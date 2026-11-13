@@ -27,6 +27,9 @@ All Phase 1 protocol primitives are implemented in portable C++11 (`-std=gnu++0x
   - Implemented 128-byte packet header parser (NTP 32.32 `senderNanos` conversion & video config dimensions), ChaCha20-Poly1305 frame decrypt (`decryptFrame` & `decryptFrameInPlace`), in-place 4-byte length-prefix -> Annex B `00 00 00 01` NALU converter, and `avcC`/`hvcC` detection + SPS/PPS Annex B extraction for `EvoVideo`.
 - [x] **Host Test Suite (`tests/test_phase1.cpp`)**
   - Executed via `make test-host BIN_EXT=.exe`: **10/10 test suites passing** (RFC 8439 ChaCha vector, X25519/Ed25519/HKDF, TLV8 fragmentation, Safari `bplist00` Date vector, UTF-16BE + 500KB round-trip, 6 hostile `bplist00` attacks, iAP2 streaming framer + repeated params, Wired + Wireless `0x4301`, HID descriptors + ZBE3 map, Screen 128B header + decrypt + `avcC`/Annex B).
+- [x] **Claude Code Handoff & Self-Contained Workspace Migration**
+  - Migrated repository, portable build/git toolchain (`w64devkit` + `MinGit`), and upstream reference repos (`DiPlay-main`, `EntryNav2-Android-Auto-0.12.0`) under `Documents\EntryNav2-CarPlay` and `Documents\EntryNav2-CarPlay-Assets`.
+  - Added `CLAUDE.md` architectural/GCC-4.7/ZBE3/platform handoff guide and `scripts/dev_env.ps1` session helper; configured local SSH deploy key in `.git/config` for zero-friction `git push`.
 
 ---
 
