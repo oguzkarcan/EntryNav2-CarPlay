@@ -59,6 +59,8 @@ From `EntryNav2-Android-Auto-0.12.0/Makefile`:
 
 All Phase 1 modules live under `include/carplay/` and `src/core/`, compiled into `libcarplay_core.a` and verified by `tests/test_phase1.cpp` (**10/10 tests passing**):
 
+> **Test discovery (Phase 2 P0+):** tests are auto-discovered — every `tests/test_*.cpp` builds into its own binary (`build/host/test_<name>.exe`) and `make test-host` runs all of them, failing if any fails. New test files should use the header-only harness `tests/test_support.hpp` (`TEST_CASE`, `CHECK`, `CHECK_EQ`, `CHECK_BYTES_EQ`, `REQUIRE`, `hexToBytes`/`bytesToHex`, `runAll`). Core sources are likewise auto-discovered from `src/core/*.cpp`.
+
 1. **`airplay_crypto`** (`include/carplay/airplay_crypto.hpp`, `src/core/airplay_crypto.cpp`)
    - Wraps vendored `third_party/monocypher/` (`monocypher.c`, `monocypher-ed25519.c`).
    - Provides `X25519` (rejects all-zero low-order shared secrets), `Ed25519` keypair/sign/verify, `SHA-512`, `HKDF-SHA512`, `makeCounterNonce` (`[0,0,0,0 | le64]`), `makeLabelNonce` (e.g., `"PV-Msg02"`, `"PS-Msg05"`), and both detached and combined `ChaCha20-Poly1305` (RFC 8439 IETF 96-bit nonce).
@@ -93,8 +95,8 @@ When continuing development, inspect the two local reference repositories in `..
 
 ### Phase 2 — AirPlay Session, Pairing, HTTP/RTSP & Audio (Next Immediate Task, Host-Testable)
 - Reference in `DiPlay-main\shared\src\main\java\com\shilapi\xcertplay\airplay\`:
-  - `AirPlaySession.kt`: RTSP/HTTP request parser & response builder, `ControlCipher` (2-byte LE AAD length `[len_lo, len_hi]`, encrypted blocks up to `1024` bytes + 16B ChaCha20-Poly1305 tag, incrementing read/write nonces via `makeCounterNonce`), `PairSetup`, `PairVerify`, `/info` (advertises HID UIDs + descriptors + display geometry), `SETUP`, `RECORD`, `SET_PARAMETER`, `FLUSH`, `TEARDOWN`, `/feedback`, `/command` (`requestUI`, `hidSendReport`, `changeModes`, `duckAudio`/`unduckAudio`), `eventServer` / `eventCipher`, and NTP/keep-alive UDP timing.
-  - `AudioStream.kt`: Main audio (`type 103` buffered / realtime) & alt/TTS audio (`AAC-ELD` / `LPCM`), RTP jitter buffer & clock sync.
+  - `AirPlaySession.kt`: RTSP/HTTP request parser & response builder, `ControlCipher` (see `ControlCipher.kt`: each frame is `[u16 LE len | ciphertext | tag16]` where the 2-byte little-endian length header `[len_lo, len_hi]` is the AAD; writes split plaintext into blocks of up to `MAX_PAYLOAD = 0x4000` (16384) bytes, reads accept any u16 length; 16B ChaCha20-Poly1305 tag, incrementing read/write nonces via `makeCounterNonce`), `PairSetup`, `PairVerify`, `/info` (advertises HID UIDs + descriptors + display geometry), `SETUP`, `RECORD`, `SET_PARAMETER`, `FLUSH`, `TEARDOWN`, `/feedback`, `/command` (`requestUI`, `hidSendReport`, `changeModes`, `duckAudio`/`unduckAudio`), `eventServer` / `eventCipher`, and NTP/keep-alive UDP timing.
+  - `AudioStream.kt`: Main audio (`type 103` buffered / realtime) & alt/TTS audio (`AAC-LC` / `Opus` / `LPCM`), RTP jitter buffer & clock sync.
 - Keep `Phase 2` completely OS-agnostic (`net`/socket abstraction or pure byte-stream state machines) so host unit tests can drive full `Pair-Verify` + `/info` + `SETUP` + encrypted `POST /command` round-trips natively on Windows.
 
 ### Phase 3 — BMW `HU_ENTRYNAV2` Platform HAL (`src/platform/`)

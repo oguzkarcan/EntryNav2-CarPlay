@@ -1,5 +1,10 @@
 # EntryNav2-CarPlay Makefile
 # Designed for both Windows/Linux host testing (-std=gnu++0x) and HU_ENTRYNAV2 ARMv7 cross-builds.
+#
+# Sources and tests are auto-discovered:
+#   * every src/core/*.cpp is compiled into libcarplay_core.a
+#   * every tests/test_*.cpp becomes its own binary $(BUILD_DIR)/test_<name>$(BIN_EXT)
+# `make test-host` builds and runs all test binaries and fails if any one fails.
 
 CXX ?= g++
 CC  ?= gcc
@@ -9,17 +14,14 @@ COMMON_WARN := -Wall -Wextra -Werror
 CXXFLAGS ?= -std=gnu++0x -O2 $(COMMON_WARN)
 CFLAGS   ?= -std=c99 -O2 -Wall -Wextra
 CPPFLAGS := -Iinclude -Ithird_party/monocypher
+TEST_CPPFLAGS := $(CPPFLAGS) -Itests
+# Per-object header dependency tracking (kept out of CXXFLAGS so overrides like arm-core keep it).
+DEPFLAGS = -MMD -MP -MF $(@:.o=.d)
 
 BUILD_DIR ?= build/host
 BIN_EXT   ?=
 
-CORE_CPP_SRCS := \
-	src/core/airplay_crypto.cpp \
-	src/core/tlv8_codec.cpp \
-	src/core/bplist_codec.cpp \
-	src/core/iap2_wire.cpp \
-	src/core/airplay_hid.cpp \
-	src/core/screen_stream.cpp
+CORE_CPP_SRCS := $(sort $(wildcard src/core/*.cpp))
 
 MONO_C_SRCS := \
 	third_party/monocypher/monocypher.c \
@@ -29,29 +31,42 @@ CORE_OBJS := \
 	$(patsubst src/core/%.cpp,$(BUILD_DIR)/core_%.o,$(CORE_CPP_SRCS)) \
 	$(patsubst third_party/monocypher/%.c,$(BUILD_DIR)/mono_%.o,$(MONO_C_SRCS))
 
-TEST_BIN := $(BUILD_DIR)/test_phase1$(BIN_EXT)
 CORE_LIB := $(BUILD_DIR)/libcarplay_core.a
 
-.PHONY: all core test-host clean arm-core
+PUBLIC_HDRS := $(wildcard include/carplay/*.hpp)
+TEST_HDRS   := $(wildcard tests/*.hpp)
+
+TEST_SRCS := $(sort $(wildcard tests/test_*.cpp))
+TEST_BINS := $(patsubst tests/%.cpp,$(BUILD_DIR)/%$(BIN_EXT),$(TEST_SRCS))
+
+.PHONY: all core tests test-host clean arm-core
 
 all: test-host
 
 core: $(CORE_LIB)
 
+tests: $(TEST_BINS)
+
 $(CORE_LIB): $(CORE_OBJS)
 	$(AR) rcs $@ $^
 
 $(BUILD_DIR)/core_%.o: src/core/%.cpp | $(BUILD_DIR)
-	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(DEPFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/mono_%.o: third_party/monocypher/%.c | $(BUILD_DIR)
-	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(DEPFLAGS) -c $< -o $@
 
-$(TEST_BIN): tests/test_phase1.cpp $(CORE_LIB) | $(BUILD_DIR)
-	$(CXX) $(CPPFLAGS) $(CXXFLAGS) tests/test_phase1.cpp $(CORE_LIB) -o $@
+$(BUILD_DIR)/test_%$(BIN_EXT): tests/test_%.cpp $(CORE_LIB) $(PUBLIC_HDRS) $(TEST_HDRS) | $(BUILD_DIR)
+	$(CXX) $(TEST_CPPFLAGS) $(CXXFLAGS) $< $(CORE_LIB) -o $@
 
-test-host: $(TEST_BIN)
-	./$(TEST_BIN)
+test-host: $(TEST_BINS)
+	@fail=0; \
+	for t in $(TEST_BINS); do \
+		echo "==> $$t"; \
+		if ./$$t; then :; else echo "FAILED: $$t"; fail=1; fi; \
+	done; \
+	if [ $$fail -ne 0 ]; then echo "test-host: one or more test binaries FAILED"; exit 1; fi; \
+	echo "test-host: all $(words $(TEST_BINS)) test binaries passed"
 
 arm-core:
 	$(MAKE) CXX=arm-linux-gnueabihf-g++ CC=arm-linux-gnueabihf-gcc AR=arm-linux-gnueabihf-ar \
@@ -64,3 +79,5 @@ $(BUILD_DIR):
 
 clean:
 	rm -rf build
+
+-include $(CORE_OBJS:.o=.d)

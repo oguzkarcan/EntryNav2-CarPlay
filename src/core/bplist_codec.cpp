@@ -291,6 +291,19 @@ private:
             case Value::TYPE_INT:
                 writeIntScalar(out, v.asInt());
                 return true;
+            case Value::TYPE_UINT64: {
+                const uint64_t u = v.asUInt();
+                if (u <= 0x7fffffffffffffffULL) {
+                    // Non-canonical but harmless: fits signed minimal encoding.
+                    writeIntScalar(out, static_cast<int64_t>(u));
+                } else {
+                    // >= 2^63: 16-byte big-endian integer with hi == 0 (CFBinaryPList form).
+                    out.push_back(0x14);
+                    appendBeUint(out, 0, 8);
+                    appendBeUint(out, u, 8);
+                }
+                return true;
+            }
             case Value::TYPE_REAL: {
                 out.push_back(0x23);
                 uint64_t bits = 0;
@@ -506,7 +519,7 @@ private:
         return true;
     }
 
-    bool readIntValue(size_t& cursor, uint8_t low_nibble, int64_t& val_out, std::string* error_out) const {
+    bool readIntValue(size_t& cursor, uint8_t low_nibble, Value& val_out, std::string* error_out) const {
         if (low_nibble > 4) {
             setError(error_out, "bplist integer width exceeds 16 bytes");
             return false;
@@ -517,18 +530,23 @@ private:
             return false;
         }
         if (nbytes == 1 || nbytes == 2 || nbytes == 4) {
-            val_out = static_cast<int64_t>(readBeUint(data_ + cursor, nbytes));
+            val_out = Value::makeInt(static_cast<int64_t>(readBeUint(data_ + cursor, nbytes)));
         } else if (nbytes == 8) {
-            val_out = static_cast<int64_t>(readBeUint(data_ + cursor, 8));
+            // 8-byte integers are signed two's complement (Apple semantics).
+            val_out = Value::makeInt(static_cast<int64_t>(readBeUint(data_ + cursor, 8)));
         } else {
-            // 16-byte signed big-endian integer (only valid if representable in int64_t).
+            // 16-byte signed big-endian integer. Accepted forms:
+            //   hi == 0                         -> unsigned [0, 2^64-1] (TYPE_INT or TYPE_UINT64)
+            //   hi == all-ones && lo MSB set    -> negative int64 (TYPE_INT)
             const uint64_t hi = readBeUint(data_ + cursor, 8);
             const uint64_t lo = readBeUint(data_ + cursor + 8, 8);
             const bool lo_msb = (lo & 0x8000000000000000ULL) != 0;
-            if ((hi == 0 && !lo_msb) || (hi == 0xffffffffffffffffULL && lo_msb)) {
-                val_out = static_cast<int64_t>(lo);
+            if (hi == 0) {
+                val_out = Value::makeUInt(lo);
+            } else if (hi == 0xffffffffffffffffULL && lo_msb) {
+                val_out = Value::makeInt(static_cast<int64_t>(lo));
             } else {
-                setError(error_out, "128-bit bplist integer overflows int64");
+                setError(error_out, "128-bit bplist integer overflows 64 bits");
                 return false;
             }
         }
@@ -579,9 +597,9 @@ private:
                 setError(error_out, "unsupported bplist singleton marker");
             }
         } else if (kind == 0x10U) {
-            int64_t iv = 0;
+            Value iv;
             if (readIntValue(pos, info, iv, error_out)) {
-                out = Value::makeInt(iv);
+                out = iv;
                 ok = true;
             }
         } else if (kind == 0x20U) {
@@ -756,7 +774,8 @@ Value::Value()
       bool_val_(false),
       int_val_(0),
       real_val_(0.0),
-      uid_val_(0) {}
+      uid_val_(0),
+      uint_val_(0) {}
 
 Value Value::makeNull() {
     return Value();
@@ -774,6 +793,22 @@ Value Value::makeInt(int64_t v) {
     out.type_ = TYPE_INT;
     out.int_val_ = v;
     return out;
+}
+
+Value Value::makeUInt(uint64_t v) {
+    if (v <= 0x7fffffffffffffffULL) {
+        return makeInt(static_cast<int64_t>(v));
+    }
+    Value out;
+    out.type_ = TYPE_UINT64;
+    out.uint_val_ = v;
+    return out;
+}
+
+uint64_t Value::asUInt() const {
+    if (type_ == TYPE_UINT64) return uint_val_;
+    if (type_ == TYPE_INT && int_val_ >= 0) return static_cast<uint64_t>(int_val_);
+    return 0;
 }
 
 Value Value::makeReal(double v) {
@@ -883,6 +918,13 @@ bool Value::getInt(const std::string& key, int64_t& out) const {
     return true;
 }
 
+bool Value::getUInt(const std::string& key, uint64_t& out) const {
+    const Value* v = find(key);
+    if (v == NULL || !v->isUInt()) return false;
+    out = v->asUInt();
+    return true;
+}
+
 bool Value::getBool(const std::string& key, bool& out) const {
     const Value* v = find(key);
     if (v == NULL || !v->isBool()) return false;
@@ -899,6 +941,8 @@ bool Value::operator==(const Value& other) const {
             return bool_val_ == other.bool_val_;
         case TYPE_INT:
             return int_val_ == other.int_val_;
+        case TYPE_UINT64:
+            return uint_val_ == other.uint_val_;
         case TYPE_REAL:
         case TYPE_DATE:
             return real_val_ == other.real_val_;
@@ -914,6 +958,21 @@ bool Value::operator==(const Value& other) const {
             return dict_val_ == other.dict_val_;
     }
     return false;
+}
+
+bool toUnsignedDecimal(const Value& v, std::string& out) {
+    if (!v.isUInt()) {
+        return false;
+    }
+    uint64_t u = v.asUInt();
+    char buf[24];
+    size_t pos = sizeof(buf);
+    do {
+        buf[--pos] = static_cast<char>('0' + static_cast<int>(u % 10U));
+        u /= 10U;
+    } while (u != 0);
+    out.assign(buf + pos, sizeof(buf) - pos);
+    return true;
 }
 
 bool encode(const Value& root, std::vector<uint8_t>& bytes_out, std::string* error_out) {
