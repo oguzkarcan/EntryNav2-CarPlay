@@ -1,0 +1,23 @@
+# Build outputs
+build/
+*.o
+*.a
+*.so
+*.exe
+*.out
+
+# IDE / OS metadata
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Sensitive keys / certificates / runtime MFi credentials (never commit)
+*.key
+*.pem
+*.p7b
+*.pk8
+*.der
+id_ed25519*
+offline-mfi/
