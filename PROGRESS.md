@@ -2,7 +2,7 @@
 
 **Target Hardware:** BMW `HU_ENTRYNAV2` (EntryEVO / ARMv7 `-std=gnu++0x`)  
 **Transports Targeted:** Wired USB (`iAP2` over USB + `NCM` IPv6) **and** Wireless (`Bluetooth RFCOMM` + `Wi-Fi` AP/STA + Bonjour)  
-**Active Milestone:** **Phase 2 Completed (host-verified); next: Phase 3 platform HAL**
+**Active Milestone:** **Phase 3 In Progress** (Phase 2 completed, host-verified)
 
 ---
 
@@ -67,7 +67,7 @@ All Phase 1 protocol primitives are implemented in portable C++11 (`-std=gnu++0x
 **Verified host test status (2026-11-14, after P8):** clean `-Wall -Wextra -Werror` build, 14 test binaries all passing — `test_airplay_hid` 22/22, `test_airplay_info` 25/25, `test_airplay_session` 21/21, `test_audio_rtp` 17/17, `test_bigint` 11/11, `test_bplist_u64` 11/11, `test_control_cipher` 19/19, `test_e2e_session` 11/11, `test_event_channel` 8/8, `test_ntp_timing` 10/10, `test_pairing` 14/14, `test_phase1` 10/10, `test_rtsp_message` 16/16, `test_srp6a` 11/11.
 
 ### Known gaps / not yet verified
-- Nothing compiled with the real ARM GCC 4.7.2 toolchain yet (host GCC 16 `-std=gnu++0x` only).
+- Real ARM GCC 4.7.2 build: CI job `armv7-gcc47` added in Phase 3 F3-P0 (Debian wheezy armhf `g++-4.7` 4.7.2 under QEMU, build + run of every test binary); result of its first run pending. Until it is green, only host GCC 16 `-std=gnu++0x` is verified.
 - No real iPhone traffic captured; all vectors come from the reference implementation or self-generated data (the P8 simulated iPhone is written from the reference/protocol description, so it cannot catch a shared misreading of the reference).
 - Type-103 buffered audio (TCP, `shk` key, `SETRATE`/`GETANCHOR`) not implemented (only routed to `MediaHandler`).
 - AAC-LC / Opus decoding deferred to Phase 3; `/auth-setup` MFiSAP (SHA-1/SHA-256/AES-CTR) deferred to Phase 5.
@@ -76,6 +76,35 @@ All Phase 1 protocol primitives are implemented in portable C++11 (`-std=gnu++0x
 - BMW display physical sizes and the 48 kHz entertainment sample rate are estimates.
 - `airplay_session` out of scope / deferred: iPhone corner masks (`SET_PARAMETER` / screen SETUP), cluster (alt-screen) content and `showUI`/`stopUI`/map zoom, video-in-car (remote-control `X-Apple-StreamID` messages are acknowledged but not dispatched; `requestUI` with the video URL is a plain `requestUI`), `sendIapMessage` timeout/poll variant, keep-alive / NTP / event socket handling itself (delegated to `TransportHost`; the event socket layer must accept only the control peer's address), reentrant/thread-safe use (callers serialise).
 - The default `require_verified_for_session_requests = true` policy is a deviation from the reference (which answers SETUP etc. on an unencrypted connection); it has not been checked against real iPhone traffic.
+
+---
+
+## Phase 3 — In Progress
+
+### Architecture decisions
+1. All vehicle libraries (`libxsvideo`, `libasound`, `libvmostclient`, `libilm*`, `libdns_sd`, …) are loaded with `dlopen`/`dlsym` through hand-written prototypes; the daemon links only libc / libstdc++ / libpthread / librt / libdl and builds without the sysroot.
+2. Single-threaded `poll()` reactor owning the `Session` and every socket; media sinks sit behind interfaces with a worker hand-off.
+3. POSIX sockets with a thin Winsock compatibility layer, so the network layer stays host-testable on Windows.
+4. Audio: LPCM-only advertisement on this head unit (the sysroot contains no AAC/Opus decoder); ALSA `entertainment` / `carplay_alt` / `tel_out1` playback and `mic1` capture in the Dirana 44.1 kHz domain.
+5. CI: Linux host tests + GCC 4.7.x ARMv7 build-and-run under QEMU; the sysroot never leaves the PC (see `docs/BUILD.md`).
+
+### Wave A
+- [x] **F3-P0 — CI & ARM GCC 4.7 verification** — workflow written; first CI run pending verification.
+  - `.github/workflows/ci.yml`: `host-linux` (`make test-host`, g++ blocking + clang++ advisory), `armv7-gcc47` (Debian 7 wheezy armhf `debian/eol:wheezy` under QEMU, `g++-4.7` 4.7.2-5, `-std=gnu++0x -O2 -march=armv7-a -mfpu=neon -mfloat-abi=hard -Wall -Wextra -Werror`, builds with `make -k` and runs every test binary; checks hard-float ELF attributes, `DT_NEEDED`, max `GLIBC_2.15` / `GLIBCXX_3.4.17` / `CXXABI_1.3.6`; logs as artifact), `no-proprietary-files`.
+  - `scripts/ci/build_and_test.sh` (POSIX sh, `host` / `armv7-gcc47` profiles, also usable with a cross compiler + `RUNNER="qemu-arm -L …"`), `scripts/ci/wheezy_armhf.sh` (container entry), `scripts/ci/check_repo_content.sh`; `docs/BUILD.md`.
+- [ ] **F3-P1 — Core hardening + F20 profile**: P8 review items (pre-verify request budget, no re-pairing after encryption, teardown order) + F20 audio/display profile (44.1 kHz, LPCM-only).
+- [ ] **F3-P2 — Platform base (`src/platform`)**: socket compat, poll reactor, TCP/UDP, timers, OS `RandomSource`, persistent `PairingStore` + `Identity`.
+
+### Wave B
+- [ ] **F3-P3 — Network session server + media engine**: control `:7000`, event, timing / keep-alive UDP, backpressure, peer checks, rate limiting; screen TCP receiver, audio UDP receivers, feedback; real-socket loopback end-to-end test.
+
+### Wave C (vehicle HAL, dlopen)
+- [ ] **F3-P4 — Video sink**: `libxsvideo` + OMAP dma-buf + LayerManager.
+- [ ] **F3-P5 — Audio sinks + microphone** (ALSA).
+- [ ] **F3-P6 — Input**: ZBE3 over vmost `E5.01` / `E5.03`, touch UDP `30567` → HID over the event channel.
+- [ ] **F3-P7 — Daemon `carplayd`**, HMI plugin / visibility, install layout.
+
+---
 
 ## Next Phases (Pending)
 
