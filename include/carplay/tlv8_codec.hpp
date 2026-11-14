@@ -38,21 +38,19 @@ struct Item {
 
     Item() : type(0) {}
     Item(uint8_t t, const std::vector<uint8_t>& v) : type(t), value(v) {}
-    Item(uint8_t t, const uint8_t* data, size_t len)
-        : type(t), value(data != NULL && len > 0 ? std::vector<uint8_t>(data, data + len) : std::vector<uint8_t>()) {}
-
-    static Item fromByte(uint8_t t, uint8_t b) {
-        std::vector<uint8_t> v(1, b);
-        return Item(t, v);
+    Item(uint8_t t, const uint8_t* data, size_t len) : type(t) {
+        if (data != NULL && len > 0) {
+            value.assign(data, data + len);
+        }
     }
+
+    static Item fromByte(uint8_t t, uint8_t b);
 
     static Item fromString(uint8_t t, const std::string& s) {
         return Item(t, reinterpret_cast<const uint8_t*>(s.data()), s.size());
     }
 
-    static Item separator() {
-        return Item(kSeparatorType, std::vector<uint8_t>());
-    }
+    static Item separator();
 };
 
 /// Encodes TLV8 items, splitting values > 255 bytes into consecutive fragments

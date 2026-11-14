@@ -42,6 +42,19 @@ void appendItemEncoded(std::vector<uint8_t>& out, uint8_t type, const std::vecto
 
 }  // namespace
 
+Item Item::fromByte(uint8_t t, uint8_t b) {
+    Item item;
+    item.type = t;
+    item.value.push_back(b);
+    return item;
+}
+
+Item Item::separator() {
+    Item item;
+    item.type = kSeparatorType;
+    return item;
+}
+
 std::vector<uint8_t> encode(const std::vector<Item>& items) {
     std::vector<uint8_t> out;
     bool have_prev_non_sep = false;

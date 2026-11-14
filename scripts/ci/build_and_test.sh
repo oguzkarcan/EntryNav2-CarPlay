@@ -143,7 +143,7 @@ echo "+ make -k -j$JOBS $* tests"
 
 # No pipefail in POSIX sh: carry make's exit code out of the pipeline through a file.
 RC_FILE="$LOG_DIR/.make_rc"
-{ make -k -j"$JOBS" "$@" tests; echo $? > "$RC_FILE"; } 2>&1 | tee "$BUILD_LOG"
+{ rc=0; make -k -j"$JOBS" "$@" tests || rc=$?; echo "$rc" > "$RC_FILE"; } 2>&1 | tee "$BUILD_LOG"
 BUILD_RC=$(cat "$RC_FILE")
 rm -f "$RC_FILE"
 
