@@ -6,7 +6,7 @@ This file gives Claude Code (and any contributor) everything needed to pick up *
 - **Goal:** Build an open-source C++11 Apple CarPlay receiver for **BMW `HU_ENTRYNAV2` (EntryEVO)** supporting **both**:
   1. **Wired USB CarPlay** (`iAP2` over USB bulk/mux + `CDC NCM` virtual Ethernet / link-local IPv6)
   2. **Wireless CarPlay** (`Bluetooth` RFCOMM/iAP2 via Alps D-Bus stack + `Wi-Fi` AP/STA credential handoff + Bonjour/mDNS)
-- **Physical Access Status:** The user does **not** currently have physical access to the vehicle. Keep all protocol, session, crypto, framing, and state-machine work **host-testable on PC** (`make test-host BIN_EXT=.exe`) until vehicle bring-up.
+- **Physical Access Status:** The user does **not** currently have continuous bench access on this Windows PC, though the target car (`2017 BMW F20 LCI`, `HU_ENTRYNAV2`, `/etc/version` `202402191339`) has been profiled over ENET — see **[docs/TARGET_HARDWARE.md](docs/TARGET_HARDWARE.md)** for verified screen (`800x480`), `ZBE3` (`E5.01`), USB (`no cdc_ncm` / `tun` available), ALSA (`carplay_alt`, `mic1`), Wi-Fi (`wl18xx`), and I2C facts. Keep all Phase 2 protocol, session, crypto, framing, and state-machine work **host-testable on PC** (`make test-host BIN_EXT=.exe`) until vehicle bring-up.
 - **Language Preference:** Respond to the user in **Turkish** unless they switch language.
 - **Tracking Rule:** Always update [PROGRESS.md](PROGRESS.md) after completing tasks or milestones, and commit/push verified changes cleanly to `origin/main`.
 
