@@ -2,7 +2,7 @@
 
 **Target Hardware:** BMW `HU_ENTRYNAV2` (EntryEVO / ARMv7 `-std=gnu++0x`)  
 **Transports Targeted:** Wired USB (`iAP2` over USB + `NCM` IPv6) **and** Wireless (`Bluetooth RFCOMM` + `Wi-Fi` AP/STA + Bonjour)  
-**Active Milestone:** **Phase 2 In Progress** (Wave 3 of 4 complete; Phase 1 Zero-Car Host-Verified C++11 Core completed)
+**Active Milestone:** **Phase 2 Completed (host-verified); next: Phase 3 platform HAL**
 
 ---
 
@@ -33,7 +33,7 @@ All Phase 1 protocol primitives are implemented in portable C++11 (`-std=gnu++0x
 
 ---
 
-## Phase 2 — In Progress
+## Completed Work — Phase 2 (2026-11-14, host-verified)
 
 - [x] **P0 — Build & test foundation** (2026-11-14)
   - `Makefile` auto-discovers `src/core/*.cpp` and builds every `tests/test_*.cpp` into its own binary; `make test-host` runs all and fails if any fails; header-change rebuilds via `-MMD -MP` (objects) and header prerequisites (tests).
@@ -50,7 +50,7 @@ All Phase 1 protocol primitives are implemented in portable C++11 (`-std=gnu++0x
   - RTP open/seal for stream types 100/101/102 (`[RTP12 | ct | tag16 | nonce tail8]`, AAD = header bytes 4..11, nonce `[0,0,0,0 | tail8]`), `audioFormat` bit -> codec mapping (AAC-LC / Opus / LPCM), `DataStream-Salt<unsigned streamConnectionID>` HKDF output/input keys, big-endian LPCM helpers, sequence-ordered `JitterBuffer`.
   - NTP 32.32 PT 210/211 request/response packets and `ClockSync` filter with injected monotonic time. `tests/test_audio_rtp.cpp` (17/17), `tests/test_ntp_timing.cpp` (10/10).
 - [x] **P5 — `/info` plist & SETUP features (`airplay_info`)** (2026-11-14)
-  - `AirPlayConfig`/`DisplayConfig`, `/info` bplist builder mirroring `AirPlayInfoPlist.kt` key order, `setupEnabledFeatures`, BMW `bmwEntryNav2_800x480` / `_1280x480` / `_1440x540` profiles. `tests/test_airplay_info.cpp` (24/24).
+  - `AirPlayConfig`/`DisplayConfig`, `/info` bplist builder mirroring `AirPlayInfoPlist.kt` key order, `setupEnabledFeatures`, BMW `bmwEntryNav2_800x480` / `_1280x480` / `_1440x540` profiles. `tests/test_airplay_info.cpp` (25/25 after P5b).
 - [x] **P5b — Reference HID layouts (`airplay_hid`)** (2026-11-14)
   - Byte-exact `AirPlayHid.kt` layouts: 2-contact 12-byte touch report (`[slot, down, x16le, y16le] x2`) with the descriptor's X/Y logical maxima = display pixels, 4-byte knob report (`[select|home<<1|back<<2, x, y, wheel]`), index-byte media/telephony reports, `TouchSlots` (port of `AirPlayTouchSlots.kt`), ZBE3 tilt -> wheel mapping (Up/Left `-1`, Down/Right `+1`). `tests/test_airplay_hid.cpp` (22/22).
 - [x] **P6 — HAP pairing (`pairing`)** (2026-11-14)
@@ -60,17 +60,19 @@ All Phase 1 protocol primitives are implemented in portable C++11 (`-std=gnu++0x
   - Abstract `SessionListener`, `MediaHandler`, `TransportHost` (timing/event/keep-alive ports), `AuthProvider` (Phase 5 seam; `/auth-setup` stays 400). Stream key helpers (`deriveAudioStreamKeys`, `deriveScreenStreamKey`, `deriveDataStreamSeedKey`, `streamOutputKey`/`streamInputKey`).
   - `session::EventChannel`: encrypted `POST /command` sender (exact `sendCommandLocked` bytes, CSeq from 1), `hidSendReport`, report sequences, `requestSiri`, pending night mode flushed on accept, `iAPSendMessage`; inbound requests answered 200, responses consumed.
   - Hardening: `SessionPolicy::require_verified_for_session_requests` (default on: non-pairing requests before pair-verify -> `403 Forbidden`, no side effects), max 32 streams per SETUP, type-checked plist fields, timing port range check. `tests/test_event_channel.cpp` (8/8), `tests/test_airplay_session.cpp` (21/21).
+- [x] **P8 — End-to-end simulated-iPhone session (`tests/test_e2e_session.cpp`)** (2026-11-14)
+  - An independent simulated iPhone (own SRP-6a client, pair-verify client, phone-side control/event/stream key labels, RTP/NTP/screen-header builders, big-endian LPCM) drives ONE `Session` with a fresh empty pairing store through the whole flow: plaintext `/info` -> pair-setup M1–M6 (accessory LTPK learned from M6, controller LTPK stored) -> pair-verify M1–M4 (M4 plaintext) -> encrypted `/info` (identical plist) -> session `SETUP` (ports, `enabledFeatures`, `onDeviceInfo`) -> event channel (pending night mode flushed on accept) -> `ntp::ClockSync` synchronised against the phone clock through PT 210/211 exchanges -> streams `SETUP` 110 / 100 (LPCM, `streamConnectionID` >= 2^63) / 101 -> `RECORD` -> HID (2-finger `TouchSlots` sequence, knob wheel/select, media, telephony, ZBE3 mapping) with phone-side bplist/CSeq checks and 200 answers, a phone->accessory event request -> screen config + 2 sealed frames to Annex B and 8 RTP audio datagrams (reordered, duplicate, one lost) through `JitterBuffer` to int16, wrong-key packet rejected -> `/feedback` (synced NTP timestamp), `/command` duck/unduck/requestUI, `SET_PARAMETER`, `FLUSH` -> partial and whole `TEARDOWN` -> disconnect (`onSessionEnded` / `closeAll` exactly once).
+  - The golden path is re-run with every phone byte delivered one at a time: byte-identical accessory output. Reconnection (stored pairing -> verify + encrypted `/info`; empty store -> error TLV, plaintext, 403). Adversarial: wrong setup code + fresh-M1 retry, replayed frame, event frame on the control channel, truncated frame + silence, SETUP before verify, replaced LTPK, Content-Length 1 MiB + 1. SHA-512 regression pins of the plaintext-phase and encrypted transcripts (self-generated, not external vectors). 11/11.
 
-**Verified host test status (2026-11-14):** clean `-Wall -Wextra -Werror` build, 13 test binaries all passing — `test_airplay_hid` 22/22, `test_airplay_info` 25/25, `test_airplay_session` 21/21, `test_audio_rtp` 17/17, `test_bigint` 11/11, `test_bplist_u64` 11/11, `test_control_cipher` 19/19, `test_event_channel` 8/8, `test_ntp_timing` 10/10, `test_pairing` 14/14, `test_phase1` 10/10, `test_rtsp_message` 16/16, `test_srp6a` 11/11.
-
-### Phase 2 — Remaining
-- [ ] **P8** — End-to-end simulated-iPhone test.
+**Verified host test status (2026-11-14, after P8):** clean `-Wall -Wextra -Werror` build, 14 test binaries all passing — `test_airplay_hid` 22/22, `test_airplay_info` 25/25, `test_airplay_session` 21/21, `test_audio_rtp` 17/17, `test_bigint` 11/11, `test_bplist_u64` 11/11, `test_control_cipher` 19/19, `test_e2e_session` 11/11, `test_event_channel` 8/8, `test_ntp_timing` 10/10, `test_pairing` 14/14, `test_phase1` 10/10, `test_rtsp_message` 16/16, `test_srp6a` 11/11.
 
 ### Known gaps / not yet verified
 - Nothing compiled with the real ARM GCC 4.7.2 toolchain yet (host GCC 16 `-std=gnu++0x` only).
-- No real iPhone traffic captured; all vectors come from the reference implementation or self-generated data.
-- Type-103 buffered audio (TCP, `shk` key, `SETRATE`/`GETANCHOR`) not implemented.
+- No real iPhone traffic captured; all vectors come from the reference implementation or self-generated data (the P8 simulated iPhone is written from the reference/protocol description, so it cannot catch a shared misreading of the reference).
+- Type-103 buffered audio (TCP, `shk` key, `SETRATE`/`GETANCHOR`) not implemented (only routed to `MediaHandler`).
 - AAC-LC / Opus decoding deferred to Phase 3; `/auth-setup` MFiSAP (SHA-1/SHA-256/AES-CTR) deferred to Phase 5.
+- Platform layer still to be written (Phase 3/4): sockets (control TCP, event TCP with peer-address check, screen TCP, audio data/control UDP, NTP timing UDP, keep-alive UDP), threads / serialisation of Session calls, an OS CSPRNG `RandomSource`, a persistent `PairingStore` and persistent accessory `Identity`.
+- HID tilt -> wheel convention and the ZBE3 mapping are unverified against a real iPhone.
 - BMW display physical sizes and the 48 kHz entertainment sample rate are estimates.
 - `airplay_session` out of scope / deferred: iPhone corner masks (`SET_PARAMETER` / screen SETUP), cluster (alt-screen) content and `showUI`/`stopUI`/map zoom, video-in-car (remote-control `X-Apple-StreamID` messages are acknowledged but not dispatched; `requestUI` with the video URL is a plain `requestUI`), `sendIapMessage` timeout/poll variant, keep-alive / NTP / event socket handling itself (delegated to `TransportHost`; the event socket layer must accept only the control peer's address), reentrant/thread-safe use (callers serialise).
 - The default `require_verified_for_session_requests = true` policy is a deviation from the reference (which answers SETUP etc. on an unencrypted connection); it has not been checked against real iPhone traffic.
@@ -81,7 +83,7 @@ All Phase 1 protocol primitives are implemented in portable C++11 (`-std=gnu++0x
 - [x] Lightweight non-blocking HTTP/RTSP parser & responder (binary plist + TLV8 bodies, HAP encrypted block framing `[u16 LE len | ciphertext | tag16]` with the length header as AAD and up to `0x4000` bytes of plaintext per frame).
 - [x] HAP `Pair-Setup` & `Pair-Verify` state machine (Ed25519 verifier + `Control-Salt` Read/Write key derivation; MFi hook = `AuthProvider`, MFiSAP itself in Phase 5).
 - [x] RTSP `/info`, `SETUP`, `RECORD`, `SET_PARAMETER`, `FLUSH`, `TEARDOWN`, `/feedback`, and `/command` (inbound `requestUI` / `duckAudio` / generic; outbound `hidSendReport`, `requestSiri`, `setNightMode`, generic typed commands such as `changeModes`) state handlers (P7, host-verified; no real iPhone yet).
-- [ ] AirPlay RTP audio receiver (AAC-LC / Opus / LPCM jitter buffer, NTP/PTP timing response, control/timing UDP sockets).
+- [ ] AirPlay RTP audio receiver — **partly done**: RTP open/seal, per-stream keys, `audioFormat` -> codec mapping, LPCM conversion, sequence-ordered jitter buffer and NTP PT 210/211 request/response + `ClockSync` are implemented and host-verified (P4, exercised end to end in P8); AAC-LC / Opus decoding, type-103 buffered audio and the control/timing/keep-alive UDP sockets move to Phase 3.
 
 ### Phase 3 — BMW `HU_ENTRYNAV2` Platform Abstraction Layer (`src/platform/`)
 - [ ] `EvoVideo` Annex-B surface integration (`800x480` / `1280x480` / `1440x540` display profiles).
