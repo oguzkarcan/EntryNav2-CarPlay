@@ -1441,10 +1441,18 @@ bool testRateLimitingAndUnverifiedTimeout() {
     const plat::Address addr = plat::Address::ipv4Loopback(server.controlPort());
 
     plat::TcpConnection c[5];
-    for (int i = 0; i < 5; ++i) {
+    for (int i = 0; i < 3; ++i) {
         CHECK_TRUE(c[i].connect(addr));
         CHECK_TRUE(waitUntilConnected(reactor, c[i]));
         reactor.runOnce(0);
+    }
+    for (int i = 3; i < 5; ++i) {
+        CHECK_TRUE(c[i].connect(addr));
+        const int64_t rl_deadline = plat::monotonicMillis() + 1000;
+        while (server.rateLimitedAccepts() < static_cast<size_t>(i - 2) &&
+               plat::monotonicMillis() < rl_deadline) {
+            reactor.runOnce(0);
+        }
     }
     CHECK_TRUE(server.rateLimitedAccepts() == 2U);
     CHECK_TRUE(server.hasActiveSession());
