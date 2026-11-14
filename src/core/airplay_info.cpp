@@ -132,7 +132,8 @@ Value audioFormats(const AirPlayConfig& c) {
     // PCM 8 kHz and 16 kHz, mono and stereo.
     const int64_t speech = c.speech_without_8_and_16khz ? (pcm & ~static_cast<int64_t>(0x3c)) : pcm;
     const int64_t pcm_mono = 0x154 | (is48 ? 0x4000 : 0x400);
-    const int64_t opus = 0x70000000;
+    // lpcm_only (not in the reference): no Opus bit anywhere; the AAC-LC entries are dropped below.
+    const int64_t opus = c.lpcm_only ? 0 : 0x70000000;
     const int64_t aac_lc = is48 ? 0x800000 : 0x400000;
     const int64_t telephony_output = c.call_at_call_rate ? 0x154 : (pcm_mono | opus);
     const int64_t pcm_input = c.microphone ? pcm_mono : -1;
@@ -150,6 +151,7 @@ Value audioFormats(const AirPlayConfig& c) {
     arr.push_back(format(100, "telephony", telephony_output, telephony_input));
     arr.push_back(format(100, "speechRecognition", pcm_mono | opus, wireless_input));
     arr.push_back(format(101, "default", speech | opus, -1));
+    if (c.lpcm_only) return a;  // no type-102 AAC-LC media, no type-103 mainBuffered
     arr.push_back(format(102, "media", aac_lc, -1));
     if (c.main_buffered_audio) {
         arr.push_back(format(kStreamTypeMainBufferedAudio, "media", aac_lc, -1));
@@ -305,11 +307,15 @@ AirPlayConfig bmwProfile(int32_t width, int32_t height, int32_t width_mm, bool t
     c.main.features = kDisplayFeatureKnobs | (touch ? kDisplayFeatureHighFidelityTouch : 0);
     c.main.primary_input_device = kPrimaryInputKnob;
     c.microphone = true;
-    c.entertainment_sample_rate = 48000;
+    c.entertainment_sample_rate = 44100;  // Dirana TDM domain (docs/TARGET_HARDWARE.md section 7)
+    c.lpcm_only = true;                   // no AAC-LC / Opus decoder on the head unit image
     c.hevc = false;
     c.has_cluster = false;
     return c;
 }
+
+const int32_t kF20PanelWidthMm = 142;  // estimate for the 800 px wide F20 panel
+const int32_t kF20PanelWidthPx = 800;
 
 }  // namespace
 
@@ -366,7 +372,14 @@ AirPlayConfig::AirPlayConfig()
       main_buffered_audio(false),
       speech_without_8_and_16khz(false),
       call_at_call_rate(false),
-      hid_name_prefix("xcertplay") {}
+      hid_name_prefix("xcertplay"),
+      lpcm_only(false) {}
+
+bool isSupportedOutputFormat(const AirPlayConfig& config, const audio::AudioFormat& format) {
+    if (config.disable_audio_output) return false;
+    if (!config.lpcm_only) return true;
+    return format.codec == audio::kCodecLpcm;
+}
 
 int32_t sanitizeFps(int32_t fps) { return snapToStep(fps, kMinFps, kMaxFps, kFpsStep); }
 
@@ -377,7 +390,26 @@ int32_t sanitizeReportedPhysicalMm(int32_t mm) {
 // Physical widths are estimates from the nominal panel diagonals (6.5" 5:3, 8.8" 8:3,
 // 10.25" 8:3); heights are derived from the pixel aspect ratio. Not measured on a car.
 AirPlayConfig bmwEntryNav2_800x480(bool touch) {
-    return bmwProfile(800, 480, 142, touch, "HU_ENTRYNAV2");
+    return bmwProfile(800, 480, kF20PanelWidthMm, touch, "HU_ENTRYNAV2");
+}
+
+bool bmwEntryNav2ForDisplay(int32_t width_px, int32_t height_px, bool touch, AirPlayConfig& out) {
+    if (width_px < kMinDisplayWidthPx || width_px > kMaxDisplayWidthPx) return false;
+    if (height_px < kMinDisplayHeightPx || height_px > kMaxDisplayHeightPx) return false;
+    if (width_px < height_px) return false;
+    int32_t width_mm;
+    if (width_px == 800 && height_px == 480) {
+        width_mm = kF20PanelWidthMm;
+    } else if (width_px == 1280 && height_px == 480) {
+        width_mm = 209;
+    } else if (width_px == 1440 && height_px == 540) {
+        width_mm = 244;
+    } else {
+        // round(width_px * 142 / 800) in integers (all operands positive and small).
+        width_mm = (width_px * kF20PanelWidthMm + kF20PanelWidthPx / 2) / kF20PanelWidthPx;
+    }
+    out = bmwProfile(width_px, height_px, sanitizeReportedPhysicalMm(width_mm), touch, "HU_ENTRYNAV2");
+    return true;
 }
 
 AirPlayConfig bmwEntryNav2_1280x480(bool touch) {

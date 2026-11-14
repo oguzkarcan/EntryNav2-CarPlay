@@ -327,7 +327,11 @@ struct FakeMedia : public session::MediaHandler {
         r.set("streams", bplist::Value::makeArray());
         return true;
     }
-    virtual void onTeardown(session::Session&, int32_t type) { events.push_back("teardown:" + rtsp::toDecimal(type)); }
+    std::vector<bool> teardown_still_active;  // hasActiveStream(type) seen inside onTeardown
+    virtual void onTeardown(session::Session& s, int32_t type) {
+        events.push_back("teardown:" + rtsp::toDecimal(type));
+        teardown_still_active.push_back(s.hasActiveStream(type));
+    }
     virtual void onAudioDuck(session::Session&, bool ducked) { events.push_back(ducked ? "duck" : "unduck"); }
     virtual void onSetupResponseSent(session::Session&) { ++setup_sent; }
     virtual void onSessionClosed(session::Session&) { events.push_back("closed"); }
@@ -338,7 +342,10 @@ struct FakeTransport : public session::TransportHost {
     int32_t peer_timing;
     int close_all;
     bool fail_timing;
-    FakeTransport() : peer_timing(-1), close_all(0), fail_timing(false) {}
+    bool fail_event;
+    bool fail_keepalive;
+    FakeTransport()
+        : peer_timing(-1), close_all(0), fail_timing(false), fail_event(false), fail_keepalive(false) {}
     virtual bool openTiming(int32_t peer, int32_t& port) {
         events.push_back("timing");
         peer_timing = peer;
@@ -348,11 +355,13 @@ struct FakeTransport : public session::TransportHost {
     }
     virtual bool openEvent(int32_t& port) {
         events.push_back("event");
+        if (fail_event) return false;
         port = 6002;
         return true;
     }
     virtual bool openKeepAlive(int32_t& port) {
         events.push_back("keepalive");
+        if (fail_keepalive) return false;
         port = 6003;
         return true;
     }
@@ -393,6 +402,7 @@ struct Harness {
                      session::AuthProvider* auth = NULL, bool buffered = false)
         : config(info::bmwEntryNav2_800x480(true)), rng("session-acc-rng"), ctrl("ctrl-ltsk", kControllerId) {
         config.main_buffered_audio = buffered;
+        if (buffered) config.lpcm_only = false;  // the BMW profile is LPCM-only, which disables type 103
         const Bytes seed = prefix(shaStr("accessory-seed"), 32);
         identity.initFromSeed(&seed[0], kAccessoryId);
         store.save(ctrl.id, ctrl.keys.public_key);
@@ -1323,6 +1333,257 @@ TEST_CASE(pairSetupRoutedThroughSession) {
     CHECK(!q.pairVerify(h2));
     CHECK(!h2.s->encrypted());
     CHECK(!h2.s->closed());
+}
+
+// ---- F3-P1 hardening ----
+
+TEST_CASE(preVerifyRequestBudget) {
+    {
+        Harness h;  // default budget 32
+        CHECK_EQ(32U, h.s->policy().max_unverified_requests);
+        Phone p;
+        Reply r;
+        for (int i = 0; i < 32; ++i) {
+            REQUIRE(p.call(*h.s, "GET", "/info", "", Bytes(), r));
+            CHECK_EQ(200, r.status);
+        }
+        CHECK_EQ(32U, h.s->unverifiedRequests());
+        Bytes raw;
+        CHECK(!p.feed(*h.s, p.build("GET", "/info", "", Bytes()), raw));  // the 33rd
+        CHECK(raw.empty());
+        CHECK(h.s->closed());
+        CHECK_EQ(1, h.listener.ended);
+        CHECK_EQ(1, h.transport.close_all);
+    }
+    {
+        // Refused (403) requests count too; pipelined requests are cut at the budget.
+        session::SessionPolicy policy;
+        policy.max_unverified_requests = 3;
+        Harness h(policy);
+        Phone p;
+        Bytes four;
+        cat(four, p.build("GET", "/info", "", Bytes()));
+        cat(four, p.build("RECORD", "rtsp://x/1", "", Bytes()));
+        cat(four, p.build("GET", "/info", "", Bytes()));
+        cat(four, p.build("GET", "/info", "", Bytes()));
+        Bytes raw;
+        CHECK(!p.feed(*h.s, four, raw));
+        std::vector<Reply> replies;
+        REQUIRE(p.parseReplies(raw, replies));
+        CHECK_EQ(3U, replies.size());  // the fourth got no answer
+        CHECK(h.s->closed());
+        CHECK(h.listener.events == Strings(1, "ended"));
+    }
+    {
+        // A normal bring-up (info + pair-verify, here 3 requests) fits; afterwards nothing is counted.
+        session::SessionPolicy policy;
+        policy.max_unverified_requests = 3;
+        Harness h(policy);
+        Phone p;
+        Reply r;
+        REQUIRE(p.call(*h.s, "GET", "/info", "", Bytes(), r));
+        REQUIRE(p.pairVerify(h));
+        CHECK_EQ(3U, h.s->unverifiedRequests());
+        for (int i = 0; i < 40; ++i) REQUIRE(p.call(*h.s, "GET", "/info", "", Bytes(), r));
+        CHECK(!h.s->closed());
+        CHECK_EQ(3U, h.s->unverifiedRequests());
+    }
+    {
+        // Budget too small for pair-verify: M3 (the 2nd request) is never processed.
+        session::SessionPolicy policy;
+        policy.max_unverified_requests = 1;
+        Harness h(policy);
+        Phone p;
+        CHECK(!p.pairVerify(h));
+        CHECK(h.s->closed());
+        CHECK(!h.s->encrypted());
+    }
+    {
+        // 0 = unlimited (reference behaviour).
+        session::SessionPolicy policy;
+        policy.max_unverified_requests = 0;
+        Harness h(policy);
+        Phone p;
+        Reply r;
+        for (int i = 0; i < 100; ++i) REQUIRE(p.call(*h.s, "GET", "/info", "", Bytes(), r));
+        CHECK(!h.s->closed());
+        CHECK_EQ(100U, h.s->unverifiedRequests());
+    }
+}
+
+TEST_CASE(pairingRefusedOnEncryptedConnection) {
+    Harness h;
+    Phone p;
+    REQUIRE(p.pairVerify(h));
+    uint8_t before[32];
+    REQUIRE(h.s->sharedSecret(before));
+    Reply r;
+    // A fresh pair-verify M1 and a pair-setup M1 on the encrypted connection: 403, nothing reset.
+    VerifyClient other("phone-eph-2");
+    REQUIRE(p.call(*h.s, "POST", "/pair-verify", rtsp::kContentTypePairingTlv8, other.m1(), r));
+    CHECK_EQ(403, r.status);
+    CHECK_EQ(std::string("Forbidden"), r.reason);
+    CHECK(r.raw.body.empty());
+    Items m1;
+    m1.push_back(tlv8::Item(tlv8::kTagMethod, Bytes(1, 0)));
+    m1.push_back(tlv8::Item::fromByte(tlv8::kTagState, 1));
+    REQUIRE(p.call(*h.s, "POST", "/pair-setup", rtsp::kContentTypePairingTlv8, tlv8::encode(m1), r));
+    CHECK_EQ(403, r.status);
+    REQUIRE(p.call(*h.s, "POST", "/PAIR-VERIFY", rtsp::kContentTypePairingTlv8, Bytes(3, 0), r));
+    CHECK_EQ(403, r.status);
+    uint8_t after[32];
+    REQUIRE(h.s->sharedSecret(after));
+    CHECK_BYTES_EQ(arr(before, 32), arr(after, 32));
+    CHECK_EQ(std::string(kControllerId), h.s->controllerId());
+    CHECK(h.s->encrypted());
+    // Stream keys and the event channel still work.
+    REQUIRE(setupThreeStreams(h, p));
+    CHECK_BYTES_EQ(hkdf(p.vc.shared, "DataStream-Salt6", "DataStream-Output-Encryption-Key"), h.media.audio_out_key);
+    Bytes wire;
+    REQUIRE(h.s->onEventAccepted(wire));
+    // Plaintext pairing before verification is of course still allowed (covered above); /auth-setup
+    // and /info are unaffected after verification.
+    REQUIRE(p.call(*h.s, "GET", "/info", "", Bytes(), r));
+    CHECK_EQ(200, r.status);
+
+    // Flag off: reference behaviour, the request reaches PairVerify and wipes the verified secret.
+    session::SessionPolicy off;
+    off.refuse_pairing_after_verified = false;
+    Harness ref(off);
+    Phone q;
+    REQUIRE(q.pairVerify(ref));
+    REQUIRE(q.call(*ref.s, "POST", "/pair-verify", rtsp::kContentTypePairingTlv8, Bytes(3, 0), r));
+    CHECK_EQ(200, r.status);
+    CHECK(!r.raw.body.empty());
+    uint8_t gone[32];
+    CHECK(!ref.s->sharedSecret(gone));
+    CHECK(ref.s->controllerId().empty());
+    CHECK(ref.s->encrypted());  // the control cipher itself stays
+}
+
+TEST_CASE(wholeTeardownCallsBackBeforeClearing) {
+    Harness h;
+    Phone p;
+    REQUIRE(p.pairVerify(h));
+    REQUIRE(setupThreeStreams(h, p));
+    h.media.events.clear();
+    h.media.teardown_still_active.clear();
+    Reply r;
+    REQUIRE(p.call(*h.s, "TEARDOWN", "rtsp://x/1", "", Bytes(), r));
+    CHECK_EQ(join(strs("teardown:110", "teardown:100", "teardown:130")), join(h.media.events));
+    REQUIRE(h.media.teardown_still_active.size() == 3U);
+    for (size_t i = 0; i < 3; ++i) CHECK(h.media.teardown_still_active[i]);
+    CHECK(h.s->activeStreams().empty());
+    // Per-type teardown: the type is removed before its callback (reference order).
+    REQUIRE(setupThreeStreams(h, p));
+    h.media.teardown_still_active.clear();
+    bplist::Value::Array one;
+    one.push_back(streamEntry(100));
+    REQUIRE(p.callPlist(*h.s, "TEARDOWN", "rtsp://x/1", streamsBody(one), r));
+    REQUIRE(h.media.teardown_still_active.size() == 1U);
+    CHECK(!h.media.teardown_still_active[0]);
+}
+
+TEST_CASE(failedSessionSetupClosesSetupPorts) {
+    const char* which[] = {"timing", "event", "keepalive"};
+    for (int k = 0; k < 3; ++k) {
+        Harness h;
+        Phone p;
+        REQUIRE(p.pairVerify(h));
+        h.transport.fail_timing = k == 0;
+        h.transport.fail_event = k == 1;
+        h.transport.fail_keepalive = k == 2;
+        Reply r;
+        REQUIRE(p.callPlist(*h.s, "SETUP", "rtsp://x/1", sessionSetupBody(true), r));
+        CHECK_EQ(500, r.status);
+        CHECK_EQ(std::string(which[k]), h.transport.events.back());
+        CHECK_EQ(1, h.transport.close_all);  // default closeSetupPorts() -> closeAll()
+        CHECK(!h.s->closed());
+        CHECK(!h.s->sessionSetupDone());
+        CHECK(!h.s->eventExpected());
+        // A retry after the failure succeeds; repeated SETUPs call the open* hooks again.
+        h.transport.fail_timing = h.transport.fail_event = h.transport.fail_keepalive = false;
+        h.transport.events.clear();
+        REQUIRE(p.callPlist(*h.s, "SETUP", "rtsp://x/1", sessionSetupBody(true), r));
+        CHECK_EQ(200, r.status);
+        REQUIRE(p.callPlist(*h.s, "SETUP", "rtsp://x/1", sessionSetupBody(false), r));
+        CHECK_EQ(200, r.status);
+        CHECK_EQ(join(strs("timing", "event", "keepalive", "timing", "event")), join(h.transport.events));
+        CHECK_EQ(1, h.transport.close_all);
+        CHECK(h.s->sessionSetupDone());
+    }
+    // An override of closeSetupPorts is called instead of closeAll.
+    struct PortTransport : public FakeTransport {
+        int setup_closes;
+        PortTransport() : setup_closes(0) {}
+        virtual void closeSetupPorts() { ++setup_closes; }
+    };
+    info::AirPlayConfig config = info::bmwEntryNav2_800x480(true);
+    pairing::Identity identity;
+    const Bytes seed = prefix(shaStr("accessory-seed"), 32);
+    identity.initFromSeed(&seed[0], kAccessoryId);
+    pairing::InMemoryPairingStore store;
+    DetRng rng("port-rng");
+    FakeListener listener;
+    FakeMedia media;
+    PortTransport transport;
+    transport.fail_event = true;
+    session::SessionPolicy off;
+    off.require_verified_for_session_requests = false;
+    session::Session s(config, identity, store, rng, listener, media, transport, NULL, off);
+    Phone p;
+    Bytes raw;
+    REQUIRE(p.feed(s, p.build("SETUP", "rtsp://x/1", rtsp::kContentTypeBinaryPlist, encode(sessionSetupBody(false))), raw));
+    CHECK(startsWith(raw, "RTSP/1.0 500"));
+    CHECK_EQ(1, transport.setup_closes);
+    CHECK_EQ(0, transport.close_all);
+}
+
+TEST_CASE(eventExpectedAndSecondAcceptRefused) {
+    Harness h;
+    Phone p;
+    CHECK(!h.s->eventExpected());  // plaintext
+    REQUIRE(p.pairVerify(h));
+    CHECK(!h.s->eventExpected());  // no session SETUP yet
+    Reply r;
+    REQUIRE(setupThreeStreams(h, p));  // streams SETUP is not a session SETUP
+    CHECK(!h.s->eventExpected());
+    REQUIRE(p.callPlist(*h.s, "SETUP", "rtsp://10.0.0.1/1", sessionSetupBody(false), r));
+    CHECK(h.s->sessionSetupDone());
+    CHECK(h.s->eventExpected());
+
+    Bytes wire;
+    CHECK(!h.s->setNightMode(true, wire));
+    REQUIRE(h.s->onEventAccepted(wire));
+    CHECK(!h.s->eventExpected());
+    const Bytes ev_read = hkdf(p.vc.shared, "Events-Salt", "Events-Write-Encryption-Key");
+    const Bytes ev_write = hkdf(p.vc.shared, "Events-Salt", "Events-Read-Encryption-Key");
+    ControlCipher phone_ev(&ev_read[0], &ev_write[0]);
+    Bytes plain;
+    REQUIRE(phone_ev.feed(wire, plain));  // night mode, CSeq 1
+
+    // A second connection is refused without touching the first or the session.
+    Bytes second;
+    CHECK(!h.s->onEventAccepted(second));
+    CHECK(second.empty());
+    CHECK(!h.s->closed());
+    CHECK(h.s->events().ready());
+    CHECK_EQ(1U, h.s->events().lastCseq());
+    wire.clear();
+    REQUIRE(h.s->events().sendTypedCommand("forceKeyFrame", NULL, wire));
+    plain.clear();
+    REQUIRE(phone_ev.feed(wire, plain));  // still the first channel's keys and nonces
+    rtsp::Parser parser;
+    std::vector<rtsp::Request> msgs;
+    REQUIRE(parser.feed(plain, msgs));
+    REQUIRE(msgs.size() == 1U);
+    CHECK_EQ(std::string("2"), msgs[0].header("cseq"));
+    CHECK_EQ(0, h.listener.ended);
+
+    // After close nothing is expected.
+    h.s->close();
+    CHECK(!h.s->eventExpected());
+    CHECK(!h.s->sessionSetupDone());
 }
 
 int main() { return test_support::runAll("test_airplay_session"); }

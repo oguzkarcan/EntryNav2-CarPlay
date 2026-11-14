@@ -12,6 +12,7 @@
 #include <string>
 #include <vector>
 
+#include "carplay/audio_rtp.hpp"
 #include "carplay/bplist_codec.hpp"
 
 namespace carplay {
@@ -153,12 +154,34 @@ struct AirPlayConfig {
     bool call_at_call_rate;
     /// Prefix of the HID device `name` strings ("<prefix> Touchscreen", ...). Reference: "xcertplay".
     std::string hid_name_prefix;
+    /// Advertise PCM audio ONLY (not in the reference; default false = reference behaviour). For head
+    /// units without AAC-LC / Opus codecs (the F20 HU_ENTRYNAV2 image ships only speex / speexdsp and
+    /// GStreamer 0.10 base plugins). When set, /info `audioFormats`:
+    ///   - drops the Opus bits (0x70000000) from every audioOutputFormats / audioInputFormats mask,
+    ///     leaving exactly the reference's PCM parts (pcm / speech / pcmMono / 0x154);
+    ///   - omits the type-102 "media" AAC-LC entry and the type-103 mainBuffered entry;
+    /// and bufferedAudioOutputEnabled() is false (no `mainBufferedInfo`, setupEnabledFeatures never
+    /// enables "mainBuffered", buffered-audio methods are not routed). Everything else is unchanged
+    /// (audioLatencies still lists type 102, `features` keeps the audio bits).
+    ///
+    /// RISK (unverified against a real iPhone): the reference keeps Opus on the microphone input on
+    /// purpose, noting "PCM-only wireless negotiation is not a universal fallback" (AirPlayInfoPlist.kt
+    /// :151-152). A wireless session may therefore fail to open Siri / call microphone streams, or the
+    /// phone may refuse PCM-only offers on some iOS versions. Wired sessions are believed to be fine.
+    bool lpcm_only;
 
     AirPlayConfig();
 
-    /// mainBufferedAudio && !disableAudioOutput.
-    bool bufferedAudioOutputEnabled() const { return main_buffered_audio && !disable_audio_output; }
+    /// mainBufferedAudio && !disableAudioOutput && !lpcm_only.
+    bool bufferedAudioOutputEnabled() const { return main_buffered_audio && !disable_audio_output && !lpcm_only; }
 };
+
+/// Whether a negotiated stream format (audio::formatFromBits of the SETUP entry's `audioFormat`) can
+/// be played with this configuration. A MediaHandler::onAudio should decline (return false) when this
+/// is false. With lpcm_only only kCodecLpcm is supported (any Opus or AAC-LC bit -> false; unknown bits
+/// map to the reference's LPCM 44.1 kHz stereo fallback and are accepted); with disable_audio_output
+/// nothing is; otherwise everything formatFromBits maps (the reference accepts all).
+bool isSupportedOutputFormat(const AirPlayConfig& config, const audio::AudioFormat& format);
 
 // ---- Display settings helpers (AirPlayDisplaySettings.kt) ----
 int32_t sanitizeFps(int32_t fps);
@@ -168,9 +191,28 @@ int32_t sanitizeReportedPhysicalMm(int32_t mm);
 // Knob-primary (iDrive ZBE3): primaryInputDevice = 3. `touch` adds the high-fidelity-touch display
 // feature bit (0x08) for units with a touch panel; the knob bit (0x02) is always set.
 // device_id / bt_mac are placeholders ("02:00:00:00:00:02") to be filled at runtime.
+//
+// Audio (all profiles): entertainment_sample_rate = 44100 (the Dirana TDM domain runs at 44.1 kHz,
+// docs/TARGET_HARDWARE.md section 7) and lpcm_only = true (no AAC-LC / Opus decoder on the image; see
+// the RISK note on AirPlayConfig::lpcm_only). microphone = true.
+//
+// bmwEntryNav2_800x480 is THE profile of the profiled car (2017 F20 LCI, LayerManager screen 800x480).
 AirPlayConfig bmwEntryNav2_800x480(bool touch = false);
 AirPlayConfig bmwEntryNav2_1280x480(bool touch = false);
 AirPlayConfig bmwEntryNav2_1440x540(bool touch = false);
+
+/// Accepted range for bmwEntryNav2ForDisplay (landscape only).
+static const int32_t kMinDisplayWidthPx = 320;
+static const int32_t kMaxDisplayWidthPx = 2560;
+static const int32_t kMinDisplayHeightPx = 240;
+static const int32_t kMaxDisplayHeightPx = 1600;
+
+/// Profile for the resolution the platform layer reads from the LayerManager at run time (never a
+/// hardcoded size). Same settings as the fixed profiles; the physical width is the fixed profile's
+/// estimate for 800x480 / 1280x480 / 1440x540 and otherwise width_px * 142 / 800 mm (the F20 panel's
+/// pixel pitch estimate), rounded and clamped to [1, 2000]; the height follows from the aspect ratio.
+/// Returns false (out untouched) unless kMin..kMaxDisplayWidthPx / HeightPx hold and width >= height.
+bool bmwEntryNav2ForDisplay(int32_t width_px, int32_t height_px, bool touch, AirPlayConfig& out);
 
 // ---- /info ----
 /// 0x615653aee2, minus 0x10004540a00 when audio output is disabled.
