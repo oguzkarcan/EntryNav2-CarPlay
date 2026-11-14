@@ -37,12 +37,8 @@ struct Item {
     std::vector<uint8_t> value;
 
     Item() : type(0) {}
-    Item(uint8_t t, const std::vector<uint8_t>& v) : type(t), value(v) {}
-    Item(uint8_t t, const uint8_t* data, size_t len) : type(t) {
-        if (data != NULL && len > 0) {
-            value.assign(data, data + len);
-        }
-    }
+    Item(uint8_t t, const std::vector<uint8_t>& v);
+    Item(uint8_t t, const uint8_t* data, size_t len);
 
     static Item fromByte(uint8_t t, uint8_t b);
 

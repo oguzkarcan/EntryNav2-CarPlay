@@ -42,6 +42,14 @@ void appendItemEncoded(std::vector<uint8_t>& out, uint8_t type, const std::vecto
 
 }  // namespace
 
+Item::Item(uint8_t t, const std::vector<uint8_t>& v) : type(t), value(v) {}
+
+Item::Item(uint8_t t, const uint8_t* data, size_t len) : type(t) {
+    if (data != NULL && len > 0) {
+        value.assign(data, data + len);
+    }
+}
+
 Item Item::fromByte(uint8_t t, uint8_t b) {
     Item item;
     item.type = t;
