@@ -1,0 +1,136 @@
+# EntryNav2-CarPlay CI.
+#
+#   host-linux           make test-host on Ubuntu with the current g++ (blocking) and clang++ (advisory).
+#   armv7-gcc47          builds AND runs every test binary with GCC 4.7.2 for ARMv7 hard-float, the
+#                        compiler generation of the BMW HU_ENTRYNAV2 (eglibc 2.15, libstdc++.so.6.0.17).
+#   no-proprietary-files fails if the tree contains libraries, archives, keys, a sysroot/ or big files.
+#
+# No copy of the car's system (sysroot) is ever used here: vehicle libraries are dlopen()ed at run
+# time, so everything builds and links against libc/libstdc++ only. See docs/BUILD.md.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      armhf_image:
+        description: "Debian 7 wheezy armhf image for the GCC 4.7 job (e.g. debian/eol:wheezy or arm32v7/debian:wheezy)"
+        required: false
+        default: "debian/eol:wheezy"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  host-linux:
+    name: Host tests (${{ matrix.compiler }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    continue-on-error: ${{ matrix.advisory }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - compiler: g++
+            cc: gcc
+            advisory: false
+          # clang++ has never been tried on this code base; -Werror may trip on clang-only warnings.
+          - compiler: clang++
+            cc: clang
+            advisory: true
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Toolchain versions
+        run: |
+          uname -a
+          ldd --version | head -n 1
+          make --version | head -n 1
+          ${{ matrix.compiler }} --version
+          ${{ matrix.cc }} --version | head -n 1
+
+      - name: make test-host
+        run: make test-host CXX=${{ matrix.compiler }} CC=${{ matrix.cc }}
+
+  armv7-gcc47:
+    name: ARMv7 hard-float, GCC 4.7.2 (Debian wheezy armhf under QEMU)
+    runs-on: ubuntu-latest
+    # Compiling and running under qemu-user is slow (the 3072-bit SRP tests especially).
+    timeout-minutes: 150
+    env:
+      ARMHF_IMAGE: ${{ inputs.armhf_image || 'debian/eol:wheezy' }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up QEMU (binfmt for arm)
+        uses: docker/setup-qemu-action@v4
+        with:
+          platforms: arm
+
+      - name: Pull ${{ env.ARMHF_IMAGE }} (linux/arm/v7)
+        run: |
+          case "$ARMHF_IMAGE" in
+            *[!A-Za-z0-9._/:@-]*) echo "::error::unexpected characters in image name: $ARMHF_IMAGE"; exit 1 ;;
+          esac
+          docker version
+          ls -l /proc/sys/fs/binfmt_misc/ | grep -i arm || true
+          docker pull --platform linux/arm/v7 "$ARMHF_IMAGE"
+          docker image inspect --format 'id={{.Id}} digests={{.RepoDigests}} os={{.Os}} arch={{.Architecture}} variant={{.Variant}} created={{.Created}}' "$ARMHF_IMAGE"
+
+      - name: Build and run all tests with g++-4.7 (armhf, native in emulated container)
+        run: |
+          mkdir -p "$RUNNER_TEMP/armv7-out"
+          docker run --rm --platform linux/arm/v7 \
+            -v "$GITHUB_WORKSPACE:/src:ro" \
+            -v "$RUNNER_TEMP/armv7-out:/out" \
+            --tmpfs /work:exec,size=3g \
+            "$ARMHF_IMAGE" sh /src/scripts/ci/wheezy_armhf.sh
+
+      - name: Test summary
+        if: always()
+        run: |
+          f="$RUNNER_TEMP/armv7-out/summary.txt"
+          if [ -f "$f" ]; then
+            cat "$f"
+            { echo '### ARMv7 / GCC 4.7 test summary'; echo '```'; cat "$f"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "no summary.txt (the job failed before the tests ran; see the step log)"
+          fi
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: armv7-gcc47-logs
+          path: ${{ runner.temp }}/armv7-out
+          if-no-files-found: warn
+          retention-days: 14
+
+  # Fallback NOT implemented: the reference project's approach (ubuntu:12.10 + gcc-arm-linux-gnueabihf
+  # 4.7 from old-releases.ubuntu.com, test binaries run with qemu-arm -L /usr/arm-linux-gnueabihf)
+  # cannot be used as-is on hosted runners, because the ubuntu:12.10 / ubuntu:quantal tags exist on
+  # Docker Hub only as manifest schema v1, which Docker Engine stopped pulling (disabled in 26.0,
+  # removed in 28.2). scripts/ci/build_and_test.sh still supports that cross setup through
+  # CXX=arm-linux-gnueabihf-g++ ... RUNNER="qemu-arm -L <sysroot>" for anyone who has such a box.
+
+  no-proprietary-files:
+    name: No proprietary / secret files
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check tracked files
+        run: sh scripts/ci/check_repo_content.sh
+
+      - name: Shell syntax of CI scripts
+        run: |
+          for s in scripts/ci/*.sh; do echo "sh -n $s"; sh -n "$s"; done

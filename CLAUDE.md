@@ -40,6 +40,9 @@ $env:PATH = "$tools\w64devkit\bin;$tools\mingit\cmd;" + $env:PATH
 make clean; make test-host BIN_EXT=.exe
 ```
 
+- **Build guide & CI:** see [docs/BUILD.md](docs/BUILD.md) (Windows/Linux host tests, car builds, dlopen policy). CI is `.github/workflows/ci.yml` (Linux host tests + GCC 4.7.2 ARMv7 build-and-run under QEMU via `scripts/ci/build_and_test.sh`).
+- **Car sysroot:** `C:\Users\Acer\Documents\EntryNav2-CarPlay-Assets\sysroot\entrynav2-sysroot-202402191339.tar.gz` (proprietary BMW/supplier files). **Never commit, upload, cache or link it**, and **never extract it on NTFS** (symlinks break) — extract only on a Linux filesystem outside the repo.
+
 ---
 
 ## 3. Hard Target Constraints (`HU_ENTRYNAV2` / GCC 4.7.2)
