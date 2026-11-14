@@ -86,11 +86,18 @@ void ParameterList::addRaw(uint16_t id, const std::vector<uint8_t>& payload) {
 }
 
 void ParameterList::addVoid(uint16_t id) {
-    params_.push_back(Parameter(id, std::vector<uint8_t>()));
+    params_.resize(params_.size() + 1);
+    Parameter& p = params_.back();
+    p.id = id;
+    p.payload.clear();
 }
 
 void ParameterList::addU8(uint16_t id, uint8_t value) {
-    params_.push_back(Parameter(id, std::vector<uint8_t>(1, value)));
+    params_.resize(params_.size() + 1);
+    Parameter& p = params_.back();
+    p.id = id;
+    p.payload.clear();
+    p.payload.push_back(value);
 }
 
 void ParameterList::addI8(uint16_t id, int8_t value) {

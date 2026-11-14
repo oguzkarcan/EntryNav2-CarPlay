@@ -119,7 +119,9 @@ std::vector<uint8_t> prefix(const std::vector<uint8_t>& v, size_t n) {
 }
 
 void cat(std::vector<uint8_t>& out, const std::vector<uint8_t>& v) {
-    out.insert(out.end(), v.begin(), v.end());
+    for (size_t i = 0; i < v.size(); ++i) {
+        out.push_back(v[i]);
+    }
 }
 
 // Test-local pad / minimal encodings (Kotlin semantics), deliberately not using srp::encode*.

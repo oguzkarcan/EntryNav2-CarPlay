@@ -33,6 +33,7 @@ echo "== debian_version: $(cat /etc/debian_version 2>/dev/null || echo '?')"
 
 cat > /etc/apt/sources.list <<'EOF'
 deb http://archive.debian.org/debian wheezy main
+deb http://archive.debian.org/debian-security wheezy/updates main
 EOF
 rm -f /etc/apt/sources.list.d/*.list 2>/dev/null || true
 cat > /etc/apt/apt.conf.d/99ci-eol <<'EOF'

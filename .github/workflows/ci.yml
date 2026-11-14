@@ -58,7 +58,7 @@ jobs:
           ${{ matrix.cc }} --version | head -n 1
 
       - name: make test-host
-        run: make test-host CXX=${{ matrix.compiler }} CC=${{ matrix.cc }}
+        run: CXX=${{ matrix.compiler }} CC=${{ matrix.cc }} sh scripts/ci/build_and_test.sh host
 
   armv7-gcc47:
     name: ARMv7 hard-float, GCC 4.7.2 (Debian wheezy armhf under QEMU)

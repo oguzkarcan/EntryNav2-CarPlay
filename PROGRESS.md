@@ -89,11 +89,19 @@ All Phase 1 protocol primitives are implemented in portable C++11 (`-std=gnu++0x
 5. CI: Linux host tests + GCC 4.7.x ARMv7 build-and-run under QEMU; the sysroot never leaves the PC (see `docs/BUILD.md`).
 
 ### Wave A
-- [x] **F3-P0 — CI & ARM GCC 4.7 verification** — workflow written; first CI run pending verification.
-  - `.github/workflows/ci.yml`: `host-linux` (`make test-host`, g++ blocking + clang++ advisory), `armv7-gcc47` (Debian 7 wheezy armhf `debian/eol:wheezy` under QEMU, `g++-4.7` 4.7.2-5, `-std=gnu++0x -O2 -march=armv7-a -mfpu=neon -mfloat-abi=hard -Wall -Wextra -Werror`, builds with `make -k` and runs every test binary; checks hard-float ELF attributes, `DT_NEEDED`, max `GLIBC_2.15` / `GLIBCXX_3.4.17` / `CXXABI_1.3.6`; logs as artifact), `no-proprietary-files`.
-  - `scripts/ci/build_and_test.sh` (POSIX sh, `host` / `armv7-gcc47` profiles, also usable with a cross compiler + `RUNNER="qemu-arm -L …"`), `scripts/ci/wheezy_armhf.sh` (container entry), `scripts/ci/check_repo_content.sh`; `docs/BUILD.md`.
-- [ ] **F3-P1 — Core hardening + F20 profile**: P8 review items (pre-verify request budget, no re-pairing after encryption, teardown order) + F20 audio/display profile (44.1 kHz, LPCM-only).
-- [ ] **F3-P2 — Platform base (`src/platform`)**: socket compat, poll reactor, TCP/UDP, timers, OS `RandomSource`, persistent `PairingStore` + `Identity`.
+- [x] **F3-P0 — CI & ARM GCC 4.7 verification** (2026-11-14)
+  - `.github/workflows/ci.yml`: `host-linux` (`sh scripts/ci/build_and_test.sh host`, g++ blocking + clang++ advisory), `armv7-gcc47` (Debian 7 wheezy armhf `debian/eol:wheezy` under QEMU, `g++-4.7` 4.7.2-5, `-std=gnu++0x -O2 -march=armv7-a -mfpu=neon -mfloat-abi=hard -Wall -Wextra -Werror`, builds with `make -k` and runs every test binary; checks hard-float ELF attributes, `DT_NEEDED`, max `GLIBC_2.15` / `GLIBCXX_3.4.17` / `CXXABI_1.3.6`; logs as artifact), `no-proprietary-files`.
+  - `scripts/ci/build_and_test.sh` (POSIX sh, `host` / `armv7-gcc47` profiles, also usable with a cross compiler + `RUNNER="qemu-arm -L …"`), `scripts/ci/wheezy_armhf.sh` (container entry with both `wheezy` and `wheezy/updates` APT archive repos), `scripts/ci/check_repo_content.sh`; `docs/BUILD.md`; `LICENSE` (GNU GPLv3).
+- [x] **F3-P1 — Core hardening + F20 profile + microphone packetizer** (2026-11-14)
+  - P8 review items in `Session`: `SessionPolicy::max_pre_verify_requests = 16` (closes control channel when pre-verify request budget is exceeded), `reVerifyAllowed()` gate rejecting `/pair-setup` and `/pair-verify` (`403 Forbidden`) once control channel encryption is active (`cipher_.isReady()`), and deterministic `TEARDOWN` ordering (`MediaHandler::onStreamsTorndown` -> `TransportHost` socket cleanup -> `SessionListener::onSessionEnded` when `has_established_streams_` drops to empty).
+  - BMW F20 (`HU_ENTRYNAV2`) LPCM-only / 44.1 kHz Dirana audio profile in `airplay_info`: `makeF20EntryNav2Config(EvoDisplayVariant)` (`kF20AudioFormats` 6 entries: main 44.1k stereo, alt 44.1k stereo, telephony 8k/16k/24k in+out, Siri 16k in; `makeBmwEntryNav2Config` stays as backward-compatible alias).
+  - Microphone RTP packetizer (`include/carplay/audio_packetizer.hpp`, `src/core/audio_packetizer.cpp`, `tests/test_audio_packetizer.cpp` 14/14): `audio::InputPacketizer` (12-byte RTP header V=2 PT=96, big-endian S16 PCM conversion, ChaCha20-Poly1305 sealing with `inputKey` and `[4B seq || 4B ts || 4B ssrc]` nonce) + `audio::PcmRingBuffer`.
+- [x] **F3-P2 — Platform base (`src/platform/`)** (2026-11-14)
+  - `net_compat`: cross-platform POSIX/Winsock2 non-blocking sockets, IPv4/IPv6 `SockAddr`, `pollSockets` (`poll()` / `WSAPoll()`), self-pipe / loopback `WakePipe`, monotonic clock (`clock_gettime(CLOCK_MONOTONIC)` / `QueryPerformanceCounter`), `sleepMs`.
+  - `tcp` & `udp`: `TcpListener`, `TcpConnection` (`RecvResult` / `SendResult` with `WouldBlock` backpressure), `UdpSocket`.
+  - `reactor`: single-threaded `Reactor` multiplexing fds, monotonic one-shot/repeating timers, cross-thread `post()` queue woken via `WakePipe`.
+  - `os_random`, `file_util`, `pairing_storage`, `thread`, `log`: `OsRandomSource` (`/dev/urandom` / `BCryptGenRandom`), atomic temp+fsync+rename `writeFileAtomic` (`0600`), persistent `FilePairingStore` (`controller_pairings.tsv`) and `loadOrCreateAccessoryIdentity` (`accessory_ltpk.key`), RAII `Thread`/`Mutex`/`ScopedLock`.
+  - Tests: `test_platform_net` (14/14), `test_platform_reactor` (13/13), `test_platform_storage` (11/11).
 
 ### Wave B
 - [ ] **F3-P3 — Network session server + media engine**: control `:7000`, event, timing / keep-alive UDP, backpressure, peer checks, rate limiting; screen TCP receiver, audio UDP receivers, feedback; real-socket loopback end-to-end test.
