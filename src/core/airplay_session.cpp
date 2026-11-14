@@ -144,6 +144,8 @@ Session::Session(const info::AirPlayConfig& config,
       active_streams_(),
       device_info_(),
       closed_(false),
+      session_setup_done_(false),
+      unverified_requests_(0),
       empty_() {}
 
 Session::~Session() {
@@ -224,6 +226,13 @@ bool Session::onControlBytes(const uint8_t* data, size_t len, std::vector<uint8_
 
 bool Session::processRequest(const rtsp::Request& request, std::vector<uint8_t>& out) {
     if (closed_) return false;
+    if (cipher_.get() == NULL) {
+        ++unverified_requests_;
+        if (policy_.max_unverified_requests > 0 && unverified_requests_ > policy_.max_unverified_requests) {
+            debugLog("airplay control closing: pre-verify request budget exceeded");
+            return false;  // caller closes; no response for this request
+        }
+    }
     rtsp::Response response;
     if (!handle(request, response)) {
         debugLog("airplay handler failed " + request.method + " " + request.path);
@@ -300,6 +309,14 @@ bool Session::handle(const rtsp::Request& request, rtsp::Response& response) {
         debugLog("airplay refused " + request.method + " " + request.path + " before pair-verify");
         return true;
     }
+    if (policy_.refuse_pairing_after_verified && cipher_.get() != NULL &&
+        (route == kRoutePairSetup || route == kRoutePairVerify)) {
+        // Would reset PairVerify and wipe the shared secret the stream keys / event channel rely on.
+        response = rtsp::Response(kStatusForbidden);
+        response.status_text = "Forbidden";
+        debugLog("airplay refused " + request.method + " " + request.path + " on the encrypted connection");
+        return true;
+    }
     switch (route) {
         case kRouteSetup:
             return handleSetup(request, response);
@@ -371,15 +388,24 @@ bool Session::handleSetup(const rtsp::Request& request, rtsp::Response& response
 
     bplist::Value out = bplist::Value::makeDict();
     int32_t port = 0;
-    if (!transport_.openTiming(peer_timing_port, port)) return false;
+    if (!transport_.openTiming(peer_timing_port, port)) {
+        transport_.closeSetupPorts();
+        return false;
+    }
     out.set("timingPort", bplist::Value::makeInt(port));
     port = 0;
-    if (!transport_.openEvent(port)) return false;
+    if (!transport_.openEvent(port)) {
+        transport_.closeSetupPorts();
+        return false;
+    }
     out.set("eventPort", bplist::Value::makeInt(port));
     const bplist::Value* ka = dict.find("keepAliveLowPower");
     if (ka != NULL && ((ka->isBool() && ka->asBool()) || (ka->isInt() && ka->asInt() == 1))) {
         port = 0;
-        if (!transport_.openKeepAlive(port)) return false;
+        if (!transport_.openKeepAlive(port)) {
+            transport_.closeSetupPorts();
+            return false;
+        }
         out.set("keepAlivePort", bplist::Value::makeInt(port));
     }
     const bplist::Value* proposed = dict.find("features");
@@ -388,7 +414,9 @@ bool Session::handleSetup(const rtsp::Request& request, rtsp::Response& response
     bplist::Value::Array arr;
     for (size_t i = 0; i < features.size(); ++i) arr.push_back(bplist::Value::makeString(features[i]));
     out.set("enabledFeatures", bplist::Value::makeArray(arr));
-    return plistResponse(out, response);
+    if (!plistResponse(out, response)) return false;
+    session_setup_done_ = true;
+    return true;
 }
 
 bool Session::handleStreams(const bplist::Value::Array& streams, rtsp::Response& response) {
@@ -487,9 +515,11 @@ bool Session::handleTeardown(const rtsp::Request& request, rtsp::Response& respo
     std::vector<int32_t> types;
     teardownStreamTypes(decoded ? &body : NULL, whole, types);
     if (whole) {
+        // Reference order (AirPlaySession.kt handleTeardown): every onTeardown first, then clear, so a
+        // callback still sees the streams being torn down in hasActiveStream().
         const std::vector<int32_t> active(active_streams_);
-        active_streams_.clear();
         for (size_t i = 0; i < active.size() && !closed_; ++i) media_.onTeardown(*this, active[i]);
+        active_streams_.clear();
     } else {
         for (size_t i = 0; i < types.size() && !closed_; ++i) {
             if (removeActiveStream(types[i])) media_.onTeardown(*this, types[i]);
@@ -514,8 +544,16 @@ bool Session::handleBufferedAudio(const rtsp::Request& request, rtsp::Response& 
 
 // ---- Event channel ----
 
+bool Session::eventExpected() const {
+    return !closed_ && cipher_.get() != NULL && session_setup_done_ && !events_.ready();
+}
+
 bool Session::onEventAccepted(std::vector<uint8_t>& wire_out) {
     if (closed_) return false;
+    if (events_.ready()) {
+        debugLog("airplay event rejected: an event channel is already active");
+        return false;  // the active channel and the session are left untouched
+    }
     uint8_t shared[crypto::kKeyBytes];
     if (!pair_verify_.sharedSecret(shared)) {
         debugLog("airplay event rejected: pair-verify shared secret unavailable");
@@ -528,7 +566,13 @@ bool Session::onEventAccepted(std::vector<uint8_t>& wire_out) {
         close();
         return false;
     }
-    events_.flushPendingNightMode(wire_out);
+    if (!events_.flushPendingNightMode(wire_out)) {
+        // Encode / encrypt failure on a fresh channel: drop the channel, keep the session (the night
+        // mode stays pending). The caller closes the event socket and drops wire_out.
+        debugLog("airplay event channel closed: pending night mode could not be sent");
+        events_.close();
+        return false;
+    }
     return true;
 }
 
@@ -558,6 +602,7 @@ void Session::close() {
     pair_setup_.reset();
     pair_verify_.reset();
     active_streams_.clear();
+    session_setup_done_ = false;
     listener_.onSessionEnded(*this);
 }
 

@@ -119,7 +119,10 @@ public:
     }
     /// POST /feedback. Return true + plist body, or false for an empty 200.
     virtual bool onFeedback(Session& /*session*/, bplist::Value& /*response_out*/) { return false; }
-    /// One call per active stream type removed by TEARDOWN.
+    /// One call per active stream type removed by TEARDOWN. For a whole-session TEARDOWN every call is
+    /// made BEFORE the active set is cleared (reference order, AirPlaySession.kt handleTeardown), so
+    /// Session::hasActiveStream() still reports the streams being torn down; for a per-type TEARDOWN the
+    /// type has already been removed when its call runs (also the reference order).
     virtual void onTeardown(Session& /*session*/, int32_t /*type*/) {}
     /// duckAudio (true) / unduckAudio (false).
     virtual void onAudioDuck(Session& /*session*/, bool /*ducked*/) {}
@@ -133,6 +136,16 @@ public:
 
 /// Replaces the sockets the reference opens inside handleSetup (NTP timing UDP, event TCP server,
 /// keep-alive UDP). The session only needs the local port numbers for the SETUP response.
+///
+/// REPEATED SETUP: every session SETUP (a SETUP without `streams`) calls openTiming, openEvent and, if
+/// asked for, openKeepAlive again, on the same TransportHost. Implementations MUST be idempotent: either
+/// reuse the already open socket (returning the same port) or close it and open a replacement; they
+/// must never leak the earlier socket. (The reference throws "NtpClock is already running" on a second
+/// SETUP and leaks its event server; neither behaviour is wanted here.)
+///
+/// FAILED SETUP: when openTiming, openEvent or openKeepAlive returns false, the session calls
+/// closeSetupPorts() before answering 500, so a timing socket opened earlier in the same SETUP does not
+/// leak.
 class TransportHost {
 public:
     virtual ~TransportHost() {}
@@ -141,11 +154,16 @@ public:
     /// 0 when absent or outside 1..65535. false -> SETUP answered with 500.
     virtual bool openTiming(int32_t peer_timing_port, int32_t& local_port_out) = 0;
     /// Open the event TCP server. The socket layer must accept only the control peer's address
-    /// (reference acceptFrom(expected), AirPlaySession.kt:876) and then call Session::onEventAccepted.
+    /// (reference acceptFrom(expected), AirPlaySession.kt:876), only while Session::eventExpected(),
+    /// and then call Session::onEventAccepted.
     virtual bool openEvent(int32_t& local_port_out) = 0;
     /// Open the keep-alive UDP socket (only when the phone asked for keepAliveLowPower).
     virtual bool openKeepAlive(int32_t& local_port_out) = 0;
-    /// Close every socket opened above (from Session::close()).
+    /// Close the timing / event-server / keep-alive sockets after a failed session SETUP. The default
+    /// closes everything (closeAll()); override to keep an already accepted event connection open.
+    virtual void closeSetupPorts() { closeAll(); }
+    /// Close every socket opened above (from Session::close(); may also run from closeSetupPorts(), so
+    /// it must tolerate being called more than once).
     virtual void closeAll() = 0;
 };
 
@@ -172,8 +190,26 @@ struct SessionPolicy {
     bool require_verified_for_session_requests;
     /// At most this many `streams[]` entries are examined per SETUP; later ones are ignored.
     size_t max_streams_per_setup;
+    /// Budget of requests handled on this connection BEFORE pair-verify succeeds (every request counts,
+    /// whatever its route or answer, including the pair-verify M3 that enables encryption). The request
+    /// that would exceed it is not answered and the session closes (onControlBytes returns false).
+    /// Rationale: an unauthenticated peer could otherwise loop /info (~100x amplification) or pair-setup
+    /// M1/M3 (tens of ms of SRP-6a each) forever on one connection. A normal bring-up needs 6 (1 /info
+    /// + 3 pair-setup + 2 pair-verify). 0 = unlimited (reference behaviour). Default 32.
+    size_t max_unverified_requests;
+    /// When true (default) a /pair-setup or /pair-verify request arriving on an ENCRYPTED control
+    /// connection is answered "403 Forbidden" and never reaches PairSetup / PairVerify. Without this,
+    /// such a request (reference behaviour) resets PairVerify, wiping the verified shared secret that
+    /// stream-key derivation and the event channel depend on. This default is NOT verified against a
+    /// real iPhone; if an iPhone turns out to re-pair on an open connection, set it to false to restore
+    /// the reference behaviour.
+    bool refuse_pairing_after_verified;
 
-    SessionPolicy() : require_verified_for_session_requests(true), max_streams_per_setup(32) {}
+    SessionPolicy()
+        : require_verified_for_session_requests(true),
+          max_streams_per_setup(32),
+          max_unverified_requests(32),
+          refuse_pairing_after_verified(true) {}
 };
 
 /// Status of the pre-verification refusal.
@@ -197,7 +233,8 @@ public:
 
     /// Feeds bytes read from the control socket (any split) and APPENDS the bytes to write back to
     /// `out`. Returns false when the connection must be closed: decrypt failure, RTSP framing violation
-    /// (header > 16 KiB, body > 1 MiB, bad Content-Length), encryption failure, or the session is (or
+    /// (header > 16 KiB, body > 1 MiB, bad Content-Length), encryption failure, pre-verify request
+    /// budget exceeded (SessionPolicy::max_unverified_requests), or the session is (or
     /// became, e.g. via a callback) closed. On false the session has been close()d; `out` may still hold
     /// responses produced earlier in the same call (the reference never flushes them; the caller may
     /// drop them).
@@ -210,8 +247,20 @@ public:
 
     /// The phone connected to the event port (address already checked by the socket layer). Starts the
     /// event channel from the pair-verify shared secret and flushes a pending night mode into
-    /// `wire_out`. With no verified shared secret the session closes and false is returned (acceptEvent).
+    /// `wire_out`. Returns true when the channel is ready. On false the caller closes THIS event
+    /// socket, drops `wire_out`, and checks closed() for the session:
+    ///  - session closed (or no verified shared secret: the session closes, like acceptEvent);
+    ///  - an event channel is already active: refused, the session AND the active channel are left
+    ///    untouched (a second connection must not replace the first);
+    ///  - flushing the pending night mode failed: the new event channel is closed again, the session
+    ///    stays open (event-channel failures never take down the control connection by themselves; the
+    ///    night mode stays pending and a later accept may retry).
     bool onEventAccepted(std::vector<uint8_t>& wire_out);
+    /// True while the socket layer should accept an event connection: a session SETUP succeeded on this
+    /// verified (encrypted) connection, the session is open and no event channel is active. The socket
+    /// layer combines this with the reference's address rule (accept only the control peer's address);
+    /// core knows no addresses.
+    bool eventExpected() const;
     /// Bytes from the event socket. On failure (decrypt / framing) the session closes (runEventRead's
     /// finally block) and false is returned.
     bool onEventBytes(const uint8_t* data,
@@ -243,6 +292,10 @@ public:
     const DeviceInfo& deviceInfo() const { return device_info_; }
     const info::AirPlayConfig& config() const { return config_; }
     const SessionPolicy& policy() const { return policy_; }
+    /// A session SETUP (timing / event ports) has been answered with 200 on this connection.
+    bool sessionSetupDone() const { return session_setup_done_; }
+    /// Requests handled so far before pair-verify succeeded (see max_unverified_requests).
+    size_t unverifiedRequests() const { return unverified_requests_; }
 
     // ---- Keys for the platform / media layers (all false unless pair-verify succeeded) ----
 
@@ -328,6 +381,8 @@ private:
     std::vector<int32_t> active_streams_;
     DeviceInfo device_info_;
     bool closed_;
+    bool session_setup_done_;
+    size_t unverified_requests_;
     std::string empty_;
 };
 

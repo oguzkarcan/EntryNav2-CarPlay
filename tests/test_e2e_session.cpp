@@ -34,6 +34,7 @@
 #include "carplay/bigint.hpp"
 #include "carplay/bplist_codec.hpp"
 #include "carplay/control_cipher.hpp"
+#include "carplay/mic_uplink.hpp"
 #include "carplay/ntp_timing.hpp"
 #include "carplay/pairing.hpp"
 #include "carplay/rtsp_message.hpp"
@@ -424,6 +425,10 @@ struct E2EMedia : public session::MediaHandler {
         const bplist::Value* f = st.find("audioFormat");
         if (f != NULL) session::Session::plistUnsignedId(*f, bits);
         const audio::AudioFormat fmt = audio::formatFromBits(bits, type, strAt(st, "audioType"));
+        if (!info::isSupportedOutputFormat(s.config(), fmt)) {  // LPCM-only head unit
+            events.push_back("declined:" + dec(bits));
+            return false;
+        }
         if (type == info::kStreamTypeMainAudio) {
             main_key = key;
             main_id = id;
@@ -998,6 +1003,18 @@ void checkInfo(const bplist::Value& v, const info::AirPlayConfig& config) {
     CHECK(v.getUInt("features", features));
     CHECK(features == 0x615653aee2ULL);
     CHECK(features == info::features(config));
+    // F20 profile: LPCM only (no Opus bit anywhere, no 102 AAC-LC / 103 buffered entry), 44.1 kHz.
+    const bplist::Value* formats = v.find("audioFormats");
+    REQUIRE(formats != NULL && formats->isArray() && formats->asArray().size() == 8U);
+    for (size_t i = 0; i < formats->asArray().size(); ++i) {
+        const bplist::Value& f = formats->asArray()[i];
+        const int64_t t = intAt(f, "type");
+        CHECK(t == 100 || t == 101);
+        CHECK_EQ(0, intAt(f, "audioOutputFormats") & 0x70c00000);
+        CHECK_EQ(0, intAt(f, "audioOutputFormats") & 0xc000);  // no 48 kHz PCM
+        if (f.find("audioInputFormats") != NULL) CHECK_EQ(0x554, intAt(f, "audioInputFormats"));
+    }
+    CHECK(v.find("mainBufferedInfo") == NULL);
     const bplist::Value* displays = v.find("displays");
     REQUIRE(displays != NULL && displays->isArray() && displays->asArray().size() == 1U);
     const bplist::Value& d0 = displays->asArray()[0];
@@ -1113,8 +1130,17 @@ void runGoldenPath(AccessoryEnv& env, bool bytewise, GoldenResult& res) {
     Bytes ev_wire;
     CHECK(!s.setNightMode(true, ev_wire));
     CHECK(ev_wire.empty());
+    CHECK(s.eventExpected());  // the socket layer would now accept the control peer's connection
     REQUIRE(s.onEventAccepted(ev_wire));
     CHECK(s.events().ready());
+    CHECK(!s.eventExpected());
+    CHECK_EQ(6U, s.unverifiedRequests());  // 1 /info + 3 pair-setup + 2 pair-verify
+    {
+        Bytes dup;  // a second event connection is refused, the first keeps working
+        CHECK(!s.onEventAccepted(dup));
+        CHECK(dup.empty());
+        CHECK(!s.closed());
+    }
     {
         std::vector<rtsp::Request> reqs;
         REQUIRE(phone.readEvents(ev_wire, reqs));
@@ -1205,7 +1231,7 @@ void runGoldenPath(AccessoryEnv& env, bool bytewise, GoldenResult& res) {
         bplist::Value::Array e;
         bplist::Value m = dict();
         m.set("type", num(100));
-        m.set("audioFormat", num(0x8000));  // LPCM 48 kHz / 16-bit / stereo
+        m.set("audioFormat", num(0x800));  // LPCM 44.1 kHz / 16-bit / stereo (the F20 profile's rate)
         m.set("audioType", str("media"));
         m.set("streamConnectionID", bplist::Value::makeUInt(kAudioConnId));
         m.set("audioLatencyMs", num(50));
@@ -1214,7 +1240,7 @@ void runGoldenPath(AccessoryEnv& env, bool bytewise, GoldenResult& res) {
         e.push_back(m);
         bplist::Value a = dict();
         a.set("type", num(101));
-        a.set("audioFormat", num(0x4000));  // LPCM 48 kHz mono
+        a.set("audioFormat", num(0x400));  // LPCM 44.1 kHz mono
         a.set("audioType", str("alert"));
         a.set("streamConnectionID", bplist::Value::makeUInt(kAltConnId));
         e.push_back(a);
@@ -1245,7 +1271,7 @@ void runGoldenPath(AccessoryEnv& env, bool bytewise, GoldenResult& res) {
     CHECK_EQ(100, s.activeStreams()[1]);
     CHECK_EQ(101, s.activeStreams()[2]);
     CHECK(rig.media.main_format.codec == audio::kCodecLpcm);
-    CHECK_EQ(48000U, rig.media.main_format.sample_rate);
+    CHECK_EQ(44100U, rig.media.main_format.sample_rate);
     CHECK_EQ(2U, rig.media.main_format.channels);
     CHECK_EQ(1U, rig.media.alt_format.channels);
     // The keys the accessory's media handler derived equal the phone's own derivations.
@@ -1473,7 +1499,7 @@ void runGoldenPath(AccessoryEnv& env, bool bytewise, GoldenResult& res) {
         const bplist::Value& e = st->asArray()[0];
         CHECK_EQ(join(strs("type", "sampleRate", "streamConnectionID", "timestamp", "sampleTime")), join(keysOf(e)));
         CHECK_EQ(100, intAt(e, "type"));
-        CHECK_EQ(48000, intAt(e, "sampleRate"));
+        CHECK_EQ(44100, intAt(e, "sampleRate"));
         uint64_t id = 0;
         CHECK(e.getUInt("streamConnectionID", id) && id == kAudioConnId);
         uint64_t ts = 0;
@@ -1588,12 +1614,14 @@ struct PairedRig {
 // every byte the accessory emitted during the chunked golden path, (1) on the control channel while it
 // was plaintext (/info, pair-setup M2/M4/M6, pair-verify M2/M4) and (2) on the encrypted control
 // channel followed by everything written to the event channel. The byte-at-a-time run must match too.
+// Re-pinned in Phase 3 F3-P1: the F20 profile now advertises 44.1 kHz LPCM-only audioFormats in /info
+// (plaintext and encrypted phase) and the golden path negotiates 44.1 kHz LPCM (feedback sampleRate).
 const char* const kPinPlainPhase =
-    "462f4c7c53f929c2e5354860b60d3521dfd93b1f7ff37606ed8e9210ffee6e60"
-    "1eee0119818f4af52842eb006bfe27159c9c0b9db4b74e881876a3d4f6f6fdaa";
+    "e9271490b78b0c0c5d01e448ba38d9df9efe36815bf982793f4ddd6970bfe79b"
+    "23fbb7ed2323233bfbe7dd532560e53765f8c96d9fd09295716d2169502cc3bc";
 const char* const kPinEncryptedTranscript =
-    "b3de3349c844c4605a310f16c33d6e79ca01fe5cf184e0d8e1e67f715237b582"
-    "1ad84cfcc7308c5cf9a62e64d9086773b9ae453452baff4d2706f2480f6d89ce";
+    "e47d033286eda92cd64470040efa344c00d626c1b9ac03ebaf7657973bad73de"
+    "f068c36f8958f5d10d9f811df6ae6a93329fadf9ef21a6f5a46957a9f08f4f06";
 
 }  // namespace
 
@@ -1874,6 +1902,187 @@ TEST_CASE(oversizedContentLengthCloses) {
         CHECK(out.empty());
         CHECK(s.closed());
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// C2. Phase 3 F3-P1 hardening, end to end
+// ---------------------------------------------------------------------------------------------
+
+TEST_CASE(unauthenticatedInfoFloodClosesAtBudget) {
+    PairedRig p;
+    session::Session& s = p.s();
+    Reply r;
+    for (int i = 0; i < 32; ++i) {
+        REQUIRE(p.phone.call(s, "GET", "/info", "", Bytes(), r));
+        CHECK_EQ(200, r.status);
+    }
+    CHECK(!p.phone.call(s, "GET", "/info", "", Bytes(), r));  // 33rd pre-verify request
+    CHECK(s.closed());
+    CHECK_EQ(1, p.rig->listener.ended);
+    CHECK_EQ(1, p.rig->transport.close_all);
+    // A pair-setup M1 flood is cut the same way (each M1 costs an SRP-6a key generation).
+    PairedRig q(false);
+    session::Session& s2 = q.s();
+    int answered = 0;
+    for (int i = 0; i < 40; ++i) {
+        Bytes b_pub, salt;
+        if (!q.phone.setupM1(s2, b_pub, salt)) break;
+        ++answered;
+    }
+    CHECK_EQ(32, answered);
+    CHECK(s2.closed());
+}
+
+TEST_CASE(rePairingOnEncryptedConnectionRefusedKeysSurvive) {
+    PairedRig p;
+    session::Session& s = p.s();
+    REQUIRE(p.phone.pairVerify(s));
+    Reply r;
+    REQUIRE(p.phone.callPlist(s, "SETUP", "rtsp://169.254.1.2/1", sessionSetupBody(), r));
+    CHECK_EQ(200, r.status);
+    // The phone (or an attacker on the open connection) starts a new pair-verify / pair-setup.
+    crypto::X25519KeyPair eph2;
+    const Bytes sec = prefix(shaStr("e2e-second-eph"), 32);
+    crypto::x25519FromSecret(&sec[0], eph2);
+    Items m1;
+    m1.push_back(tlv8::Item::fromByte(tlv8::kTagState, 1));
+    m1.push_back(tlv8::Item(tlv8::kTagPublicKey, arr(eph2.public_key, 32)));
+    REQUIRE(p.phone.call(s, "POST", "/pair-verify", rtsp::kContentTypePairingTlv8, tlv8::encode(m1), r));
+    CHECK_EQ(403, r.status);
+    Items sm1;
+    sm1.push_back(tlv8::Item(tlv8::kTagMethod, Bytes(1, 0)));
+    sm1.push_back(tlv8::Item::fromByte(tlv8::kTagState, 1));
+    REQUIRE(p.phone.call(s, "POST", "/pair-setup", rtsp::kContentTypePairingTlv8, tlv8::encode(sm1), r));
+    CHECK_EQ(403, r.status);
+    // Stream keys and the event channel still derive from the ORIGINAL verified secret.
+    bplist::Value::Array e;
+    bplist::Value m = dict();
+    m.set("type", num(100));
+    m.set("audioFormat", num(0x800));
+    m.set("audioType", str("media"));
+    m.set("streamConnectionID", bplist::Value::makeUInt(kAudioConnId));
+    e.push_back(m);
+    bplist::Value body = dict();
+    body.set("streams", bplist::Value::makeArray(e));
+    REQUIRE(p.phone.callPlist(s, "SETUP", "rtsp://169.254.1.2/1", body, r));
+    CHECK_EQ(200, r.status);
+    CHECK_BYTES_EQ(p.phone.streamKey(kAudioConnId), p.rig->media.main_key);
+    CHECK(s.eventExpected());
+    Bytes ev;
+    REQUIRE(s.setNightMode(false, ev) == false);
+    REQUIRE(s.onEventAccepted(ev));
+    std::vector<rtsp::Request> reqs;
+    REQUIRE(p.phone.readEvents(ev, reqs));  // decrypts with the phone's original event keys
+    CHECK_EQ(1U, reqs.size());
+    CHECK(!s.closed());
+}
+
+TEST_CASE(lpcmOnlyProfileDeclinesCompressedStreams) {
+    PairedRig p;
+    session::Session& s = p.s();
+    REQUIRE(p.phone.pairVerify(s));
+    bplist::Value::Array e;
+    bplist::Value aac = dict();
+    aac.set("type", num(102));
+    aac.set("audioFormat", num(0x400000));  // AAC-LC 44.1 kHz stereo
+    aac.set("audioType", str("media"));
+    aac.set("streamConnectionID", num(11));
+    e.push_back(aac);
+    bplist::Value opus = dict();
+    opus.set("type", num(100));
+    opus.set("audioFormat", num(0x40000000));  // Opus 48 kHz
+    opus.set("audioType", str("telephony"));
+    opus.set("streamConnectionID", num(12));
+    e.push_back(opus);
+    bplist::Value pcm = dict();
+    pcm.set("type", num(101));
+    pcm.set("audioFormat", num(0x400));
+    pcm.set("audioType", str("alert"));
+    pcm.set("streamConnectionID", num(13));
+    e.push_back(pcm);
+    bplist::Value body = dict();
+    body.set("streams", bplist::Value::makeArray(e));
+    Reply r;
+    REQUIRE(p.phone.callPlist(s, "SETUP", "rtsp://169.254.1.2/1", body, r));
+    CHECK_EQ(200, r.status);
+    bplist::Value v;
+    REQUIRE(bplist::decode(r.raw.body, v) && v.isDict());
+    const bplist::Value* st = v.find("streams");
+    REQUIRE(st != NULL && st->isArray() && st->asArray().size() == 1U);
+    CHECK_EQ(101, intAt(st->asArray()[0], "type"));
+    REQUIRE(s.activeStreams().size() == 1U);
+    CHECK_EQ(101, s.activeStreams()[0]);
+    CHECK_EQ(join(strs("audio:102", "declined:4194304", "audio:100", "declined:1073741824", "audio:101")),
+             join(p.rig->media.events));
+}
+
+TEST_CASE(microphoneUplinkOpensOnThePhone) {
+    PairedRig p;
+    session::Session& s = p.s();
+    REQUIRE(p.phone.pairVerify(s));
+    // Siri / call stream with a microphone: the phone names its own UDP dataPort for the uplink.
+    bplist::Value tel = dict();
+    tel.set("type", num(100));
+    tel.set("audioFormat", num(0x10));  // LPCM 16 kHz mono (the mic1 capture rate)
+    tel.set("audioType", str("speechRecognition"));
+    tel.set("streamConnectionID", bplist::Value::makeUInt(kAudioConnId));
+    tel.set("dataPort", num(50555));
+    tel.set("framesPerPacket", num(320));
+    bplist::Value::Array e;
+    e.push_back(tel);
+    bplist::Value body = dict();
+    body.set("streams", bplist::Value::makeArray(e));
+    Reply r;
+    REQUIRE(p.phone.callPlist(s, "SETUP", "rtsp://169.254.1.2/1", body, r));
+    CHECK_EQ(200, r.status);
+    CHECK(s.hasActiveStream(100));
+
+    // Platform side: microphone parameters + input key from the SETUP entry.
+    audio::MicStreamParams mp;
+    REQUIRE(audio::parseMicrophoneStream(100, tel, p.env.config.microphone, mp));
+    CHECK(mp.supported);
+    CHECK_EQ(50555, mp.data_port);
+    CHECK_EQ(100U, static_cast<unsigned>(mp.payload_type));
+    CHECK_EQ(std::string("speechrecognition"), mp.format.audio_type);
+    CHECK_EQ(20U, mp.frame_millis);  // round(320 * 1000 / 16000)
+    CHECK_EQ(320U, mp.samples_per_packet);
+    CHECK_EQ(320U, mp.rtp_samples_per_packet);
+    uint8_t in_key[32];
+    REQUIRE(s.streamInputKey(tel, in_key));
+    audio::MicPacketizer mic;
+    REQUIRE(mic.configure(mp, in_key));
+    std::vector<int16_t> pcm(320 * 3 + 100);
+    for (size_t i = 0; i < pcm.size(); ++i) pcm[i] = static_cast<int16_t>(static_cast<int>(i * 97) - 30000);
+    std::vector<Bytes> packets;
+    CHECK_EQ(3U, mic.push(&pcm[0], pcm.size(), packets));
+    CHECK_EQ(100U, mic.pendingSamples());
+
+    // Phone side: its own DataStream INPUT key derivation opens every datagram.
+    const Bytes phone_in = hkdf(p.phone.shared, "DataStream-Salt" + dec(kAudioConnId), "DataStream-Input-Encryption-Key");
+    CHECK(phone_in != p.phone.streamKey(kAudioConnId));
+    REQUIRE(packets.size() == 3U);
+    for (size_t k = 0; k < 3; ++k) {
+        const Bytes& pkt = packets[k];
+        CHECK_EQ(36U + 640U, pkt.size());
+        audio::RtpHeader h;
+        Bytes payload;
+        REQUIRE(audio::openPacket(&phone_in[0], &pkt[0], pkt.size(), h, payload) == audio::kOpenOk);
+        CHECK_EQ(2U, static_cast<unsigned>(h.version));
+        CHECK_EQ(100U, static_cast<unsigned>(h.payload_type));
+        CHECK(!h.marker);
+        CHECK_EQ(k, static_cast<size_t>(h.sequence));
+        CHECK_EQ(320U * k, h.timestamp);
+        CHECK_EQ(0U, h.ssrc);
+        CHECK(getBe(pkt, pkt.size() - 8, 1) == k);  // nonce tail = LE counter k
+        std::vector<int16_t> got;
+        REQUIRE(audio::lpcmToInt16(&payload[0], payload.size(), got) == 320U);  // big-endian on the wire
+        CHECK(got == std::vector<int16_t>(pcm.begin() + static_cast<long>(320 * k),
+                                          pcm.begin() + static_cast<long>(320 * (k + 1))));
+        // The downlink key must not open uplink packets.
+        const Bytes down = p.phone.streamKey(kAudioConnId);
+        CHECK(audio::openPacket(&down[0], &pkt[0], pkt.size(), h, payload) == audio::kOpenAuthFailed);
+    }
+    crypto::wipe(in_key, sizeof(in_key));
 }
 
 // ---------------------------------------------------------------------------------------------

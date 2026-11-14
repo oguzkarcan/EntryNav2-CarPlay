@@ -138,6 +138,7 @@ TEST_CASE(topLevelKeyOrderMatchesReference) {
     // Everything optional switched on: icons, hevc, mainBuffered.
     c.hevc = true;
     c.main_buffered_audio = true;
+    c.lpcm_only = false;  // the BMW profiles are LPCM-only, which suppresses mainBufferedInfo
     info::OemIcon icon;
     icon.width_pixels = 1;
     icon.height_pixels = 1;
@@ -452,7 +453,9 @@ TEST_CASE(bmwProfilesDisplayGeometry) {
         CHECK(c.microphone);
         CHECK(!c.hevc);
         CHECK(!c.has_cluster);
-        CHECK_EQ(48000, c.entertainment_sample_rate);
+        CHECK_EQ(44100, c.entertainment_sample_rate);  // Dirana 44.1 kHz domain
+        CHECK(c.lpcm_only);
+        CHECK(!c.bufferedAudioOutputEnabled());
         Value root;
         REQUIRE(roundTrip(c, root));
         REQUIRE(mustFind(root, "displays").asArray().size() == 1);
@@ -473,8 +476,9 @@ TEST_CASE(bmwProfilesDisplayGeometry) {
         checkRect(areas[0], cases[k].w, cases[k].h, 0, 0);
         checkRect(mustFind(areas[0], "safeArea"), cases[k].w, cases[k].h, 0, 0);
         CHECK_EQ(0, intAt(d, "initialViewArea"));
-        // Microphone on => input formats advertised.
-        CHECK_EQ(0x70004154, inFmt(root, 100, "telephony"));
+        // Microphone on => input formats advertised (PCM mono 8/16/24/32/44.1 kHz, no Opus).
+        CHECK_EQ(0x554, inFmt(root, 100, "telephony"));
+        CHECK(audioFormat(root, 102, "media") == NULL);
         CHECK(!hasKey(root, "hevcInfo"));
     }
     // Touch-capable variant adds the high-fidelity touch bit.
@@ -857,6 +861,144 @@ TEST_CASE(setupEnabledFeaturesCases) {
     Value notArray = Value::makeString("mainBuffered");
     CHECK_EQ(std::string("hevc,iAPChannel,viewAreas,altScreen"),
              joined(info::setupEnabledFeatures(c, &notArray)));
+}
+
+TEST_CASE(lpcmOnlyAdvertisesExactlyThePcmParts) {
+    const int32_t rates[2] = {48000, 44100};
+    for (size_t r = 0; r < 2; ++r) {
+        const bool is48 = rates[r] == 48000;
+        const int64_t pcm = is48 ? 0xc3fc : 0xffc;
+        const int64_t mono = is48 ? 0x4154 : 0x554;
+        info::AirPlayConfig c = baseConfig();
+        c.entertainment_sample_rate = rates[r];
+        c.microphone = true;
+        c.main_buffered_audio = true;  // must be suppressed
+        c.lpcm_only = true;
+        Value root;
+        REQUIRE(roundTrip(c, root));
+        const Value::Array& f = mustFind(root, "audioFormats").asArray();
+        REQUIRE(f.size() == 8);  // no 102 AAC-LC, no 103 mainBuffered
+        for (size_t k = 0; k < f.size(); ++k) {
+            const int64_t t = intAt(f[k], "type");
+            CHECK(t == 100 || t == 101);
+            CHECK_EQ(0, intAt(f[k], "audioOutputFormats") & kOpus);
+            if (hasKey(f[k], "audioInputFormats")) CHECK_EQ(0, intAt(f[k], "audioInputFormats") & kOpus);
+            CHECK_EQ(0, intAt(f[k], "audioOutputFormats") & 0xc00000);  // no AAC-LC bit
+        }
+        CHECK_EQ(pcm, outFmt(root, 100, "compatibility"));
+        CHECK_EQ(mono, inFmt(root, 100, "compatibility"));
+        CHECK_EQ(pcm, outFmt(root, 101, "compatibility"));
+        CHECK_EQ(-1, inFmt(root, 101, "compatibility"));
+        CHECK_EQ(pcm, outFmt(root, 100, "default"));
+        CHECK_EQ(mono, inFmt(root, 100, "default"));
+        CHECK_EQ(pcm, outFmt(root, 100, "alert"));
+        CHECK_EQ(pcm, outFmt(root, 100, "media"));
+        CHECK_EQ(mono, outFmt(root, 100, "telephony"));
+        CHECK_EQ(mono, inFmt(root, 100, "telephony"));
+        CHECK_EQ(mono, outFmt(root, 100, "speechRecognition"));
+        CHECK_EQ(mono, inFmt(root, 100, "speechRecognition"));
+        CHECK_EQ(pcm, outFmt(root, 101, "default"));
+        CHECK(audioFormat(root, 102, "media") == NULL);
+        CHECK(audioFormat(root, 103, "media") == NULL);
+        CHECK(!hasKey(root, "mainBufferedInfo"));
+        CHECK(!c.bufferedAudioOutputEnabled());
+        CHECK_EQ(std::string("iAPChannel,viewAreas"),
+                 joined(info::setupEnabledFeatures(c, strList("mainBuffered"))));
+
+        // Everything except audioFormats is identical to the reference configuration.
+        info::AirPlayConfig ref = c;
+        ref.lpcm_only = false;
+        ref.main_buffered_audio = false;
+        Value ref_root;
+        REQUIRE(roundTrip(ref, ref_root));
+        CHECK_EQ(joined(keysOf(ref_root)), joined(keysOf(root)));
+        for (size_t k = 0; k < root.asDict().size(); ++k) {
+            const std::string& key = root.asDict()[k].first;
+            if (key == "audioFormats") continue;
+            CHECK(root.asDict()[k].second == ref_root.asDict()[k].second);
+        }
+        // speech_without_8_and_16khz and call_at_call_rate still apply on top.
+        c.speech_without_8_and_16khz = true;
+        c.call_at_call_rate = true;
+        Value tuned;
+        REQUIRE(roundTrip(c, tuned));
+        CHECK_EQ(pcm & ~static_cast<int64_t>(0x3c), outFmt(tuned, 100, "default"));
+        CHECK_EQ(0x154, outFmt(tuned, 100, "telephony"));
+        CHECK_EQ(0x154, inFmt(tuned, 100, "telephony"));
+        // microphone_opus has nothing left to remove.
+        c.microphone_opus = false;
+        c.call_at_call_rate = false;
+        Value no_opus;
+        REQUIRE(roundTrip(c, no_opus));
+        CHECK_EQ(mono, inFmt(no_opus, 100, "default"));
+    }
+}
+
+TEST_CASE(isSupportedOutputFormatFollowsLpcmOnly) {
+    info::AirPlayConfig c = baseConfig();
+    const carplay::audio::AudioFormat aac = carplay::audio::formatFromBits(0x400000ULL, 102);
+    const carplay::audio::AudioFormat opus = carplay::audio::formatFromBits(0x40000000ULL, 100);
+    const carplay::audio::AudioFormat pcm = carplay::audio::formatFromBits(0x800ULL, 100);
+    const carplay::audio::AudioFormat fallback = carplay::audio::formatFromBits(0ULL, 100);
+    CHECK(info::isSupportedOutputFormat(c, aac));
+    CHECK(info::isSupportedOutputFormat(c, opus));
+    CHECK(info::isSupportedOutputFormat(c, pcm));
+    c.lpcm_only = true;
+    CHECK(!info::isSupportedOutputFormat(c, aac));
+    CHECK(!info::isSupportedOutputFormat(c, opus));
+    CHECK(!info::isSupportedOutputFormat(c, carplay::audio::formatFromBits(0x70000800ULL, 100)));  // Opus wins
+    CHECK(info::isSupportedOutputFormat(c, pcm));
+    CHECK(info::isSupportedOutputFormat(c, carplay::audio::formatFromBits(0x4000ULL, 101)));
+    CHECK(info::isSupportedOutputFormat(c, fallback));  // reference LPCM 44.1k stereo fallback
+    c.disable_audio_output = true;
+    CHECK(!info::isSupportedOutputFormat(c, pcm));
+    // The BMW profiles decline AAC / Opus.
+    CHECK(!info::isSupportedOutputFormat(info::bmwEntryNav2_800x480(), aac));
+    CHECK(info::isSupportedOutputFormat(info::bmwEntryNav2_800x480(), pcm));
+}
+
+TEST_CASE(bmwEntryNav2ForDisplayFactory) {
+    info::AirPlayConfig c;
+    // Known sizes reproduce the fixed profiles exactly.
+    REQUIRE(info::bmwEntryNav2ForDisplay(800, 480, true, c));
+    Value a, b;
+    REQUIRE(roundTrip(c, a));
+    REQUIRE(roundTrip(info::bmwEntryNav2_800x480(true), b));
+    CHECK(a == b);
+    REQUIRE(info::bmwEntryNav2ForDisplay(1280, 480, false, c));
+    REQUIRE(roundTrip(c, a));
+    REQUIRE(roundTrip(info::bmwEntryNav2_1280x480(false), b));
+    CHECK(a == b);
+    REQUIRE(info::bmwEntryNav2ForDisplay(1440, 540, false, c));
+    CHECK_EQ(244, c.main.width_physical_mm);
+    // Other sizes: F20 pixel pitch, height from the aspect ratio, same audio settings.
+    REQUIRE(info::bmwEntryNav2ForDisplay(1024, 600, false, c));
+    CHECK_EQ(1024, c.main.width_pixels);
+    CHECK_EQ(600, c.main.height_pixels);
+    CHECK_EQ(182, c.main.width_physical_mm);  // round(1024 * 142 / 800 = 181.76)
+    CHECK(!c.main.has_height_physical_mm);
+    CHECK_EQ(44100, c.entertainment_sample_rate);
+    CHECK(c.lpcm_only);
+    CHECK(c.microphone);
+    CHECK_EQ(3, c.main.primary_input_device);
+    REQUIRE(roundTrip(c, a));
+    CHECK_EQ(107, intAt(display0(a), "heightPhysical"));  // round(182 * 600 / 1024 = 106.6)
+    CHECK_EQ(1024, intAt(mustFind(a, "displays").asArray()[0], "widthPixels"));
+    // The touch descriptor follows the queried size.
+    const Value::Array& hids = mustFind(a, "hidDevices").asArray();
+    CHECK(mustFind(hids[0], "hidDescriptor").asData() == hid::touchscreenDescriptor(1024, 600));
+    REQUIRE(info::bmwEntryNav2ForDisplay(2560, 1600, false, c));
+    REQUIRE(info::bmwEntryNav2ForDisplay(320, 240, false, c));
+    CHECK_EQ(57, c.main.width_physical_mm);  // round(320 * 142 / 800 = 56.8)
+    // Nonsense sizes are rejected and leave `out` untouched.
+    info::AirPlayConfig keep = info::bmwEntryNav2_800x480();
+    keep.device_name = "untouched";
+    const int32_t bad[][2] = {{0, 0}, {-800, 480}, {800, -480}, {319, 240}, {320, 239}, {2561, 1000},
+                              {2000, 1601}, {480, 800}, {65535, 65535}};
+    for (size_t k = 0; k < sizeof(bad) / sizeof(bad[0]); ++k) {
+        CHECK(!info::bmwEntryNav2ForDisplay(bad[k][0], bad[k][1], true, keep));
+        CHECK_EQ(std::string("untouched"), keep.device_name);
+    }
 }
 
 int main() { return test_support::runAll("test_airplay_info"); }
