@@ -55,7 +55,7 @@ From `EntryNav2-Android-Auto-0.12.0/Makefile`:
 
 ---
 
-## 4. What Is Already Built & Verified (Phase 1)
+## 4. What Is Already Built & Verified (Phase 1 + Phase 2)
 
 All Phase 1 modules live under `include/carplay/` and `src/core/`, compiled into `libcarplay_core.a` and verified by `tests/test_phase1.cpp` (**10/10 tests passing**):
 
@@ -88,19 +88,32 @@ All Phase 1 modules live under `include/carplay/` and `src/core/`, compiled into
    - Zero-allocation in-place 4-byte length-prefix -> Annex B (`00 00 00 01`) converter (`lengthPrefixedToAnnexBInPlace`).
    - `detectConfigCodec` (`avcC`/`hvcC`/Annex B) and `avcCToAnnexB` SPS/PPS extractor for `EvoVideo`.
 
+**Phase 2 modules** (host-verified; 14 auto-discovered test binaries incl. the end-to-end simulated-iPhone session `tests/test_e2e_session.cpp`; see PROGRESS.md for per-binary counts):
+
+1. **`rtsp_message`** — incremental RTSP/HTTP parser (16 KiB header / 1 MiB body caps, lowercased headers, last value wins) + request/response builders echoing `CSeq`.
+2. **`control_cipher`** — `[u16 LE len | ct | tag16]`, AAD = length header, per-direction `makeCounterNonce` counters, 0x4000-byte write chunks; any auth failure is fatal.
+3. **`bigint`** — fixed 3072-bit Montgomery math on `uint32_t` limbs with `uint64_t` products (no `__int128`, no heap; not constant-time).
+4. **`srp6a`** — RFC 5054 3072-bit SRP-6a server, SHA-512, user `Pair-Setup`, code `3939`, byte-compatible with `Srp6a.kt`.
+5. **`pairing`** — Pair-Setup M1–M6 / Pair-Verify M1–M4; control keys SWAPPED (accessory read = `Control-Write-Encryption-Key`), event keys NOT swapped; one attempt per M1.
+6. **`airplay_info`** — `/info` plist in reference key order, `setupEnabledFeatures`, BMW display profiles.
+7. **`audio_rtp`** — RTP `[hdr12 | ct | tag | tail8]`, AAD = header[4..12], nonce `[0,0,0,0|tail8]`; `DataStream-Salt<UNSIGNED streamConnectionID>`; wire LPCM is BIG-endian; `JitterBuffer`.
+8. **`ntp_timing`** — PT 210/211 packets (NTP 32.32 BE) + `ClockSync` filter with injected monotonic time.
+9. **`event_channel`** — encrypted `POST /command` sender (CSeq from 1, never reset), HID/Siri/night mode/iAP, inbound requests answered 200, responses consumed.
+10. **`airplay_session`** — sans-I/O `Session` (`onControlBytes`/`onEventBytes`): pair-verify M4 is written in PLAINTEXT, then the cipher takes over at the next input byte (chunking-independent); default policy answers non-pairing requests with 403 before verify; `streamConnectionID` handled as unsigned (`plistUnsignedId`); sockets/clock delegated to `TransportHost` / `MediaHandler`.
+
 ---
 
 ## 5. Architecture Blueprint for Phases 2–5 (Reference Map)
 
 When continuing development, inspect the two local reference repositories in `..\EntryNav2-CarPlay-Assets\repos\` rather than guessing wire details:
 
-### Phase 2 — AirPlay Session, Pairing, HTTP/RTSP & Audio (Next Immediate Task, Host-Testable)
+### Phase 2 — AirPlay Session, Pairing, HTTP/RTSP & Audio (DONE, host-verified; Phase 3 is the next task)
 - Reference in `DiPlay-main\shared\src\main\java\com\shilapi\xcertplay\airplay\`:
   - `AirPlaySession.kt`: RTSP/HTTP request parser & response builder, `ControlCipher` (see `ControlCipher.kt`: each frame is `[u16 LE len | ciphertext | tag16]` where the 2-byte little-endian length header `[len_lo, len_hi]` is the AAD; writes split plaintext into blocks of up to `MAX_PAYLOAD = 0x4000` (16384) bytes, reads accept any u16 length; 16B ChaCha20-Poly1305 tag, incrementing read/write nonces via `makeCounterNonce`), `PairSetup`, `PairVerify`, `/info` (advertises HID UIDs + descriptors + display geometry), `SETUP`, `RECORD`, `SET_PARAMETER`, `FLUSH`, `TEARDOWN`, `/feedback`, `/command` (`requestUI`, `hidSendReport`, `changeModes`, `duckAudio`/`unduckAudio`), `eventServer` / `eventCipher`, and NTP/keep-alive UDP timing.
   - `AudioStream.kt`: Main audio (`type 103` buffered / realtime) & alt/TTS audio (`AAC-LC` / `Opus` / `LPCM`), RTP jitter buffer & clock sync.
 - Keep `Phase 2` completely OS-agnostic (`net`/socket abstraction or pure byte-stream state machines) so host unit tests can drive full `Pair-Verify` + `/info` + `SETUP` + encrypted `POST /command` round-trips natively on Windows.
 
-### Phase 3 — BMW `HU_ENTRYNAV2` Platform HAL (`src/platform/`)
+### Phase 3 — BMW `HU_ENTRYNAV2` Platform HAL (`src/platform/`) (Next Immediate Task)
 - Reference in `EntryNav2-Android-Auto-0.12.0\platform\`:
   - **Video:** `evo_video.hpp` — `libxsvideo.so.4` (type 1 IVA-HD/DCE hardware H.264 decoder) -> NV12 onto Wayland IVI surface (`kAaLayerId = 0x80000000`, `LayerManager` via `evo_ilm.hpp`), fed via OMAP `dma-buf` (`omap_dmabuf.hpp`). Prepend cached Annex-B SPS/PPS (`avcCToAnnexB`) before IDR NAL units (`type 5`).
   - **Knob / Buttons / Volume / Steering Wheel:** `evo_knob.hpp` — runtime-loaded `libvmostclient.so.1`, `FBlock 0xE5` (`instance 03`, functions `C46/C47/C4F` for `CCS35up`; `instance 01` `C10/C20` fallback). Issue plain `Get` (`OpType 1`) to open `vmostd`'s `EnableFunctionBasedFiltering`. Remember `normalizePushButtons`: byte value `4` means finger resting (NOT pressed!), `1/2/3` = pressed, `0` = released. Steering wheel telephone button is `0x15.02` `fkt 0x400`.
