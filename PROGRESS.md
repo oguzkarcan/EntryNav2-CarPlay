@@ -2,7 +2,7 @@
 
 **Target Hardware:** BMW `HU_ENTRYNAV2` (EntryEVO / ARMv7 `-std=gnu++0x`)  
 **Transports Targeted:** Wired USB (`iAP2` over USB + `NCM` IPv6) **and** Wireless (`Bluetooth RFCOMM` + `Wi-Fi` AP/STA + Bonjour)  
-**Active Milestone:** **Phase 1 Completed** (Zero-Car Host-Verified C++11 Core)
+**Active Milestone:** **Phase 2 In Progress** (Wave 1 of 4 complete; Phase 1 Zero-Car Host-Verified C++11 Core completed)
 
 ---
 
@@ -39,11 +39,38 @@ All Phase 1 protocol primitives are implemented in portable C++11 (`-std=gnu++0x
   - `Makefile` auto-discovers `src/core/*.cpp` and builds every `tests/test_*.cpp` into its own binary; `make test-host` runs all and fails if any fails; header-change rebuilds via `-MMD -MP` (objects) and header prerequisites (tests).
   - Header-only test harness `tests/test_support.hpp` (`TEST_CASE`, `CHECK`/`CHECK_EQ`/`CHECK_BYTES_EQ`/`REQUIRE`, hex helpers, per-file `test_xxx: N/N passed` summary).
   - `bplist_codec` unsigned 64-bit support: `0x14` integers with `hi == 0` decode (values >= 2^63 as `TYPE_UINT64`), encoder emits `0x14` for >= 2^63, `makeUInt`/`isUInt`/`asUInt`/`getUInt`, `toUnsignedDecimal` (for `DataStream-Salt<streamConnectionID>`); covered by `tests/test_bplist_u64.cpp` (11/11).
+- [x] **P1 — RTSP/HTTP message framing (`rtsp_message`)** (2026-11-14)
+  - Incremental byte-stream `Parser` (port of `RtspMessage.kt`) with `kMaxHeaderBytes = 16 KiB` / `kMaxBodyBytes = 1 MiB` caps, lowercased/trimmed ordered headers (repeated name: last value wins), `isResponse()` for event-channel status lines; request/response builders with `CSeq` echo. `tests/test_rtsp_message.cpp` (16/16).
+- [x] **P2 — Encrypted control channel framing (`control_cipher`)** (2026-11-14)
+  - Byte-exact `ControlCipher.kt` port: `[u16 LE len | ciphertext | tag16]`, AAD = 2-byte length header, per-direction keys + `makeCounterNonce` counters, `0x4000`-byte write chunks (empty plaintext -> one 18-byte frame), streaming partial-frame decrypt, fatal-on-auth-failure with key/buffer wipe. `tests/test_control_cipher.cpp` (19/19).
+- [x] **P3 — SRP-6a pair-setup math (`bigint` + `srp6a`)** (2026-11-14)
+  - Fixed-width 3072-bit (96 x `uint32_t` limbs, `uint64_t` products, no `__int128`, no heap) Montgomery/CIOS bignum with 4-bit window `modExp` (not constant-time; public setup code `3939`).
+  - SRP-6a server (RFC 5054 3072-bit group, `g = 5`, SHA-512, user `Pair-Setup`) byte-compatible with `Srp6a.kt` (`min`/`pad` encodings, raw `pad(A)`, `A mod N == 0` rejected); vectors cross-checked against .NET `BigInteger`. `tests/test_bigint.cpp` (11/11), `tests/test_srp6a.cpp` (11/11).
+- [x] **P4 — Realtime audio RTP & timing (`audio_rtp` + `ntp_timing`)** (2026-11-14)
+  - RTP open/seal for stream types 100/101/102 (`[RTP12 | ct | tag16 | nonce tail8]`, AAD = header bytes 4..11, nonce `[0,0,0,0 | tail8]`), `audioFormat` bit -> codec mapping (AAC-LC / Opus / LPCM), `DataStream-Salt<unsigned streamConnectionID>` HKDF output/input keys, big-endian LPCM helpers, sequence-ordered `JitterBuffer`.
+  - NTP 32.32 PT 210/211 request/response packets and `ClockSync` filter with injected monotonic time. `tests/test_audio_rtp.cpp` (17/17), `tests/test_ntp_timing.cpp` (10/10).
+- [x] **P5 — `/info` plist & SETUP features (`airplay_info`)** (2026-11-14)
+  - `AirPlayConfig`/`DisplayConfig`, `/info` bplist builder mirroring `AirPlayInfoPlist.kt` key order, `setupEnabledFeatures`, BMW `bmwEntryNav2_800x480` / `_1280x480` / `_1440x540` profiles. `tests/test_airplay_info.cpp` (24/24).
+
+**Verified host test status (2026-11-14):** clean `-Wall -Wextra -Werror` build, 9 test binaries all passing — `test_phase1` 10/10, `test_bplist_u64` 11/11, `test_rtsp_message` 16/16, `test_control_cipher` 19/19, `test_bigint` 11/11, `test_srp6a` 11/11, `test_audio_rtp` 17/17, `test_ntp_timing` 10/10, `test_airplay_info` 24/24.
+
+### Phase 2 — Remaining
+- [ ] **P5b** — Switch `airplay_hid` descriptors/report builders to the field-proven reference layouts (`AirPlayHid.kt`).
+- [ ] **P6** — `pairing` (`PairingStore`, identity, Pair-Setup M1–M6, Pair-Verify M1–M4, Control/Events key derivation).
+- [ ] **P7** — `airplay_session` + `event_channel`.
+- [ ] **P8** — End-to-end simulated-iPhone test.
+
+### Known gaps / not yet verified
+- Nothing compiled with the real ARM GCC 4.7.2 toolchain yet (host GCC 16 `-std=gnu++0x` only).
+- No real iPhone traffic captured; all vectors come from the reference implementation or self-generated data.
+- Type-103 buffered audio (TCP, `shk` key, `SETRATE`/`GETANCHOR`) not implemented.
+- AAC-LC / Opus decoding deferred to Phase 3; `/auth-setup` MFiSAP (SHA-1/SHA-256/AES-CTR) deferred to Phase 5.
+- BMW display physical sizes and the 48 kHz entertainment sample rate are estimates.
 
 ## Next Phases (Pending)
 
 ### Phase 2 — AirPlay HAP Session, HTTP/RTSP Server & Audio Pipeline (Host-Testable)
-- [ ] Lightweight non-blocking HTTP/RTSP parser & responder (binary plist + TLV8 bodies, HAP encrypted block framing `[u16 LE len | ciphertext | tag16]` with the length header as AAD and up to `0x4000` bytes of plaintext per frame).
+- [x] Lightweight non-blocking HTTP/RTSP parser & responder (binary plist + TLV8 bodies, HAP encrypted block framing `[u16 LE len | ciphertext | tag16]` with the length header as AAD and up to `0x4000` bytes of plaintext per frame).
 - [ ] HAP `Pair-Setup` & `Pair-Verify` state machine (client-auth MFi/Ed25519 verifier hooks + `Control-Salt` Read/Write key derivation).
 - [ ] RTSP `/info`, `SETUP`, `RECORD`, `SET_PARAMETER`, `FLUSH`, `TEARDOWN`, `/feedback`, and `/command` (`hidSendReport`, `requestUI`, `changeModes`) state handlers.
 - [ ] AirPlay RTP audio receiver (AAC-LC / Opus / LPCM jitter buffer, NTP/PTP timing response, control/timing UDP sockets).
