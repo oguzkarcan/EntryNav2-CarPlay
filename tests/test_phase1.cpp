@@ -546,8 +546,10 @@ bool testIap2WiredAndWirelessCarPlay() {
 bool testAirPlayHidAndZbe3Mapping() {
     using namespace carplay::hid;
 
-    const DescriptorSummary touch_sum = inspectDescriptor(touchscreenDescriptor());
+    // Reference layouts (AirPlayHid.kt); exact bytes are covered by tests/test_airplay_hid.cpp.
+    const DescriptorSummary touch_sum = inspectDescriptor(touchscreenDescriptor(800, 480));
     CHECK(touch_sum.valid && touch_sum.has_absolute_input && !touch_sum.has_relative_input);
+    CHECK(touchscreenDescriptor(800, 480).size() == 109U);
 
     const DescriptorSummary knob_sum = inspectDescriptor(knobDescriptor());
     CHECK(knob_sum.valid && knob_sum.has_absolute_input && knob_sum.has_relative_input);
@@ -556,38 +558,39 @@ bool testAirPlayHidAndZbe3Mapping() {
     const DescriptorSummary tel_sum = inspectDescriptor(telephonyDescriptor());
     CHECK(media_sum.valid && tel_sum.valid);
 
-    uint16_t tx = 0, ty = 0;
-    normalizeTouchCoords(-10, 500, 800, 480, tx, ty);
-    CHECK(tx == 0 && ty == kTouchAxisMax);
-    normalizeTouchCoords(799, 0, 800, 480, tx, ty);
-    CHECK(tx == kTouchAxisMax && ty == 0);
-
-    const std::vector<uint8_t> trep = makeTouchReport(true, 0x1234U, 0x5678U);
-    CHECK(trep.size() == 5U && trep[0] == 1U && trep[1] == 0x34U && trep[2] == 0x12U);
+    // 2-contact touch report in display pixels; slot 1 down at (300,400).
+    std::vector<TouchContact> contacts(1, TouchContact(1, true, 300, 400));
+    const std::vector<uint8_t> trep = touchReport(contacts, 800, 480);
+    CHECK(trep.size() == 12U);
+    CHECK(trep[0] == 0U && trep[1] == 0U && trep[6] == 1U && trep[7] == 1U);
+    CHECK(trep[8] == 0x2cU && trep[9] == 0x01U && trep[10] == 0x90U && trep[11] == 0x01U);
 
     // BMW ZBE3 hardware mapping.
     Zbe3Event hw;
-    hw.dir_mask = 0x01U;  // Up
+    hw.dir_mask = zbe3::kDirUp;
     hw.center_pressed = true;
     hw.button_mask = static_cast<uint8_t>(zbe3::kBtnMenu | zbe3::kBtnBack | zbe3::kBtnMedia | zbe3::kBtnCom);
     hw.rotary_delta = -2;
 
     KnobState knob;
-    MediaButton media = MEDIA_NONE;
-    uint8_t tel = 0;
+    int32_t media = MEDIA_NONE;
+    int32_t tel = TELEPHONY_NONE;
     mapZbe3ToCarPlay(hw, knob, media, tel);
-    CHECK(knob.up && !knob.down && knob.select && knob.home && knob.back && knob.wheel_delta == -2);
+    // Up tilt adds -1 to the rotary -2 (reference D-pad -> wheel convention).
+    CHECK(knob.select && knob.home && knob.back && knob.wheel == -3 && knob.x == 0 && knob.y == 0);
     CHECK(media == MEDIA_PLAY_PAUSE);
-    CHECK((tel & TELEPHONY_HOOK_SWITCH) != 0);
+    CHECK(tel == TELEPHONY_HOOK_SWITCH);
 
-    const std::vector<uint8_t> krep = makeKnobReport(knob);
-    CHECK(krep.size() == 3U);
-    CHECK((krep[0] & 0x11U) == 0x11U);  // Up + Select
-    CHECK((krep[1] & 0x03U) == 0x03U);  // Home + Back
-    CHECK(static_cast<int8_t>(krep[2]) == -2);
+    const std::vector<uint8_t> krep = knobReport(knob);
+    CHECK(krep.size() == 4U);
+    CHECK(krep[0] == 0x07U);  // Select | Home<<1 | Back<<2
+    CHECK(krep[1] == 0U && krep[2] == 0U);
+    CHECK(static_cast<int8_t>(krep[3]) == -3);
 
-    const std::vector<uint8_t> mrep = makeMediaReport(MEDIA_NEXT);
-    CHECK(mrep.size() == 1U && mrep[0] == (1U << 3));
+    const std::vector<uint8_t> mrep = mediaReport(MEDIA_NEXT);
+    CHECK(mrep.size() == 1U && mrep[0] == 4U);
+    const std::vector<uint8_t> prep = telephonyReport(TELEPHONY_HOOK_SWITCH);
+    CHECK(prep.size() == 1U && prep[0] == 1U);
 
     return true;
 }

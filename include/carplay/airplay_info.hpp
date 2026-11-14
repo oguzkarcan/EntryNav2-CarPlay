@@ -176,7 +176,9 @@ AirPlayConfig bmwEntryNav2_1440x540(bool touch = false);
 /// 0x615653aee2, minus 0x10004540a00 when audio output is disabled.
 uint64_t features(const AirPlayConfig& config);
 
-/// Builds the ordered /info dictionary.
+/// Builds the ordered /info dictionary. `hidDevices` = [touch, knob, media, telephony], all bound to
+/// kMainDisplayUuid, with descriptors from carplay::hid; the touch descriptor's X/Y logical maximum
+/// is config.main.width_pixels / height_pixels (AirPlayInfoPlist.kt:58-63).
 bplist::Value buildInfo(const AirPlayConfig& config);
 
 /// bplist00-encodes buildInfo(config).

@@ -74,13 +74,14 @@ All Phase 1 modules live under `include/carplay/` and `src/core/`, compiled into
    - `ParameterList` preserving parameter order and repeated IDs + nested groups.
    - Codecs for **both Wired IPv6 and Wireless Wi-Fi** `0x4301` (`buildStartCarPlaySession`), `0x4300` (`parseCarPlayAvailability`), `0x4e0d` (`WirelessCarPlayUpdate`), `0x4e0e` (`DeviceTransportIdentifierNotification`), `0x5701` (`WiFiInformation`), `0x5703` (`AccessoryWiFiConfigurationInformation`), `0xae03` (`PowerSourceUpdate`), and `0xfffb` (`LocationInformation`).
 5. **`airplay_hid`** (`include/carplay/airplay_hid.hpp`, `src/core/airplay_hid.cpp`)
-   - Standard CarPlay HID descriptors & report builders: Touchscreen (`0x2a2a2a2a`), Rotary Knob (`0x2a2a2a2b`, absolute D-Pad/Buttons `0x02` + relative Wheel `0x06`), Media (`0x2a2a2a2c`), Telephony (`0x2a2a2a2d`).
-   - Hardware mapper `mapZbe3ToCarPlay` using verified BMW `HU_ENTRYNAV2` `ZBE3` button bits:
+   - Descriptors & reports are byte-for-byte the reference `DiPlay-main\...\airplay\AirPlayHid.kt` (Phase 2 P5b): Touchscreen (`0x2a2a2a2a`, `touchscreenDescriptor(width_px, height_px)`: 2 finger collections, 8-bit contact id + Touch bit + 16-bit X/Y with logical max = display pixels; 12-byte `touchReport` `[slot, down, x16le, y16le] x2`, coordinates clamped to `[0, width/height]`; `TouchSlots` = port of `AirPlayTouchSlots.kt`), Knob (`0x2a2a2a2b`, 4-byte `knobReport` `[select|home<<1|back<<2, x, y, wheel]`, x/y absolute `0x02` legacy (never driven), wheel relative `0x06`, all clamped to `-127..127`), Media (`0x2a2a2a2c`, 1-byte array index 0..6: `MEDIA_PLAY=1 .. MEDIA_PREVIOUS=5`), Telephony (`0x2a2a2a2d`, 1-byte array index 0..17: `HOOK_SWITCH=1`, `DROP=3`). `uidString()` gives the lowercase-hex `uuid`; `momentaryKnobReports` / `mediaPressReports` / `telephonyPressReports` reproduce the reference send sequences (report, then neutral/0) for `hidSendReport`.
+   - Hardware mapper `mapZbe3ToCarPlay(hw, knob, media_index, telephony_index)` using verified BMW `HU_ENTRYNAV2` `ZBE3` button bits:
      - `MENU = 0x01` -> CarPlay `home`
      - `BACK = 0x02` -> CarPlay `back`
-     - `OPTION = 0x04`
+     - `OPTION = 0x04` (not mapped)
      - `MEDIA = 0x08` -> `MEDIA_PLAY_PAUSE`
      - `COM = 0x40` -> `TELEPHONY_HOOK_SWITCH`
+     - push -> `select`; rotation -> `wheel` (clockwise `+`); tilt Up/Left -> wheel `-1`, Down/Right -> wheel `+1` (reference D-pad convention, `CarPlayRemoteKeys.kt:67-76`); knob X/Y stay 0. `zbe3KnobReports` sends a wheel step then the same state with wheel 0.
 6. **`screen_stream`** (`include/carplay/screen_stream.hpp`, `src/core/screen_stream.cpp`)
    - 128-byte AirPlay screen header parser (NTP 32.32 `senderNanos`, opcode `0` frame / `1` config, dimensions).
    - `ChaCha20-Poly1305` frame decryption (`decryptFrame`, `decryptFrameInPlace`).

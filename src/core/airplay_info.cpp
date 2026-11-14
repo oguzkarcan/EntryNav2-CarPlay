@@ -265,18 +265,7 @@ Value displayEntry(const DisplayConfig& display, int32_t type, const char* uuid,
     return e;
 }
 
-std::string hexUid(uint32_t uid) {
-    // Kotlin Int.toString(16): lowercase, no leading zeros (UIDs here are all positive).
-    static const char kDigits[] = "0123456789abcdef";
-    if (uid == 0) return "0";
-    std::string out;
-    while (uid != 0) {
-        out.insert(out.begin(), kDigits[uid & 0x0fU]);
-        uid >>= 4;
-    }
-    return out;
-}
-
+// AirPlayHid.hidDeviceEntry (AirPlayHid.kt:74-87).
 Value hidDeviceEntry(uint32_t uid,
                      const std::string& name,
                      const std::vector<uint8_t>& descriptor,
@@ -285,7 +274,7 @@ Value hidDeviceEntry(uint32_t uid,
     put(d, "hidProductID", i(1));
     put(d, "hidVendorID", i(2));
     put(d, "hidCountryCode", i(0));
-    put(d, "uuid", s(hexUid(uid)));
+    put(d, "uuid", s(hid::uidString(uid)));
     put(d, "name", s(name));
     put(d, "displayUUID", s(display_uuid));
     put(d, "hidDescriptor", Value::makeData(descriptor));
@@ -433,13 +422,15 @@ Value buildInfo(const AirPlayConfig& config) {
     }
     put(info, "displays", displays);
 
-    // HID descriptors come from carplay::hid (see airplay_hid.hpp). The touch descriptor uses the
-    // module's 0..kTouchAxisMax logical range, matching hid::normalizeTouchCoords/makeTouchReport,
-    // rather than the reference's pixel range.
+    // AirPlayInfoPlist.kt:58-63: touchHidDevice(main.widthPixels, main.heightPixels, MAIN_UUID),
+    // knobHidDevice, mediaHidDevice, telephonyHidDevice. Descriptors come from carplay::hid; the
+    // touch X/Y logical maximum is the main display's pixel size.
     const std::string& p = config.hid_name_prefix;
     Value hids = Value::makeArray();
-    hids.asArray().push_back(hidDeviceEntry(hid::kUidTouchscreen, p + " Touchscreen",
-                                            hid::touchscreenDescriptor(), kMainDisplayUuid));
+    hids.asArray().push_back(hidDeviceEntry(
+        hid::kUidTouchscreen, p + " Touchscreen",
+        hid::touchscreenDescriptor(config.main.width_pixels, config.main.height_pixels),
+        kMainDisplayUuid));
     hids.asArray().push_back(
         hidDeviceEntry(hid::kUidKnob, p + " Knob", hid::knobDescriptor(), kMainDisplayUuid));
     hids.asArray().push_back(
