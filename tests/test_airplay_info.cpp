@@ -698,7 +698,7 @@ TEST_CASE(hidDevicesUseExistingDescriptors) {
     const char* names[] = {"EntryNav2 Touchscreen", "EntryNav2 Knob", "EntryNav2 Media",
                            "EntryNav2 Telephony"};
     std::vector<std::vector<uint8_t> > descs;
-    descs.push_back(hid::touchscreenDescriptor());
+    descs.push_back(hid::touchscreenDescriptor(800, 480));
     descs.push_back(hid::knobDescriptor());
     descs.push_back(hid::mediaDescriptor());
     descs.push_back(hid::telephonyDescriptor());
@@ -720,12 +720,66 @@ TEST_CASE(hidDevicesUseExistingDescriptors) {
         CHECK_BYTES_EQ(descs[k], d.asData());
         CHECK(hid::inspectDescriptor(d.asData()).valid);
     }
+    // Touch descriptor: X/Y logical maximum = 800 (0x0320) / 480 (0x01e0) in both finger
+    // collections (AirPlayInfoPlist.kt:59 passes the main display's pixel size).
+    const std::vector<uint8_t>& touch = mustFind(hids[0], "hidDescriptor").asData();
+    REQUIRE(touch.size() == 109);
+    for (size_t f = 0; f < 2; ++f) {
+        const size_t base = 6 + 51 * f;
+        CHECK_EQ(0x26, touch[base + 32]);
+        CHECK_EQ(0x20, touch[base + 33]);
+        CHECK_EQ(0x03, touch[base + 34]);
+        CHECK_EQ(0x26, touch[base + 43]);
+        CHECK_EQ(0xe0, touch[base + 44]);
+        CHECK_EQ(0x01, touch[base + 45]);
+    }
     // Generic config keeps the reference's "xcertplay" names.
     Value g;
     REQUIRE(roundTrip(baseConfig(), g));
     std::string n;
     CHECK(mustFind(g, "hidDevices").asArray()[1].getString("name", n));
     CHECK_EQ(std::string("xcertplay Knob"), n);
+}
+
+// The whole hidDevices array, transcribed from AirPlayHid.kt for a 1280x480 main display; must be
+// identical to the reference except for the configurable name prefix.
+TEST_CASE(hidDevicesMatchReferenceForMainDisplaySize) {
+    info::AirPlayConfig c = info::bmwEntryNav2_1280x480(true);
+    Value root;
+    REQUIRE(roundTrip(c, root));
+    const Value::Array& hids = mustFind(root, "hidDevices").asArray();
+    REQUIRE(hids.size() == 4);
+    // X max 1280 = 0x0500 -> "26 00 05", Y max 480 = 0x01e0 -> "26 e0 01".
+    const std::string finger =
+        "050d0922a102" "0938750895018102" "150025010933750195018102" "95078103"
+        "0501" "260005" "0930" "7510" "9501" "8102" "26e001" "0931" "8102" "c0";
+    const std::string touchHex = "050d0904a101" + finger + finger + "c0";
+    const char* expected[] = {
+        touchHex.c_str(),
+        "05010908a101"
+        "0509" "0901" "1500" "2501" "7501" "9501" "8102"
+        "050c" "0a2302" "0a2402" "9502" "8102"
+        "9505" "8101"
+        "0501" "0901" "a100"
+        "0930" "0931" "1581" "257f" "7508" "9502" "8102" "c0"
+        "0938" "1581" "257f" "7508" "9501" "8106" "c0",
+        "050c0901a101" "1500" "2506" "050c"
+        "0a0000" "0ab000" "0ab100" "0acd00" "0ab500" "0ab600" "0a9e02"
+        "7508" "9501" "8100" "c0",
+        "050b0907a101" "1500" "2511" "050b"
+        "0900" "0920" "0921" "0926" "092f"
+        "09b0" "09b1" "09b2" "09b3" "09b4" "09b5" "09b6" "09b7" "09b8" "09b9" "09ba" "09bb"
+        "0507" "092a"
+        "7508" "9501" "8100" "c0"};
+    const char* uuids[] = {"2a2a2a2a", "2a2a2a2b", "2a2a2a2c", "2a2a2a2d"};
+    for (size_t k = 0; k < 4; ++k) {
+        const Value& d = mustFind(hids[k], "hidDescriptor");
+        REQUIRE(d.isData());
+        CHECK_BYTES_EQ(test_support::hexToBytes(expected[k]), d.asData());
+        std::string s;
+        CHECK(hids[k].getString("uuid", s));
+        CHECK_EQ(std::string(uuids[k]), s);
+    }
 }
 
 TEST_CASE(oemIconAdvertisedWithOriginalBytes) {

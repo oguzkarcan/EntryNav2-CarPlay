@@ -1,231 +1,363 @@
 #include "carplay/airplay_hid.hpp"
 
+#include <math.h>
+
 namespace carplay {
 namespace hid {
 
 namespace {
 
-uint8_t lo8(uint16_t v) { return static_cast<uint8_t>(v & 0xffU); }
-uint8_t hi8(uint16_t v) { return static_cast<uint8_t>((v >> 8) & 0xffU); }
+const uint8_t kInputConst = 0x01U;
+const uint8_t kInputRelative = 0x04U;
+
+uint8_t lo8(int32_t v) { return static_cast<uint8_t>(static_cast<uint32_t>(v) & 0xffU); }
+uint8_t hi8(int32_t v) { return static_cast<uint8_t>((static_cast<uint32_t>(v) >> 8) & 0xffU); }
+
+int32_t clampI32(int32_t v, int32_t lo, int32_t hi) {
+    if (v < lo) return lo;
+    if (v > hi) return hi;
+    return v;
+}
+
+uint8_t clampAxis(int32_t v) {
+    return static_cast<uint8_t>(static_cast<int8_t>(clampI32(v, kKnobAxisMin, kKnobAxisMax)));
+}
+
+void appendFinger(std::vector<uint8_t>& out, int32_t x_max, int32_t y_max) {
+    // AirPlayHid.fingerCollection (AirPlayHid.kt:97-104).
+    const uint8_t raw[] = {
+        0x05, 0x0d,              // Usage Page (Digitizer)
+        0x09, 0x22,              // Usage (Finger)
+        0xa1, 0x02,              // Collection (Logical)
+        0x09, 0x38,              //   Usage (Transducer Index) - contact id byte
+        0x75, 0x08,              //   Report Size (8)
+        0x95, 0x01,              //   Report Count (1)
+        0x81, 0x02,              //   Input (Data,Var,Abs)
+        0x15, 0x00,              //   Logical Minimum (0)
+        0x25, 0x01,              //   Logical Maximum (1)
+        0x09, 0x33,              //   Usage (Touch)
+        0x75, 0x01,              //   Report Size (1)
+        0x95, 0x01,              //   Report Count (1)
+        0x81, 0x02,              //   Input (Data,Var,Abs)
+        0x95, 0x07,              //   Report Count (7) - padding
+        0x81, 0x03,              //   Input (Const,Var,Abs)
+        0x05, 0x01,              //   Usage Page (Generic Desktop)
+        0x26, lo8(x_max), hi8(x_max),  // Logical Maximum (width pixels)
+        0x09, 0x30,              //   Usage (X)
+        0x75, 0x10,              //   Report Size (16)
+        0x95, 0x01,              //   Report Count (1)
+        0x81, 0x02,              //   Input (Data,Var,Abs)
+        0x26, lo8(y_max), hi8(y_max),  // Logical Maximum (height pixels)
+        0x09, 0x31,              //   Usage (Y)
+        0x81, 0x02,              //   Input (Data,Var,Abs)
+        0xc0                     // End Collection
+    };
+    out.insert(out.end(), raw, raw + sizeof(raw));
+}
+
+void writeU16Le(std::vector<uint8_t>& out, size_t offset, int32_t v) {
+    out[offset] = lo8(v);
+    out[offset + 1] = hi8(v);
+}
+
+ReportSequence pair(const std::vector<uint8_t>& a, const std::vector<uint8_t>& b) {
+    ReportSequence seq;
+    seq.push_back(a);
+    seq.push_back(b);
+    return seq;
+}
 
 }  // namespace
 
-std::vector<uint8_t> touchscreenDescriptor(uint16_t max_x, uint16_t max_y) {
-    // Digitizer (0x0D) / Touch Screen (0x04):
-    // Finger collection with Tip Switch (1 bit), 7-bit pad, and 16-bit Absolute X/Y.
-    const uint8_t raw[] = {
-        0x05, 0x0d,                    // Usage Page (Digitizer)
-        0x09, 0x04,                    // Usage (Touch Screen)
-        0xa1, 0x01,                    // Collection (Application)
-        0x09, 0x22,                    //   Usage (Finger)
-        0xa1, 0x02,                    //   Collection (Logical)
-        0x09, 0x42,                    //     Usage (Tip Switch)
-        0x15, 0x00,                    //     Logical Minimum (0)
-        0x25, 0x01,                    //     Logical Maximum (1)
-        0x75, 0x01,                    //     Report Size (1)
-        0x95, 0x01,                    //     Report Count (1)
-        0x81, kInputDataVarAbs,        //     Input (Data,Var,Abs)
-        0x75, 0x07,                    //     Report Size (7) - padding
-        0x95, 0x01,                    //     Report Count (1)
-        0x81, kInputConst,             //     Input (Const)
-        0x05, 0x01,                    //     Usage Page (Generic Desktop)
-        0x15, 0x00,                    //     Logical Minimum (0)
-        0x26, lo8(max_x), hi8(max_x),  //     Logical Maximum (max_x)
-        0x75, 0x10,                    //     Report Size (16)
-        0x95, 0x01,                    //     Report Count (1)
-        0x09, 0x30,                    //     Usage (X)
-        0x81, kInputDataVarAbs,        //     Input (Data,Var,Abs)
-        0x26, lo8(max_y), hi8(max_y),  //     Logical Maximum (max_y)
-        0x09, 0x31,                    //     Usage (Y)
-        0x81, kInputDataVarAbs,        //     Input (Data,Var,Abs)
-        0xc0,                          //   End Collection
-        0xc0                           // End Collection
+std::string uidString(uint32_t uid) {
+    static const char kDigits[] = "0123456789abcdef";
+    if (uid == 0) return "0";
+    std::string out;
+    while (uid != 0) {
+        out.insert(out.begin(), kDigits[uid & 0x0fU]);
+        uid >>= 4;
+    }
+    return out;
+}
+
+std::vector<uint8_t> touchscreenDescriptor(int32_t width_pixels, int32_t height_pixels) {
+    // AirPlayHid.multitouchDescriptor (AirPlayHid.kt:89-95).
+    std::vector<uint8_t> out;
+    const uint8_t head[] = {
+        0x05, 0x0d,  // Usage Page (Digitizer)
+        0x09, 0x04,  // Usage (Touch Screen)
+        0xa1, 0x01   // Collection (Application)
     };
-    return std::vector<uint8_t>(raw, raw + sizeof(raw));
+    out.insert(out.end(), head, head + sizeof(head));
+    for (size_t k = 0; k < kTouchContacts; ++k) {
+        appendFinger(out, width_pixels, height_pixels);
+    }
+    out.push_back(0xc0);  // End Collection
+    return out;
 }
 
 std::vector<uint8_t> knobDescriptor() {
-    // Generic Desktop (0x01) / Game Pad or Multi-axis Controller (0x08) for CarPlay rotary knob:
-    // Byte 0 bits 0..4: Up, Down, Left, Right, Select (Button 1)
-    // Byte 1 bits 0..1: AC Home (0x0223), AC Back (0x0224)
-    // Byte 2 int8_t:    Relative Wheel (-127..127)
+    // AirPlayHid.knobDescriptor (AirPlayHid.kt:106-115).
     const uint8_t raw[] = {
-        0x05, 0x01,              // Usage Page (Generic Desktop)
-        0x09, 0x08,              // Usage (Multi-axis Controller)
-        0xa1, 0x01,              // Collection (Application)
-        0x05, 0x01,              //   Usage Page (Generic Desktop)
-        0x09, 0x90,              //   Usage (D-Pad Up)
-        0x09, 0x91,              //   Usage (D-Pad Down)
-        0x09, 0x93,              //   Usage (D-Pad Left)
-        0x09, 0x92,              //   Usage (D-Pad Right)
-        0x05, 0x09,              //   Usage Page (Button)
-        0x09, 0x01,              //   Usage (Button 1 - Select)
-        0x15, 0x00,              //   Logical Minimum (0)
-        0x25, 0x01,              //   Logical Maximum (1)
-        0x75, 0x01,              //   Report Size (1)
-        0x95, 0x05,              //   Report Count (5)
-        0x81, kInputDataVarAbs,  //   Input (Data,Var,Abs)
-        0x75, 0x03,              //   Report Size (3) - pad byte 0
-        0x95, 0x01,              //   Report Count (1)
-        0x81, kInputConst,       //   Input (Const)
-        0x05, 0x0c,              //   Usage Page (Consumer)
-        0x0a, 0x23, 0x02,        //   Usage (AC Home)
-        0x0a, 0x24, 0x02,        //   Usage (AC Back)
-        0x75, 0x01,              //   Report Size (1)
-        0x95, 0x02,              //   Report Count (2)
-        0x81, kInputDataVarAbs,  //   Input (Data,Var,Abs)
-        0x75, 0x06,              //   Report Size (6) - pad byte 1
-        0x95, 0x01,              //   Report Count (1)
-        0x81, kInputConst,       //   Input (Const)
-        0x05, 0x01,              //   Usage Page (Generic Desktop)
-        0x09, 0x38,              //   Usage (Wheel)
-        0x15, 0x81,              //   Logical Minimum (-127)
-        0x25, 0x7f,              //   Logical Maximum (127)
-        0x75, 0x08,              //   Report Size (8)
-        0x95, 0x01,              //   Report Count (1)
-        0x81, kInputDataVarRel,  //   Input (Data,Var,Rel)
-        0xc0                     // End Collection
+        0x05, 0x01,        // Usage Page (Generic Desktop)
+        0x09, 0x08,        // Usage (Multi-axis Controller)
+        0xa1, 0x01,        // Collection (Application)
+        0x05, 0x09,        //   Usage Page (Button)
+        0x09, 0x01,        //   Usage (Button 1) - select
+        0x15, 0x00,        //   Logical Minimum (0)
+        0x25, 0x01,        //   Logical Maximum (1)
+        0x75, 0x01,        //   Report Size (1)
+        0x95, 0x01,        //   Report Count (1)
+        0x81, 0x02,        //   Input (Data,Var,Abs)
+        0x05, 0x0c,        //   Usage Page (Consumer)
+        0x0a, 0x23, 0x02,  //   Usage (AC Home)
+        0x0a, 0x24, 0x02,  //   Usage (AC Back)
+        0x95, 0x02,        //   Report Count (2)
+        0x81, 0x02,        //   Input (Data,Var,Abs)
+        0x95, 0x05,        //   Report Count (5) - padding
+        0x81, 0x01,        //   Input (Const)
+        0x05, 0x01,        //   Usage Page (Generic Desktop)
+        0x09, 0x01,        //   Usage (Pointer)
+        0xa1, 0x00,        //   Collection (Physical)
+        0x09, 0x30,        //     Usage (X)
+        0x09, 0x31,        //     Usage (Y)
+        0x15, 0x81,        //     Logical Minimum (-127)
+        0x25, 0x7f,        //     Logical Maximum (127)
+        0x75, 0x08,        //     Report Size (8)
+        0x95, 0x02,        //     Report Count (2)
+        0x81, 0x02,        //     Input (Data,Var,Abs)
+        0xc0,              //   End Collection
+        0x09, 0x38,        //   Usage (Wheel)
+        0x15, 0x81,        //   Logical Minimum (-127)
+        0x25, 0x7f,        //   Logical Maximum (127)
+        0x75, 0x08,        //   Report Size (8)
+        0x95, 0x01,        //   Report Count (1)
+        0x81, 0x06,        //   Input (Data,Var,Rel)
+        0xc0               // End Collection
     };
     return std::vector<uint8_t>(raw, raw + sizeof(raw));
 }
 
 std::vector<uint8_t> mediaDescriptor() {
-    // Consumer (0x0C) / Consumer Control (0x01): bits 0..4 correspond to Play..Previous.
+    // AirPlayHid.mediaDescriptor (AirPlayHid.kt:117-123).
     const uint8_t raw[] = {
-        0x05, 0x0c,              // Usage Page (Consumer)
-        0x09, 0x01,              // Usage (Consumer Control)
-        0xa1, 0x01,              // Collection (Application)
-        0x09, 0xb0,              //   Usage (Play)
-        0x09, 0xb1,              //   Usage (Pause)
-        0x09, 0xcd,              //   Usage (Play/Pause)
-        0x09, 0xb5,              //   Usage (Scan Next Track)
-        0x09, 0xb6,              //   Usage (Scan Previous Track)
-        0x15, 0x00,              //   Logical Minimum (0)
-        0x25, 0x01,              //   Logical Maximum (1)
-        0x75, 0x01,              //   Report Size (1)
-        0x95, 0x05,              //   Report Count (5)
-        0x81, kInputDataVarAbs,  //   Input (Data,Var,Abs)
-        0x75, 0x03,              //   Report Size (3) - padding
-        0x95, 0x01,              //   Report Count (1)
-        0x81, kInputConst,       //   Input (Const)
-        0xc0                     // End Collection
+        0x05, 0x0c,        // Usage Page (Consumer)
+        0x09, 0x01,        // Usage (Consumer Control)
+        0xa1, 0x01,        // Collection (Application)
+        0x15, 0x00,        //   Logical Minimum (0)
+        0x25, 0x06,        //   Logical Maximum (6)
+        0x05, 0x0c,        //   Usage Page (Consumer)
+        0x0a, 0x00, 0x00,  //   Usage (0x0000)          index 0
+        0x0a, 0xb0, 0x00,  //   Usage (Play)            index 1
+        0x0a, 0xb1, 0x00,  //   Usage (Pause)           index 2
+        0x0a, 0xcd, 0x00,  //   Usage (Play/Pause)      index 3
+        0x0a, 0xb5, 0x00,  //   Usage (Scan Next)       index 4
+        0x0a, 0xb6, 0x00,  //   Usage (Scan Previous)   index 5
+        0x0a, 0x9e, 0x02,  //   Usage (0x029e)          index 6
+        0x75, 0x08,        //   Report Size (8)
+        0x95, 0x01,        //   Report Count (1)
+        0x81, 0x00,        //   Input (Data,Array,Abs)
+        0xc0               // End Collection
     };
     return std::vector<uint8_t>(raw, raw + sizeof(raw));
 }
 
 std::vector<uint8_t> telephonyDescriptor() {
-    // Telephony (0x0B) / Phone (0x01): bits 0..3 = Hook Switch, Flash, Drop, Phone Mute.
+    // AirPlayHid.telephonyDescriptor (AirPlayHid.kt:125-133).
     const uint8_t raw[] = {
-        0x05, 0x0b,              // Usage Page (Telephony)
-        0x09, 0x01,              // Usage (Phone)
-        0xa1, 0x01,              // Collection (Application)
-        0x09, 0x20,              //   Usage (Hook Switch)
-        0x09, 0x21,              //   Usage (Flash)
-        0x09, 0x26,              //   Usage (Drop)
-        0x09, 0x2f,              //   Usage (Phone Mute)
-        0x15, 0x00,              //   Logical Minimum (0)
-        0x25, 0x01,              //   Logical Maximum (1)
-        0x75, 0x01,              //   Report Size (1)
-        0x95, 0x04,              //   Report Count (4)
-        0x81, kInputDataVarAbs,  //   Input (Data,Var,Abs)
-        0x75, 0x04,              //   Report Size (4) - padding
-        0x95, 0x01,              //   Report Count (1)
-        0x81, kInputConst,       //   Input (Const)
-        0xc0                     // End Collection
+        0x05, 0x0b,  // Usage Page (Telephony)
+        0x09, 0x07,  // Usage (Programmable Button)
+        0xa1, 0x01,  // Collection (Application)
+        0x15, 0x00,  //   Logical Minimum (0)
+        0x25, 0x11,  //   Logical Maximum (17)
+        0x05, 0x0b,  //   Usage Page (Telephony)
+        0x09, 0x00,  //   Usage (0x00)            index 0
+        0x09, 0x20,  //   Usage (Hook Switch)     index 1
+        0x09, 0x21,  //   Usage (Flash)           index 2
+        0x09, 0x26,  //   Usage (Drop)            index 3
+        0x09, 0x2f,  //   Usage (Phone Mute)      index 4
+        0x09, 0xb0,  //   Usage (Phone Key 0)     index 5
+        0x09, 0xb1,
+        0x09, 0xb2,
+        0x09, 0xb3,
+        0x09, 0xb4,
+        0x09, 0xb5,
+        0x09, 0xb6,
+        0x09, 0xb7,
+        0x09, 0xb8,
+        0x09, 0xb9,  //   Usage (Phone Key 9)     index 14
+        0x09, 0xba,  //   Usage (Phone Key Star)  index 15
+        0x09, 0xbb,  //   Usage (Phone Key Pound) index 16
+        0x05, 0x07,  //   Usage Page (Keyboard)
+        0x09, 0x2a,  //   Usage (Backspace)       index 17
+        0x75, 0x08,  //   Report Size (8)
+        0x95, 0x01,  //   Report Count (1)
+        0x81, 0x00,  //   Input (Data,Array,Abs)
+        0xc0         // End Collection
     };
     return std::vector<uint8_t>(raw, raw + sizeof(raw));
 }
 
-void normalizeTouchCoords(int32_t px,
-                          int32_t py,
-                          uint16_t screen_width,
-                          uint16_t screen_height,
-                          uint16_t& x_out,
-                          uint16_t& y_out) {
-    if (screen_width <= 1U) {
-        x_out = 0;
-    } else {
-        int32_t cx = px;
-        if (cx < 0) cx = 0;
-        if (cx >= static_cast<int32_t>(screen_width)) {
-            cx = static_cast<int32_t>(screen_width) - 1;
-        }
-        const uint64_t scaled = (static_cast<uint64_t>(cx) * kTouchAxisMax) /
-                                static_cast<uint64_t>(screen_width - 1U);
-        x_out = static_cast<uint16_t>(scaled);
-    }
-
-    if (screen_height <= 1U) {
-        y_out = 0;
-    } else {
-        int32_t cy = py;
-        if (cy < 0) cy = 0;
-        if (cy >= static_cast<int32_t>(screen_height)) {
-            cy = static_cast<int32_t>(screen_height) - 1;
-        }
-        const uint64_t scaled = (static_cast<uint64_t>(cy) * kTouchAxisMax) /
-                                static_cast<uint64_t>(screen_height - 1U);
-        y_out = static_cast<uint16_t>(scaled);
-    }
+int32_t pixelFromNormalized(double normalized, int32_t extent_pixels) {
+    const double v = normalized * static_cast<double>(extent_pixels);
+    if (!(v > 0.0)) return 0;  // also NaN
+    const double r = floor(v + 0.5);
+    if (r >= 2147483647.0) return 2147483647;
+    return static_cast<int32_t>(r);
 }
 
-std::vector<uint8_t> makeTouchReport(bool tip_down, uint16_t x, uint16_t y) {
-    std::vector<uint8_t> report(5, 0);
-    report[0] = tip_down ? 0x01U : 0x00U;
-    report[1] = lo8(x);
-    report[2] = hi8(x);
-    report[3] = lo8(y);
-    report[4] = hi8(y);
+std::vector<uint8_t> touchReport(const std::vector<TouchContact>& slotted_contacts,
+                                 int32_t width_pixels,
+                                 int32_t height_pixels) {
+    // AirPlayHid.touchReport (AirPlayHid.kt:44-55).
+    std::vector<uint8_t> report(kTouchReportBytes, 0);
+    const int32_t x_max = width_pixels > 0 ? width_pixels : 0;
+    const int32_t y_max = height_pixels > 0 ? height_pixels : 0;
+    for (size_t slot = 0; slot < kTouchContacts; ++slot) {
+        const size_t offset = slot * kTouchBytesPerFinger;
+        report[offset] = static_cast<uint8_t>(slot);
+        const TouchContact* contact = NULL;
+        for (size_t k = 0; k < slotted_contacts.size(); ++k) {
+            if (slotted_contacts[k].id == static_cast<int32_t>(slot)) {
+                contact = &slotted_contacts[k];
+                break;
+            }
+        }
+        if (contact == NULL) continue;
+        report[offset + 1] = contact->down ? 0x01U : 0x00U;
+        writeU16Le(report, offset + 2, clampI32(contact->x, 0, x_max));
+        writeU16Le(report, offset + 4, clampI32(contact->y, 0, y_max));
+    }
     return report;
 }
 
-std::vector<uint8_t> makeKnobReport(const KnobState& state) {
-    std::vector<uint8_t> report(3, 0);
-    uint8_t byte0 = 0;
-    if (state.up) byte0 |= (1U << 0);
-    if (state.down) byte0 |= (1U << 1);
-    if (state.left) byte0 |= (1U << 2);
-    if (state.right) byte0 |= (1U << 3);
-    if (state.select) byte0 |= (1U << 4);
+TouchSlots::TouchSlots(size_t slots)
+    : pointer_used_(slots, false), pointers_(slots, 0), held_used_(slots, false), held_(slots) {}
 
-    uint8_t byte1 = 0;
-    if (state.home) byte1 |= (1U << 0);
-    if (state.back) byte1 |= (1U << 1);
+void TouchSlots::reset() {
+    for (size_t s = 0; s < pointer_used_.size(); ++s) {
+        pointer_used_[s] = false;
+        pointers_[s] = 0;
+        held_used_[s] = false;
+        held_[s] = TouchContact();
+    }
+}
 
-    report[0] = byte0;
-    report[1] = byte1;
-    report[2] = static_cast<uint8_t>(state.wheel_delta);
+std::vector<TouchContact> TouchSlots::assign(const std::vector<TouchContact>& contacts) {
+    // AirPlayTouchSlots.assign (AirPlayTouchSlots.kt:14-34).
+    const size_t n = pointer_used_.size();
+    std::vector<bool> report_used(n, false);
+    std::vector<TouchContact> report(n);
+    for (size_t k = 0; k < contacts.size(); ++k) {
+        const TouchContact& c = contacts[k];
+        size_t slot = n;
+        for (size_t s = 0; s < n; ++s) {
+            if (pointer_used_[s] && pointers_[s] == c.id) {
+                slot = s;
+                break;
+            }
+        }
+        if (slot == n && c.down) {
+            for (size_t s = 0; s < n; ++s) {
+                if (!pointer_used_[s]) {
+                    slot = s;
+                    break;
+                }
+            }
+        }
+        if (slot == n) continue;
+        pointer_used_[slot] = true;
+        pointers_[slot] = c.id;
+        report_used[slot] = true;
+        report[slot] = TouchContact(static_cast<int32_t>(slot), c.down, c.x, c.y);
+    }
+    std::vector<TouchContact> out;
+    for (size_t s = 0; s < n; ++s) {
+        if (!report_used[s] && held_used_[s]) {
+            report[s] = held_[s];
+            report[s].down = false;
+            report_used[s] = true;
+        }
+        if (report_used[s] && report[s].down) {
+            held_used_[s] = true;
+            held_[s] = report[s];
+        } else {
+            held_used_[s] = false;
+            held_[s] = TouchContact();
+            pointer_used_[s] = false;
+            pointers_[s] = 0;
+        }
+        if (report_used[s]) out.push_back(report[s]);
+    }
+    return out;
+}
+
+std::vector<uint8_t> knobReport(const KnobState& state) {
+    // AirPlayHid.knobReport (AirPlayHid.kt:57-68).
+    std::vector<uint8_t> report(kKnobReportBytes, 0);
+    uint8_t buttons = 0;
+    if (state.select) buttons |= 0x01U;
+    if (state.home) buttons |= 0x02U;
+    if (state.back) buttons |= 0x04U;
+    report[0] = buttons;
+    report[1] = clampAxis(state.x);
+    report[2] = clampAxis(state.y);
+    report[3] = clampAxis(state.wheel);
     return report;
 }
 
-std::vector<uint8_t> makeMediaReport(MediaButton button) {
-    uint8_t bits = 0;
-    if (button >= MEDIA_PLAY && button <= MEDIA_PREVIOUS) {
-        bits = static_cast<uint8_t>(1U << (static_cast<unsigned int>(button) - 1U));
-    }
-    return std::vector<uint8_t>(1, bits);
+std::vector<uint8_t> mediaReport(int32_t index) { return std::vector<uint8_t>(1, lo8(index)); }
+
+std::vector<uint8_t> telephonyReport(int32_t index) { return std::vector<uint8_t>(1, lo8(index)); }
+
+ReportSequence momentaryKnobReports(const KnobState& state) {
+    return pair(knobReport(state), knobReport(KnobState()));
 }
 
-std::vector<uint8_t> makeTelephonyReport(uint8_t telephony_mask) {
-    return std::vector<uint8_t>(1, static_cast<uint8_t>(telephony_mask & 0x0fU));
+ReportSequence heldKnobReports(const KnobState& state) {
+    return ReportSequence(1, knobReport(state));
+}
+
+ReportSequence mediaPressReports(int32_t index) {
+    return pair(mediaReport(index), mediaReport(MEDIA_NONE));
+}
+
+ReportSequence telephonyPressReports(int32_t index) {
+    return pair(telephonyReport(index), telephonyReport(TELEPHONY_NONE));
 }
 
 void mapZbe3ToCarPlay(const Zbe3Event& hw,
                       KnobState& knob_out,
-                      MediaButton& media_out,
-                      uint8_t& telephony_out) {
+                      int32_t& media_index_out,
+                      int32_t& telephony_index_out) {
     knob_out = KnobState();
-    knob_out.up = (hw.dir_mask & 0x01U) != 0;
-    knob_out.right = (hw.dir_mask & 0x02U) != 0;
-    knob_out.down = (hw.dir_mask & 0x04U) != 0;
-    knob_out.left = (hw.dir_mask & 0x08U) != 0;
     knob_out.select = hw.center_pressed;
     knob_out.home = (hw.button_mask & zbe3::kBtnMenu) != 0;
     knob_out.back = (hw.button_mask & zbe3::kBtnBack) != 0;
-    knob_out.wheel_delta = hw.rotary_delta;
 
-    media_out = (hw.button_mask & zbe3::kBtnMedia) != 0 ? MEDIA_PLAY_PAUSE : MEDIA_NONE;
-    telephony_out = (hw.button_mask & zbe3::kBtnCom) != 0 ? TELEPHONY_HOOK_SWITCH : TELEPHONY_NONE;
+    // Reference D-pad convention (CarPlayRemoteKeys.kt:67-76): Up/Left -> wheel -1,
+    // Down/Right -> wheel +1. CarPlay's non-touch focus model is rotary-first
+    // (CarPlayRemoteKeys.kt:12-13) and "CarPlay moves its focus only when the knob turns; x/y
+    // nudges pan a focused map instead" (common/.../WheelKeyService.kt:392). The legacy X/Y axes
+    // stay 0 (AirPlayHid.kt:112).
+    int32_t tilt = 0;
+    if ((hw.dir_mask & zbe3::kDirUp) != 0) --tilt;
+    if ((hw.dir_mask & zbe3::kDirLeft) != 0) --tilt;
+    if ((hw.dir_mask & zbe3::kDirDown) != 0) ++tilt;
+    if ((hw.dir_mask & zbe3::kDirRight) != 0) ++tilt;
+    // Rotation: clockwise = forward = +1, like the wheel's NEXT (WheelKeyService.kt:394-395).
+    knob_out.wheel = static_cast<int32_t>(hw.rotary_delta) + tilt;
+
+    media_index_out = (hw.button_mask & zbe3::kBtnMedia) != 0 ? MEDIA_PLAY_PAUSE : MEDIA_NONE;
+    telephony_index_out =
+        (hw.button_mask & zbe3::kBtnCom) != 0 ? TELEPHONY_HOOK_SWITCH : TELEPHONY_NONE;
+}
+
+ReportSequence zbe3KnobReports(const KnobState& state) {
+    if (state.wheel == 0) return heldKnobReports(state);
+    KnobState settled = state;
+    settled.wheel = 0;
+    return pair(knobReport(state), knobReport(settled));
 }
 
 DescriptorSummary inspectDescriptor(const std::vector<uint8_t>& desc) {
@@ -262,7 +394,7 @@ DescriptorSummary inspectDescriptor(const std::vector<uint8_t>& desc) {
             const uint8_t flags = desc[i];
             ++summary.input_item_count;
             if ((flags & kInputConst) == 0) {
-                if ((flags & 0x04U) != 0) {
+                if ((flags & kInputRelative) != 0) {
                     summary.has_relative_input = true;
                 } else {
                     summary.has_absolute_input = true;
