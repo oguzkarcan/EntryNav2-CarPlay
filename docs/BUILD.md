@@ -94,7 +94,18 @@ Thanks to the dlopen policy, the sysroot is **not needed to build**. It is only 
    ```
 3. Optional: run a built ARM binary against the car's own libraries with `qemu-arm -L ~/entrynav2/sysroot <binary>` (from an x86 Linux shell with `qemu-user` installed).
 
-Deployable artefacts (the `carplayd` daemon, the HMI plugin) and their install layout are added in Phase 3 (F3-P7); this section will then list the exact `make` targets.
+4. Deployable targets and vehicle install layout (`F3-P7`):
+   ```sh
+   make carplayd                               # builds <BUILD_DIR>/carplayd
+   make hmi-plugin                             # builds <BUILD_DIR>/libEntryCarPlay.so
+   make install-layout                         # stages the full head-unit rootfs tree under <BUILD_DIR>/install-root:
+   #   /opt/carplay/carplayd
+   #   /opt/hmi/data/ro/Plugins/EntryCarPlay/EntryCarPlay
+   #   /opt/hmi/data/ro/Plugins/EntryCarPlay/libEntryCarPlay.so
+   #   /opt/hmi/data/ro/Plugins/EntryCarPlay/EntryCarPlay.manifest
+   #   /opt/hmi/data/ro/Plugins/EntryCarPlay/EntryCarPlay.xml
+   #   /var/local/data/CarPlay/
+   ```
 
 ## 6. Hard rule: the sysroot never leaves the PC
 

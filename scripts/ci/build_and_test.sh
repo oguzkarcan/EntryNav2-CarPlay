@@ -175,10 +175,14 @@ if [ "$PROFILE" = "armv7-gcc47" ]; then
     case "$CXX" in
         arm-linux-gnueabihf-*) READELF=arm-linux-gnueabihf-readelf; OBJDUMP=arm-linux-gnueabihf-objdump ;;
     esac
+    ELF_TARGETS=""
     for src in tests/test_*.cpp; do
         [ -e "$src" ] || continue
         name=$(basename "$src" .cpp)
-        bin="$BUILD_DIR/$name$BIN_EXT"
+        ELF_TARGETS="$ELF_TARGETS $BUILD_DIR/$name$BIN_EXT"
+    done
+    ELF_TARGETS="$ELF_TARGETS $BUILD_DIR/carplayd$BIN_EXT $BUILD_DIR/libEntryCarPlay.so"
+    for bin in $ELF_TARGETS; do
         [ -f "$bin" ] || continue
         echo "--- $bin"
         "$READELF" -h "$bin" | grep -E 'Class|Machine|Flags' || true

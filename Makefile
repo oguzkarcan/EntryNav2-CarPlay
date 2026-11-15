@@ -41,8 +41,10 @@ endif
 
 ifeq ($(TARGET_OS),windows)
 SYS_LIBS ?= -lws2_32 -lbcrypt
+PIC_FLAG :=
 else
 SYS_LIBS ?= -lpthread -lrt -ldl
+PIC_FLAG := -fPIC
 endif
 
 EVO ?= 0
@@ -75,13 +77,22 @@ PLATFORM_OBJS := \
 
 PLATFORM_LIB := $(BUILD_DIR)/libcarplay_platform.a
 
+DAEMON_BIN := $(BUILD_DIR)/carplayd$(BIN_EXT)
+STAGE_DIR  ?= $(BUILD_DIR)/install-root
+
+ifeq ($(TARGET_OS),linux)
+HMI_PLUGIN_SO := $(BUILD_DIR)/libEntryCarPlay.so
+else
+HMI_PLUGIN_SO :=
+endif
+
 PUBLIC_HDRS := $(wildcard include/carplay/*.hpp) $(wildcard include/carplay/platform/*.hpp)
 TEST_HDRS   := $(wildcard tests/*.hpp)
 
 TEST_SRCS := $(sort $(wildcard tests/test_*.cpp))
 TEST_BINS := $(patsubst tests/%.cpp,$(BUILD_DIR)/%$(BIN_EXT),$(TEST_SRCS))
 
-.PHONY: all core platform tests test-host clean arm-core arm-platform
+.PHONY: all core platform daemon hmiapp install-layout tests test-host clean arm-core arm-platform arm-daemon arm-hmiapp
 
 all: test-host
 
@@ -89,7 +100,11 @@ core: $(CORE_LIB)
 
 platform: $(PLATFORM_LIB) $(CORE_LIB)
 
-tests: $(TEST_BINS)
+daemon: $(DAEMON_BIN)
+
+hmiapp: $(HMI_PLUGIN_SO)
+
+tests: $(TEST_BINS) $(DAEMON_BIN) $(HMI_PLUGIN_SO)
 
 $(CORE_LIB): $(CORE_OBJS)
 	$(AR) rcs $@ $^
@@ -99,21 +114,40 @@ $(PLATFORM_LIB): $(PLATFORM_OBJS)
 	$(AR) rcs $@ $^
 
 $(BUILD_DIR)/core_%.o: src/core/%.cpp | $(BUILD_DIR)
-	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(DEPFLAGS) -c $< -o $@
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(PIC_FLAG) $(DEPFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/plat_%.o: src/platform/%.cpp | $(BUILD_DIR)
-	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(DEPFLAGS) -c $< -o $@
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(PIC_FLAG) $(DEPFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/evo_%.o: src/platform/evo/%.cpp | $(BUILD_DIR)
-	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(DEPFLAGS) -c $< -o $@
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(PIC_FLAG) $(DEPFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/mono_%.o: third_party/monocypher/%.c | $(BUILD_DIR)
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(DEPFLAGS) -c $< -o $@
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(PIC_FLAG) $(DEPFLAGS) -c $< -o $@
+
+$(DAEMON_BIN): src/daemon/main.cpp $(PLATFORM_LIB) $(CORE_LIB) $(PUBLIC_HDRS) | $(BUILD_DIR)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $< $(PLATFORM_LIB) $(CORE_LIB) $(SYS_LIBS) -o $@
+
+$(BUILD_DIR)/libEntryCarPlay.so: src/hmi/entry_carplay_app.cpp $(PLATFORM_LIB) $(CORE_LIB) $(PUBLIC_HDRS) | $(BUILD_DIR)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -fPIC -shared $< $(PLATFORM_LIB) $(CORE_LIB) $(SYS_LIBS) -o $@
+
+install-layout: $(DAEMON_BIN) $(HMI_PLUGIN_SO) hmiapp/EntryCarPlay.manifest hmiapp/EntryCarPlay.xml
+	mkdir -p $(STAGE_DIR)/opt/carplay
+	mkdir -p $(STAGE_DIR)/opt/hmi/data/ro/Plugins/EntryCarPlay
+	mkdir -p $(STAGE_DIR)/var/local/data/CarPlay
+	cp $(DAEMON_BIN) $(STAGE_DIR)/opt/carplay/carplayd
+	chmod 0755 $(STAGE_DIR)/opt/carplay/carplayd
+	if [ -n "$(HMI_PLUGIN_SO)" ] && [ -f "$(HMI_PLUGIN_SO)" ]; then \
+		cp $(HMI_PLUGIN_SO) $(STAGE_DIR)/opt/hmi/data/ro/Plugins/EntryCarPlay/EntryCarPlay; \
+		cp $(HMI_PLUGIN_SO) $(STAGE_DIR)/opt/hmi/data/ro/Plugins/EntryCarPlay/libEntryCarPlay.so; \
+	fi
+	cp hmiapp/EntryCarPlay.manifest $(STAGE_DIR)/opt/hmi/data/ro/Plugins/EntryCarPlay/EntryCarPlay.manifest
+	cp hmiapp/EntryCarPlay.xml $(STAGE_DIR)/opt/hmi/data/ro/Plugins/EntryCarPlay/EntryCarPlay.xml
 
 $(BUILD_DIR)/test_%$(BIN_EXT): tests/test_%.cpp $(PLATFORM_LIB) $(CORE_LIB) $(PUBLIC_HDRS) $(TEST_HDRS) | $(BUILD_DIR)
 	$(CXX) $(TEST_CPPFLAGS) $(CXXFLAGS) $< $(PLATFORM_LIB) $(CORE_LIB) $(SYS_LIBS) -o $@
 
-test-host: $(TEST_BINS)
+test-host: $(TEST_BINS) $(DAEMON_BIN) $(HMI_PLUGIN_SO)
 	@fail=0; \
 	for t in $(TEST_BINS); do \
 		echo "==> $$t"; \
@@ -131,6 +165,12 @@ arm-core:
 
 arm-platform:
 	$(MAKE) $(ARM_MAKE_VARS) EVO=1 platform
+
+arm-daemon:
+	$(MAKE) $(ARM_MAKE_VARS) EVO=1 daemon
+
+arm-hmiapp:
+	$(MAKE) $(ARM_MAKE_VARS) EVO=1 hmiapp
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)

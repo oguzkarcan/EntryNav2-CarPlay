@@ -561,7 +561,9 @@ void EvoKnob::onMessage(const VmostMsgView& m) {
                 hcb = hard_key_cb_;
                 huser = hard_key_user_;
             }
-            if (hcb != NULL && (send || !ev[i].down)) {
+            if (hcb != NULL &&
+                (send || !ev[i].down ||
+                 (mode_ == kInputForward && ev[i].key == kCcsKeyMedia))) {
                 hcb(ev[i].key, ev[i].down, ev[i].name, huser);
             }
         }

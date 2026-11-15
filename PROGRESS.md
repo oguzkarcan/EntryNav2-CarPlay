@@ -2,7 +2,7 @@
 
 **Target Hardware:** BMW `HU_ENTRYNAV2` (EntryEVO / ARMv7 `-std=gnu++0x`)  
 **Transports Targeted:** Wired USB (`iAP2` over USB + `NCM` IPv6) **and** Wireless (`Bluetooth RFCOMM` + `Wi-Fi` AP/STA + Bonjour)  
-**Active Milestone:** **Phase 3 In Progress** (Phase 2 completed, host-verified)
+**Active Milestone:** **Phase 3 Completed** (Wave A, Wave B, and Wave C completed; host `g++`/`clang++` + ARMv7 GCC 4.7.2 verified)
 
 ---
 
@@ -78,7 +78,7 @@ All Phase 1 protocol primitives are implemented in portable C++11 (`-std=gnu++0x
 
 ---
 
-## Phase 3 — In Progress
+## Completed Work — Phase 3 (2026-11-15, host & ARMv7 GCC 4.7.2 verified)
 
 ### Architecture decisions
 1. All vehicle libraries (`libxsvideo`, `libasound`, `libvmostclient`, `libilm*`, `libdns_sd`, …) are loaded with `dlopen`/`dlsym` through hand-written prototypes; the daemon links only libc / libstdc++ / libpthread / librt / libdl and builds without the sysroot.
@@ -116,25 +116,31 @@ All Phase 1 protocol primitives are implemented in portable C++11 (`-std=gnu++0x
   - Open points (not changed, need a real iPhone or a decision): `bplist::Value::makeUInt()` still encodes values >= 2^63 as `0x14` (the reference never emits that form; nothing on the wire uses it any more); audio UDP and timing PT 210 are filtered by control-peer host although the reference accepts any sender there (AEAD already authenticates audio) — set `enforce_peer_address = false` if a phone ever sends media from another source address; `SessionServerConfig::initial_ntp_offset_ns` defaults to 0 while the reference starts from the wall clock (the first sync steps either way).
 
 ### Wave C (vehicle HAL, dlopen)
-- [ ] **F3-P4 — Video sink**: `libxsvideo` + OMAP dma-buf + LayerManager.
-- [ ] **F3-P5 — Audio sinks + microphone** (ALSA).
-- [ ] **F3-P6 — Input**: ZBE3 over vmost `E5.01` / `E5.03`, touch UDP `30567` → HID over the event channel.
-- [ ] **F3-P7 — Daemon `carplayd`**, HMI plugin / visibility, install layout.
+- [x] **F3-P4 — Video sink (`libxsvideo` + OMAP dma-buf + LayerManager)** (2026-11-15)
+  - `evo_process` (`include/carplay/platform/evo_process.hpp`, `src/platform/evo_process.cpp`): `posix_spawnp` + `pipe(FD_CLOEXEC)` + non-blocking `poll()` subprocess runner with timeout, 64 KiB output cap, and `SIGKILL` + `waitpid` cleanup (no `system()` / `popen()`).
+  - `evo_ilm` (`include/carplay/platform/evo_ilm.hpp`, `src/platform/evo_ilm.cpp`): GENIVI LayerManager CLI wrapper (`LayerManagerControl`) with `kDefaultCarPlayLayerId = 0x80000000`, `kDefaultCarPlaySurfaceId = 0x7ec00001`, `kDefaultOverlaySurfaceId = 0x7ec00002`, `/etc/layermanager/compositor.conf` `genivi-flip-renderorder` parsing, read-back confirmation after `set layer ... render order`, preservation of existing surface order, and strict pure parsers (`parseRenderOrder`, `parseResolution`, `parseSurfaceList`, `validLayerGeometry`, `parseRenderOrderFlip`).
+  - `omap_dmabuf` & `xsv_api` & `evo_video` (`include/carplay/platform/omap_dmabuf.hpp`, `src/platform/omap_dmabuf.cpp`, `include/carplay/platform/xsv_api.hpp`, `include/carplay/platform/evo_video.hpp`, `src/platform/evo_video.cpp`): runtime `dlopen`/`dlsym` loaders for `libdrm.so.2`, `libdrm_omap.so.1`, and `libxsvideo.so.4` (`XSV_TYPE_DIGITAL_CAM = 4`); 4-buffer 512 KiB OMAP GEM dma-buf pool (`OMAP_BO_WC | OMAP_BO_SCANOUT`) with `XSV_EVENT_DMABUF_COMPLETE` release tracking; SPS/PPS Annex B caching and automatic prepend to IDR keyframes until `XSV_EVENT_FRAME`; `EvoVideoSink` (`MediaSink` adapter). Covered by `tests/test_evo_video.cpp` (`7/7`).
+- [x] **F3-P5 — Audio sinks + microphone (ALSA)** (2026-11-15)
+  - `evo_audio` (`include/carplay/platform/evo_audio.hpp`, `src/platform/evo_audio.cpp`): runtime `dlopen`/`dlsym` loader for `libasound.so.2` (`AlsaApi`/`AlsaLoader`) with zero link-time ALSA dependencies; routes stream type `101` to `"carplay_alt"` (1ch), `"telephony"` / `"speechrecognition"` to `"tel_out1"` (1ch), and media streams to `"entertainment"` (2ch) with stereo-to-mono `(L+R)/2` downmix, mono-to-stereo upmix, saturating Q15 ducking gain (`onAudioDuck` / `duck_on_alt_stream`), 20 ms zero-fill packet-loss concealment, non-blocking per-stream ring buffers, and a single worker thread enforcing close-before-open ordering and `snd_pcm_recover` XRUN recovery.
+  - `evo_mic` (`include/carplay/platform/evo_mic.hpp`, `src/platform/evo_mic.cpp`): ALSA `"mic1"` capture worker (`SND_PCM_STREAM_CAPTURE`, `S16_LE`, 1ch, 20 ms chunk read loop) pushing into `MediaEngine::submitMicrophonePcm()`, plus `EvoAudioMediaSink` chaining `MediaSink` callbacks into `EvoAudioSink` and `EvoMic`. Covered by `tests/test_evo_audio.cpp` (`8/8`).
+- [x] **F3-P6 — Input (ZBE3 over vmost `E5.01` / `E5.03`, touch UDP `30567` → HID over the event channel)** (2026-11-15)
+  - `vmost_client` & `evo_ccs` & `evo_knob` (`include/carplay/platform/vmost_client.hpp`, `src/platform/vmost_client.cpp`, `include/carplay/platform/evo_ccs.hpp`, `include/carplay/platform/evo_knob.hpp`, `src/platform/evo_knob.cpp`): runtime `dlopen`/`dlsym` loader for `libvmostclient.so.1`; dual-protocol ZBE3 decoder (`E5.01` `0xC10`/`0xC20` older CCS and `E5.03` `0xC46`/`0xC47`/`0xC4F` CCS35up with 2000 ms silence fallback, `normalizePushButtons` capacitive rest `4 -> 0`), MFL steering-wheel telephone (`15.02.400`) & Siri PTT (`15.02.512`), volume buttons (`15.0C.C01` / `15.02.401`), and AudioMaster volume level (`20.00.C08`).
+  - `evo_touch_frame` & `evo_touch` & `evo_input_bridge` (`include/carplay/platform/evo_touch_frame.hpp`, `include/carplay/platform/evo_touch.hpp`, `src/platform/evo_touch.cpp`, `include/carplay/platform/evo_input_bridge.hpp`, `src/platform/evo_input_bridge.cpp`): 64-byte BMW TCP/UDP `30567` touch PDU reassembler & multi-touch contact tracker (`TouchFrameReassembler`, `TouchContactTracker`, `EvoTouch`) with raw-UDP test mode and BPF-attached `PF_INET, SOCK_RAW, IPPROTO_UDP` production mode; `EvoInputBridge` marshaling worker-thread touch/knob/hard-key/MFL events onto the `Reactor` thread (`Reactor::post()`), gating HID reports on screen ownership (`owned()`), releasing held contacts/buttons on focus loss, and forwarding hard-key/volume events to `EvoInputListener`. Covered by `tests/test_evo_input.cpp` (`10/10`).
+- [x] **F3-P7 — Daemon `carplayd`, HMI plugin / visibility (`libEntryCarPlay.so`), install layout** (2026-11-15)
+  - `service_contract`, `evo_control`, `peek_timing`, `hold_machine` (`include/carplay/platform/service_contract.hpp`, `include/carplay/platform/evo_control.hpp`, `src/platform/evo_control.cpp`, `include/carplay/platform/peek_timing.hpp`, `src/platform/peek_timing.cpp`, `include/carplay/platform/hold_machine.hpp`, `src/platform/hold_machine.cpp`): abstract Unix datagram socket (`\0carplay-control`) + non-blocking `Reactor` integration, atomic `service.state` (`<state> <pid> <overlay>`), `app-key`, `daynight`, `media-recall` (`MediaDoublePress`), `PeekTiming` (drive-mode 5.5 s peek, PDC/park 5.5 s popup, volume 2.6 s 0.72 opacity dim), `HoldMachine` (iDrive state 13 hold vs native screen step-aside), and CDS JSON parsers (`parseGearValue`, `parsePhoneCallState`, `parseDayNightMode`).
+  - `carplay_daemon` & `src/daemon/main.cpp` (`include/carplay/platform/carplay_daemon.hpp`, `src/platform/carplay_daemon.cpp`, `src/daemon/main.cpp`): full `CarPlayDaemon` orchestrating dynamic display resolution detection from `EvoIlm` (`800x480` / `1280x480` / `1440x540`), `SessionServer`, `MediaEngine`, `EvoVideo`, `EvoAudioSink`, `EvoMic`, `EvoKnob`, `EvoTouch`, `EvoInputBridge`, and `EvoControl` on the single-threaded `Reactor` loop; builds standalone `carplayd` binary.
+  - `entry_carplay_plugin` & `src/hmi/entry_carplay_app.cpp` & `hmiapp/` (`include/carplay/platform/entry_carplay_plugin.hpp`, `src/platform/entry_carplay_plugin.cpp`, `src/hmi/entry_carplay_app.cpp`, `hmiapp/EntryCarPlay.manifest`, `hmiapp/EntryCarPlay.xml`): ARM32 ABI-exact `pluginAppInfo` export (`0x18` bytes, `create` at `+0x10`, `destroy` at `+0x14`), runtime `dlopen(NULL)` resolution of `libEntryHmiFramework.so` / `libEntryBase.so` symbols, vtable patching for `onInit` (`[18]`) and `onFinalize` (`[19]`), crash/boot guards (`app-guard`, `bootguard`), `posix_spawn` supervisor for `/opt/carplay/carplayd`, and `make install-layout` target staging `/opt/carplay/carplayd` and `/opt/hmi/data/ro/Plugins/EntryCarPlay/`. Covered by `tests/test_carplay_daemon.cpp` (`7/7`).
+
+**Verified host & ARMv7 GCC 4.7.2 test status (2026-11-15, after Wave C):** clean `-Wall -Wextra -Werror` build of `libcarplay_core.a`, `libcarplay_platform.a`, `carplayd`, `libEntryCarPlay.so`, and **23 test binaries (302 tests)** all passing on Linux host (`g++` 12 and `clang++` 14) and **Debian 7 wheezy `armhf` `g++-4.7` 4.7.2 under QEMU (`armv7-gcc47` CI job, `ARM checks: 0`)** — `test_airplay_hid` 22/22, `test_airplay_info` 28/28, `test_airplay_session` 26/26, `test_audio_rtp` 17/17, `test_bigint` 11/11, `test_bplist_u64` 11/11, `test_carplay_daemon` 7/7, `test_control_cipher` 19/19, `test_e2e_session` 15/15, `test_event_channel` 8/8, `test_evo_audio` 8/8, `test_evo_input` 10/10, `test_evo_video` 7/7, `test_mic_uplink` 5/5, `test_network_session` 9/9, `test_ntp_timing` 10/10, `test_pairing` 14/14, `test_phase1` 10/10, `test_platform_net` 14/14, `test_platform_reactor` 14/14, `test_platform_storage` 11/11, `test_rtsp_message` 16/16, `test_srp6a` 11/11.
 
 ---
 
 ## Next Phases (Pending)
 
-### Phase 2 — AirPlay HAP Session, HTTP/RTSP Server & Audio Pipeline (Host-Testable)
-- [x] Lightweight non-blocking HTTP/RTSP parser & responder (binary plist + TLV8 bodies, HAP encrypted block framing `[u16 LE len | ciphertext | tag16]` with the length header as AAD and up to `0x4000` bytes of plaintext per frame).
-- [x] HAP `Pair-Setup` & `Pair-Verify` state machine (Ed25519 verifier + `Control-Salt` Read/Write key derivation; MFi hook = `AuthProvider`, MFiSAP itself in Phase 5).
-- [x] RTSP `/info`, `SETUP`, `RECORD`, `SET_PARAMETER`, `FLUSH`, `TEARDOWN`, `/feedback`, and `/command` (inbound `requestUI` / `duckAudio` / generic; outbound `hidSendReport`, `requestSiri`, `setNightMode`, generic typed commands such as `changeModes`) state handlers (P7, host-verified; no real iPhone yet).
-- [ ] AirPlay RTP audio receiver — **partly done**: RTP open/seal, per-stream keys, `audioFormat` -> codec mapping, LPCM conversion, sequence-ordered jitter buffer and NTP PT 210/211 request/response + `ClockSync` are implemented and host-verified (P4, exercised end to end in P8); AAC-LC / Opus decoding, type-103 buffered audio and the control/timing/keep-alive UDP sockets move to Phase 3.
-
 ### Phase 3 — BMW `HU_ENTRYNAV2` Platform Abstraction Layer (`src/platform/`)
-- [ ] `EvoVideo` Annex-B surface integration (`800x480` / `1280x480` / `1440x540` display profiles).
-- [ ] `EvoIlm` / `ZBE3` rotary/button reader + `EvoTouch` single/multi-touch reader + video focus arbiter.
-- [ ] `EvoMic` & ALSA audio output + Navi/Siri ducking stream separation + `KombiNav` cluster HUD turn-by-turn adapter + `NMEA` GPS forwarder.
+- [x] `EvoVideo` Annex-B surface integration (`800x480` / `1280x480` / `1440x540` display profiles).
+- [x] `EvoIlm` / `ZBE3` rotary/button reader + `EvoTouch` single/multi-touch reader + video focus arbiter.
+- [x] `EvoMic` & ALSA audio output + Navi/Siri ducking stream separation (`KombiNav` cluster HUD turn-by-turn adapter & `NMEA` GPS forwarder deferred to Phase 4/5).
 
 ### Phase 4 — Dual Transport Integration (USB & Wireless)
 - [ ] **Wired USB Transport:** `usb_device` / `devfs` host -> USB role/configuration switch (`0x12a8`/`0x12a*` iPhone CarPlay USB config) -> `usbmuxd`-less direct USB bulk iAP2 + `CDC NCM` virtual Ethernet + link-local IPv6 (`fe80::/64`) socket binding.
