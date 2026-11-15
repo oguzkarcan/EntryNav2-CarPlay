@@ -58,7 +58,10 @@ std::vector<uint8_t> manualFrame(const uint8_t key[32], uint64_t counter, const 
     crypto::makeCounterNonce(counter, nonce);
     std::vector<uint8_t> sealed;
     crypto::chacha20Poly1305Seal(key, nonce, aad, 2, pt.empty() ? NULL : &pt[0], pt.size(), sealed);
-    std::vector<uint8_t> frame(aad, aad + 2);
+    std::vector<uint8_t> frame;
+    frame.reserve(2 + sealed.size());
+    frame.push_back(aad[0]);
+    frame.push_back(aad[1]);
     frame.insert(frame.end(), sealed.begin(), sealed.end());
     return frame;
 }

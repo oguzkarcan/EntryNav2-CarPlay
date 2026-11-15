@@ -66,9 +66,8 @@ void writeU32BeTest(std::vector<uint8_t>& out, uint32_t v) {
 std::vector<uint8_t> buildRawBplist(const std::vector<std::vector<uint8_t> >& objects,
                                     uint8_t offset_size = 1,
                                     uint8_t ref_size = 1) {
-    std::vector<uint8_t> out;
-    const char magic[8] = {'b', 'p', 'l', 'i', 's', 't', '0', '0'};
-    out.insert(out.end(), magic, magic + 8);
+    const uint8_t magic[8] = {'b', 'p', 'l', 'i', 's', 't', '0', '0'};
+    std::vector<uint8_t> out(magic, magic + 8);
     std::vector<uint64_t> offsets;
     for (size_t i = 0; i < objects.size(); ++i) {
         offsets.push_back(static_cast<uint64_t>(out.size()));

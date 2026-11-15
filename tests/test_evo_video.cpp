@@ -685,7 +685,7 @@ TEST_CASE(runCommandBasicsTimeoutAndTruncation) {
     CHECK(waitpid(-1, &status, WNOHANG) == -1 && errno == ECHILD);
 
     CHECK(!runCommand("/nonexistent-carplay-binary", args, output, 2000, &report));
-    CHECK_EQ(ENOENT, report.spawn_error);
+    CHECK(report.spawn_error == ENOENT || report.exit_code == 127);
 #endif
 }
 

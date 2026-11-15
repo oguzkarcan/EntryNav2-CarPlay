@@ -152,8 +152,8 @@ public:
         const size_t num_objects = nodes_.size();
         const uint8_t ref_size = minByteSize(static_cast<uint64_t>(num_objects));
 
-        bytes_out.clear();
-        bytes_out.insert(bytes_out.end(), kMagic, kMagic + kHeaderBytes);
+        bytes_out.assign(reinterpret_cast<const uint8_t*>(kMagic),
+                         reinterpret_cast<const uint8_t*>(kMagic) + kHeaderBytes);
 
         std::vector<uint64_t> offsets(num_objects, 0);
         for (size_t i = 0; i < num_objects; ++i) {
