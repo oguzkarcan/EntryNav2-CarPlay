@@ -7,6 +7,13 @@ namespace {
 
 static const char kAltScreenUuid[] = "e5f7a68d-7b0f-4305-984b-974f677a150b";
 
+// Work done per readiness callback is bounded so that one busy (or hostile) socket cannot keep
+// the single reactor thread away from the other sockets and the timers. poll() is level
+// triggered: whatever is left is picked up in the next round.
+static const int kMaxAcceptsPerWakeup = 8;
+static const int kMaxTcpReadsPerWakeup = 16;
+static const int kMaxDatagramsPerWakeup = 32;
+
 void unregisterAndClose(Reactor& reactor, TcpListener& listener) {
     if (listener.isOpen()) {
         reactor.remove(listener.handle());
@@ -129,6 +136,10 @@ void SessionServer::initCommon() {
 
 SessionServer::~SessionServer() {
     stop();
+    if (media_engine_ != NULL) {
+        // The engine may outlive this server: it must not keep calling into it.
+        media_engine_->clearSessionCallbacks(this);
+    }
 }
 
 uint64_t SessionServer::syncedNtpThunk(void* ctx) {
@@ -199,6 +210,12 @@ bool SessionServer::controlAcceptFilter(void* ctx, const Address& peer) {
     }
 
     // 2. Single-active-session policy.
+    if (self->session_ != NULL && self->session_->closed()) {
+        // Closed behind the server's back (Session::close() called directly) and not reaped yet:
+        // reap it now, otherwise accept() would adopt over a still-registered control socket and
+        // the old Session object would leak.
+        self->closeActiveSession();
+    }
     if (self->session_ != NULL && !self->session_->closed()) {
         if (self->session_->encrypted()) {
             if (!self->server_cfg_.replace_verified_from_same_host ||
@@ -241,7 +258,7 @@ bool SessionServer::eventAcceptFilter(void* ctx, const Address& peer) {
 }
 
 void SessionServer::onControlAcceptReadable() {
-    for (;;) {
+    for (int n = 0; n < kMaxAcceptsPerWakeup; ++n) {
         TcpListener::AcceptResult ar = control_listener_.accept(control_conn_);
         if (ar == TcpListener::kRejected) {
             continue;
@@ -291,7 +308,7 @@ void SessionServer::onControlConnReadable() {
         return;
     }
     uint8_t buf[16 * 1024];
-    for (;;) {
+    for (int n = 0; n < kMaxTcpReadsPerWakeup; ++n) {
         if (control_read_paused_) {
             break;
         }
@@ -436,7 +453,7 @@ bool SessionServer::sendTimingRequest() {
 
 void SessionServer::onTimingReadable() {
     uint8_t buf[512];
-    for (;;) {
+    for (int n = 0; n < kMaxDatagramsPerWakeup; ++n) {
         size_t got = 0;
         Address from;
         IoStatus st = timing_sock_.receiveFrom(buf, sizeof(buf), got, from);
@@ -477,7 +494,7 @@ bool SessionServer::openEvent(int32_t& local_port_out) {
 }
 
 void SessionServer::onEventAcceptReadable() {
-    for (;;) {
+    for (int n = 0; n < kMaxAcceptsPerWakeup; ++n) {
         TcpListener::AcceptResult ar = event_listener_.accept(event_conn_);
         if (ar == TcpListener::kRejected) {
             continue;
@@ -528,7 +545,7 @@ void SessionServer::onEventConnReadable() {
         return;
     }
     uint8_t buf[16 * 1024];
-    for (;;) {
+    for (int n = 0; n < kMaxTcpReadsPerWakeup; ++n) {
         size_t got = 0;
         IoStatus st = event_conn_.read(buf, sizeof(buf), got);
         if (st == kIoOk && got > 0) {
@@ -621,7 +638,7 @@ bool SessionServer::openKeepAlive(int32_t& local_port_out) {
 
 void SessionServer::onKeepAliveReadable() {
     uint8_t buf[512];
-    for (;;) {
+    for (int n = 0; n < kMaxDatagramsPerWakeup; ++n) {
         size_t got = 0;
         Address from;
         IoStatus st = keepalive_sock_.receiveFrom(buf, sizeof(buf), got, from);

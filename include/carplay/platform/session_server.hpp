@@ -15,6 +15,12 @@
 //   * Low-power keep-alive UDP socket;
 //   * Convenience outbound EventChannel helpers (HID reports, Siri, night mode, iAP2,
 //     forceKeyFrame) that encrypt and flush/queue onto the event TCP socket.
+//
+// Threading and lifetime: reactor thread only, the destructor included. Session / media callbacks
+// may call back into the server (closeActiveSession(), the outbound helpers): a close requested
+// from inside a Session call is carried out when that call returns. The server must not be
+// destroyed from inside one of its own callbacks. A MediaEngine passed to the convenience
+// constructor may outlive the server (the destructor detaches from it).
 
 #include <stddef.h>
 #include <stdint.h>
@@ -120,6 +126,8 @@ public:
     uint16_t controlPort() const { return control_listener_.port(); }
 
     bool hasActiveSession() const { return session_ != NULL && !session_->closed(); }
+    /// Prefer closeActiveSession() over activeSession()->close(): the latter leaves the control
+    /// socket and the Session object to be reaped by the next socket event or accept.
     session::Session* activeSession() { return session_; }
     const session::Session* activeSession() const { return session_; }
     const Address& controlPeerAddress() const { return control_conn_.peerAddress(); }

@@ -29,6 +29,9 @@
 // Limits (fixed, memory reserved in init(); the steady-state loop does not allocate):
 //   kMaxSockets user registrations (+1 internal wake handle), kMaxTimers active timers,
 //   kMaxPostedTasks queued tasks (post() returns false when full).
+//
+// Posted tasks hold a raw ctx pointer: an object that posts to itself must call cancelPosted() in
+// its destructor (see MediaEngine), otherwise a task still queued would run on freed memory.
 
 #include <stddef.h>
 #include <stdint.h>
@@ -96,6 +99,12 @@ public:
     /// Thread-safe: queues fn(ctx) for the reactor thread and wakes it. false when the queue is full
     /// (kMaxPostedTasks) or the reactor is not initialised.
     bool post(TaskFn fn, void* ctx);
+    /// Reactor thread only (or while no thread runs the loop): drops every queued task that was
+    /// posted with exactly this fn and ctx, including tasks of the batch currently being run, and
+    /// returns how many were dropped. An object that posts tasks to itself calls this from its
+    /// destructor so that no queued task outlives it. Posting threads must have stopped posting
+    /// for that ctx before (a post racing with the cancel may land after it).
+    size_t cancelPosted(TaskFn fn, void* ctx);
 
     /// One iteration: waits up to timeout_ms (< 0: until an event, timer or post; 0: no wait), then
     /// dispatches socket events, posted tasks and due timers. Returns the number of callbacks run

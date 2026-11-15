@@ -825,6 +825,128 @@ Bytes buildIapSealedCommPackage(const Bytes& seed_key, uint64_t counter, const B
     return frame;
 }
 
+
+// ---- Helpers shared by the edge-case tests ----
+
+void pump(plat::Reactor& reactor, int rounds = 6) {
+    for (int i = 0; i < rounds; ++i) reactor.runOnce(5);
+}
+
+// Connects, pairs and verifies `phone` on `addr`.
+bool pairAndVerify(NetPhoneClient& phone, const plat::Address& addr, const std::string& srp_label) {
+    return phone.connectControl(addr) && phone.pairSetup(srp_label) && phone.pairVerify();
+}
+
+// Sends one stream SETUP with the given entries and returns the response `streams` array.
+bool setupStreams(NetPhoneClient& phone,
+                  const std::vector<bplist::Value>& entries,
+                  std::vector<bplist::Value>& resp_entries) {
+    bplist::Value arr = bplist::Value::makeArray();
+    for (size_t i = 0; i < entries.size(); ++i) arr.asArray().push_back(entries[i]);
+    bplist::Value req = bplist::Value::makeDict();
+    req.set("streams", arr);
+    bplist::Value resp;
+    int status = 0;
+    if (!phone.callPlist("SETUP", "rtsp://127.0.0.1/streams", req, status, resp) || status != 200) {
+        return false;
+    }
+    const bplist::Value* out = resp.find("streams");
+    if (out == NULL || !out->isArray()) return false;
+    resp_entries = out->asArray();
+    return true;
+}
+
+bplist::Value screenEntry(int32_t type, int64_t conn_id) {
+    bplist::Value e = bplist::Value::makeDict();
+    e.set("type", bplist::Value::makeInt(type));
+    e.set("streamConnectionID", bplist::Value::makeInt(conn_id));
+    return e;
+}
+
+bplist::Value audioEntry(int32_t type, const char* audio_type, int64_t format_bits, int64_t conn_id) {
+    bplist::Value e = bplist::Value::makeDict();
+    e.set("type", bplist::Value::makeInt(type));
+    e.set("audioType", bplist::Value::makeString(audio_type));
+    e.set("audioFormat", bplist::Value::makeInt(format_bits));
+    e.set("streamConnectionID", bplist::Value::makeInt(conn_id));
+    return e;
+}
+
+bplist::Value iapEntry(int64_t seed) {
+    bplist::Value e = bplist::Value::makeDict();
+    e.set("type", bplist::Value::makeInt(130));
+    e.set("clientTypeUUID", bplist::Value::makeString("e9459fd0-bcad-4c45-820f-1e72447ef2f2"));
+    e.set("seed", bplist::Value::makeInt(seed));
+    return e;
+}
+
+// One sealed screen VideoFrame message: [128-byte header | ciphertext | tag], AAD = header.
+Bytes buildSealedScreenFrame(const Bytes& key, uint64_t counter, const Bytes& plain) {
+    Bytes hdr = buildScreenHeader(0, static_cast<uint32_t>(plain.size() + 16U), 0, 0.0f, 0.0f);
+    uint8_t nonce[12];
+    crypto::makeCounterNonce(counter, nonce);
+    Bytes sealed;
+    crypto::chacha20Poly1305Seal(&key[0],
+                                 nonce,
+                                 &hdr[0],
+                                 hdr.size(),
+                                 plain.empty() ? NULL : &plain[0],
+                                 plain.size(),
+                                 sealed);
+    cat(hdr, sealed);
+    return hdr;
+}
+
+// A length-prefixed access unit of one NAL: [u32 BE len | first_byte | filler...].
+Bytes lengthPrefixedNal(size_t nal_len, uint8_t first_byte) {
+    Bytes out(4U + nal_len, 0x5a);
+    putBe(out, 0, nal_len, 4);
+    out[4] = first_byte;
+    return out;
+}
+
+Bytes buildAudioPacket(const Bytes& key, uint8_t pt, uint16_t seq, uint32_t ts, uint64_t nonce, int16_t first) {
+    int16_t samples[4] = {first, static_cast<int16_t>(first + 1), static_cast<int16_t>(first + 2),
+                          static_cast<int16_t>(first + 3)};
+    Bytes wire_pcm;
+    audio::int16ToLpcm(samples, 4, wire_pcm, audio::kBigEndianSamples);
+    uint8_t rtp_hdr[12];
+    audio::buildRtpHeader(pt, false, seq, ts, 0U, rtp_hdr);
+    Bytes pkt;
+    audio::sealPacket(&key[0], rtp_hdr, &wire_pcm[0], wire_pcm.size(), nonce, pkt);
+    return pkt;
+}
+
+bool connectTcp(plat::Reactor& reactor, plat::TcpConnection& conn, uint16_t port) {
+    if (!conn.connect(plat::Address::ipv4Loopback(port))) return false;
+    if (!waitUntilConnected(reactor, conn)) return false;
+    pump(reactor, 4);
+    return true;
+}
+
+// Storage + reactor every edge-case test needs.
+struct Rig {
+    TempDir dir;
+    plat::OsRandomSource rng;
+    pairing::Identity identity;
+    plat::FilePairingStore store;
+    plat::Reactor reactor;
+    RecordingListener listener;
+    bool ok;
+
+    explicit Rig(const char* tag) : dir(tag), ok(false) {
+        ok = plat::storageUsable(plat::loadOrCreateIdentity(dir.path, rng, identity)) &&
+             plat::storageUsable(store.open(dir.path)) && reactor.init();
+    }
+};
+
+plat::SessionServerConfig quietServerConfig() {
+    plat::SessionServerConfig cfg;
+    cfg.control_port = 0;
+    cfg.ntp_request_interval_ms = 0;
+    return cfg;
+}
+
 // =============================================================================================
 // Test 1: Golden real-socket loopback E2E + Test 2: Persistent reconnect without pair-setup
 // =============================================================================================
@@ -1573,6 +1695,585 @@ bool testBackpressureOverflowAndScreenErrorCleanup() {
     return true;
 }
 
+// =============================================================================================
+// Test 5: Screen stream edge cases (ScreenStream.kt / ScreenCodec parity)
+// =============================================================================================
+
+bool testScreenStreamEdgeCases() {
+    Rig rig("screen_edges");
+    CHECK_TRUE(rig.ok);
+    RecordingSink sink;
+    plat::MediaEngine media_engine(rig.reactor, sink);
+    plat::SessionServer server(rig.reactor, info::bmwEntryNav2_800x480(false), rig.identity, rig.store,
+                               rig.rng, rig.listener, media_engine, NULL, quietServerConfig());
+    CHECK_TRUE(server.start(plat::Address::ipv4Loopback(0)));
+    NetPhoneClient phone(rig.reactor, "scr-ltsk", "5C5C5C5C-0000-4000-8000-000000000001", "scr-eph");
+    CHECK_TRUE(pairAndVerify(phone, plat::Address::ipv4Loopback(server.controlPort()), "scr-srp"));
+
+    std::vector<bplist::Value> entries;
+    entries.push_back(screenEntry(110, 77));
+    std::vector<bplist::Value> resp;
+    CHECK_TRUE(setupStreams(phone, entries, resp));
+    CHECK_TRUE(resp.size() == 1U);
+    plat::TcpConnection scr;
+    CHECK_TRUE(connectTcp(rig.reactor, scr, static_cast<uint16_t>(intAt(resp[0], "dataPort"))));
+    const Bytes key = phone.streamOutputKey(77);
+
+    // (a) A VideoFrame whose body is shorter than the 16-byte tag is ignored (ScreenStream.kt:103):
+    //     the stream stays up and the frame counter does not advance.
+    Bytes runt = buildScreenHeader(0, 5, 0, 0.0f, 0.0f);
+    cat(runt, Bytes(5, 0x11));
+    CHECK_TRUE(phone.sendAll(scr, runt));
+    // An unknown opcode is skipped as well.
+    Bytes unknown_op = buildScreenHeader(7, 3, 0, 0.0f, 0.0f);
+    cat(unknown_op, Bytes(3, 0x22));
+    CHECK_TRUE(phone.sendAll(scr, unknown_op));
+    pump(rig.reactor);
+    CHECK_TRUE(server.hasActiveSession());
+    CHECK_TRUE(sink.video_frames.empty());
+
+    // (b) First NAL of 300 bytes: its length prefix is 00 00 01 2c, which must NOT be mistaken for a
+    //     3-byte Annex-B start code (ScreenCodec only skips payloads starting with 00 00 00 01).
+    const Bytes au300 = lengthPrefixedNal(300, 0x41);
+    CHECK_TRUE(phone.sendAll(scr, buildSealedScreenFrame(key, 0, au300)));
+    // (c) Two NALs in one access unit, the first exactly 256 bytes (00 00 01 00).
+    Bytes au2 = lengthPrefixedNal(256, 0x06);
+    cat(au2, lengthPrefixedNal(9, 0x41));
+    CHECK_TRUE(phone.sendAll(scr, buildSealedScreenFrame(key, 1, au2)));
+    // (d) Already Annex-B (00 00 00 01): delivered untouched.
+    const Bytes annexb = test_support::hexToBytes("0000000165aabbcc");
+    CHECK_TRUE(phone.sendAll(scr, buildSealedScreenFrame(key, 2, annexb)));
+    // (e) Malformed lengths: delivered untouched for the decoder's error path.
+    const Bytes malformed = test_support::hexToBytes("000000ff6501");
+    CHECK_TRUE(phone.sendAll(scr, buildSealedScreenFrame(key, 3, malformed)));
+    pump(rig.reactor, 10);
+
+    CHECK_TRUE(sink.video_frames.size() == 4U);
+    const Bytes& f0 = sink.video_frames[0].annexb;
+    CHECK_TRUE(f0.size() == 304U && f0[0] == 0 && f0[1] == 0 && f0[2] == 0 && f0[3] == 1 && f0[4] == 0x41);
+    const Bytes& f1 = sink.video_frames[1].annexb;
+    CHECK_TRUE(f1.size() == 273U && f1[2] == 0 && f1[3] == 1 && f1[4] == 0x06);
+    CHECK_TRUE(f1[260] == 0 && f1[261] == 0 && f1[262] == 0 && f1[263] == 1 && f1[264] == 0x41);
+    CHECK_TRUE(sink.video_frames[2].annexb == annexb);
+    CHECK_TRUE(sink.video_frames[3].annexb == malformed);
+
+    // (f) The box fourcc decides the codec (ScreenCodec.detectConfig): an 'hvcC' box is HEVC and the
+    //     record after the fourcc is handed over verbatim.
+    Bytes hvcc_record(23, 0);
+    hvcc_record[0] = 0x01;
+    Bytes hvcc_box(8, 0);
+    putBe(hvcc_box, 0, 8U + hvcc_record.size(), 4);
+    memcpy(&hvcc_box[4], "hvcC", 4);
+    cat(hvcc_box, hvcc_record);
+    Bytes cfg = buildScreenHeader(1, static_cast<uint32_t>(hvcc_box.size()), 0, 800.0f, 480.0f);
+    cat(cfg, hvcc_box);
+    CHECK_TRUE(phone.sendAll(scr, cfg));
+    // (g) An 'avcC' box stays H.264 even if its bytes also parse as an hvcC record.
+    Bytes ambiguous(26, 0);
+    ambiguous[0] = 0x01;
+    ambiguous[22] = 0x01;  // hvcC numOfArrays = 1, array with zero NAL units
+    Bytes avcc_box(8, 0);
+    putBe(avcc_box, 0, 8U + ambiguous.size(), 4);
+    memcpy(&avcc_box[4], "avcC", 4);
+    cat(avcc_box, ambiguous);
+    cfg = buildScreenHeader(1, static_cast<uint32_t>(avcc_box.size()), 0, 800.0f, 480.0f);
+    cat(cfg, avcc_box);
+    CHECK_TRUE(phone.sendAll(scr, cfg));
+    pump(rig.reactor, 10);
+    CHECK_TRUE(sink.video_configs.size() == 2U);
+    CHECK_TRUE(sink.video_configs[0].codec == stream::CODEC_HEVC_HVCC);
+    CHECK_TRUE(sink.video_configs[0].raw == hvcc_record);
+    CHECK_TRUE(sink.video_configs[1].codec == stream::CODEC_H264_AVCC);
+    CHECK_TRUE(sink.video_configs[1].raw == ambiguous);
+
+    // (h) An oversized payload_size ends the stream and with it the session (MAX_BODY, onClosed).
+    CHECK_TRUE(phone.sendAll(scr, buildScreenHeader(0, 9U * 1024U * 1024U, 0, 0.0f, 0.0f)));
+    pump(rig.reactor, 10);
+    CHECK_TRUE(!server.hasActiveSession());
+    CHECK_TRUE(media_engine.activeScreenCount() == 0U);
+    server.stop();
+    return true;
+}
+
+// =============================================================================================
+// Test 6: A MediaSink callback that closes the session from inside the stream's own dispatch
+// =============================================================================================
+
+struct ClosingSink : public RecordingSink {
+    plat::SessionServer* server;
+    bool close_on_frame;
+    bool close_on_config;
+    bool close_on_pcm;
+    bool close_on_audio_started;
+    bool close_on_iap;
+    bool close_on_mic_started;
+
+    ClosingSink()
+        : server(NULL), close_on_frame(false), close_on_config(false), close_on_pcm(false),
+          close_on_audio_started(false), close_on_iap(false), close_on_mic_started(false) {}
+
+    void closeNow() {
+        if (server != NULL) server->closeActiveSession();
+    }
+
+    virtual void onVideoConfig(int32_t type, stream::VideoCodecType codec, const uint8_t* a, size_t al,
+                               const uint8_t* r, size_t rl, float w, float h) {
+        RecordingSink::onVideoConfig(type, codec, a, al, r, rl, w, h);
+        if (close_on_config) closeNow();
+    }
+    virtual void onVideoFrame(int32_t type, const uint8_t* d, size_t len, uint64_t sn, int64_t an) {
+        RecordingSink::onVideoFrame(type, d, len, sn, an);
+        if (close_on_frame) closeNow();
+    }
+    virtual void onAudioStarted(const plat::AudioStreamId& id, const audio::AudioFormat& f, uint32_t fs) {
+        RecordingSink::onAudioStarted(id, f, fs);
+        if (close_on_audio_started) closeNow();
+    }
+    virtual void onAudioPcm(const plat::AudioStreamId& id, const audio::AudioFormat& f, const int16_t* s,
+                            size_t n, uint16_t seq, uint32_t ts) {
+        RecordingSink::onAudioPcm(id, f, s, n, seq, ts);
+        if (close_on_pcm) closeNow();
+    }
+    virtual void onIapMessage(const uint8_t* data, size_t len) {
+        RecordingSink::onIapMessage(data, len);
+        if (close_on_iap) closeNow();
+    }
+    virtual void onMicrophoneStarted(const plat::AudioStreamId& id, const audio::MicStreamParams& p,
+                                     const plat::Address& dest) {
+        RecordingSink::onMicrophoneStarted(id, p, dest);
+        if (close_on_mic_started) closeNow();
+    }
+};
+
+// mode: 0 = video frame, 1 = video config, 2 = audio PCM, 3 = audio started, 4 = iAP message,
+//       5 = microphone started by the silent-start timer.
+bool runReentrantCloseScenario(int mode) {
+    Rig rig("reentrant");
+    CHECK_TRUE(rig.ok);
+    ClosingSink sink;
+    plat::MediaEngineConfig me_cfg;
+    me_cfg.mic_silent_start_ms = (mode == 5) ? 40 : -1;
+    plat::MediaEngine media_engine(rig.reactor, sink, me_cfg);
+    plat::SessionServer server(rig.reactor, info::bmwEntryNav2_800x480(true), rig.identity, rig.store,
+                               rig.rng, rig.listener, media_engine, NULL, quietServerConfig());
+    sink.server = &server;
+    CHECK_TRUE(server.start(plat::Address::ipv4Loopback(0)));
+    NetPhoneClient phone(rig.reactor, "re-ltsk", "5C5C5C5C-0000-4000-8000-000000000002", "re-eph");
+    CHECK_TRUE(pairAndVerify(phone, plat::Address::ipv4Loopback(server.controlPort()), "re-srp"));
+
+    plat::UdpSocket phone_udp;
+    CHECK_TRUE(phone_udp.open(plat::Address::ipv4Loopback(0)));
+
+    std::vector<bplist::Value> entries;
+    entries.push_back(screenEntry(110, 11));
+    bplist::Value mic_audio = audioEntry(100, "speechrecognition", 0x10, 22);
+    mic_audio.set("dataPort", bplist::Value::makeInt(phone_udp.port()));
+    entries.push_back(mic_audio);
+    entries.push_back(audioEntry(101, "media", 0x800, 33));
+    entries.push_back(iapEntry(44));
+    std::vector<bplist::Value> resp;
+    // Mode 5: the silent-start timer armed by this SETUP fires in a later reactor round, with no
+    // stream socket involved at all.
+    sink.close_on_mic_started = (mode == 5);
+    CHECK_TRUE(setupStreams(phone, entries, resp));
+    CHECK_TRUE(resp.size() == 4U);
+    CHECK_TRUE(media_engine.activeScreenCount() == 1U && media_engine.activeAudioCount() == 2U &&
+               media_engine.hasDataStream());
+
+    plat::TcpConnection scr;
+    plat::TcpConnection iap;
+    if (mode != 5) {
+        CHECK_TRUE(connectTcp(rig.reactor, scr, static_cast<uint16_t>(intAt(resp[0], "dataPort"))));
+        CHECK_TRUE(connectTcp(rig.reactor, iap, static_cast<uint16_t>(intAt(resp[3], "dataPort"))));
+    }
+
+    if (mode == 0) {
+        sink.close_on_frame = true;
+        const Bytes key = phone.streamOutputKey(11);
+        // Two frames in one write: the second must never reach the sink after the close.
+        Bytes two = buildSealedScreenFrame(key, 0, lengthPrefixedNal(20, 0x65));
+        cat(two, buildSealedScreenFrame(key, 1, lengthPrefixedNal(20, 0x41)));
+        CHECK_TRUE(phone.sendAll(scr, two));
+    } else if (mode == 1) {
+        sink.close_on_config = true;
+        Bytes cfg = buildScreenHeader(1, 4, 0, 800.0f, 480.0f);
+        cat(cfg, Bytes(4, 0x01));
+        // Two configs in one write: the second must never reach the sink after the close.
+        const Bytes one(cfg);
+        cat(cfg, one);
+        CHECK_TRUE(phone.sendAll(scr, cfg));
+    } else if (mode == 2 || mode == 3) {
+        sink.close_on_pcm = (mode == 2);
+        sink.close_on_audio_started = (mode == 3);
+        const Bytes key = phone.streamOutputKey(33);
+        const plat::Address dest =
+            plat::Address::ipv4Loopback(static_cast<uint16_t>(intAt(resp[2], "dataPort")));
+        for (uint16_t i = 0; i < 3; ++i) {
+            const Bytes pkt = buildAudioPacket(key, 101, static_cast<uint16_t>(10 + i), 100U + i * 4U, i,
+                                               static_cast<int16_t>(i * 10));
+            CHECK_TRUE(phone_udp.sendTo(&pkt[0], pkt.size(), dest) == plat::kIoOk);
+        }
+    } else if (mode == 4) {
+        sink.close_on_iap = true;
+        const Bytes key = phone.streamOutputKey(44);
+        Bytes two = buildIapSealedCommPackage(key, 0, test_support::hexToBytes("ff5a0001"));
+        cat(two, buildIapSealedCommPackage(key, 1, test_support::hexToBytes("ff5a0002")));
+        CHECK_TRUE(phone.sendAll(iap, two));
+    }
+
+    const int64_t deadline = plat::monotonicMillis() + 2000;
+    while (server.hasActiveSession() && plat::monotonicMillis() < deadline) rig.reactor.runOnce(5);
+    pump(rig.reactor);
+
+    CHECK_TRUE(!server.hasActiveSession());
+    CHECK_TRUE(rig.listener.ended_count == 1);
+    CHECK_TRUE(media_engine.activeScreenCount() == 0U);
+    CHECK_TRUE(media_engine.activeAudioCount() == 0U);
+    CHECK_TRUE(!media_engine.hasDataStream());
+    if (mode == 0) CHECK_TRUE(sink.video_frames.size() == 1U);
+    if (mode == 1) CHECK_TRUE(sink.video_configs.size() == 1U);
+    if (mode == 2) CHECK_TRUE(sink.audio_pcm.size() == 1U);
+    if (mode == 3) CHECK_TRUE(sink.audio_started.size() == 1U && sink.audio_pcm.empty());
+    if (mode == 4) CHECK_TRUE(sink.iap_messages.size() == 1U);
+    if (mode == 5) CHECK_TRUE(sink.mic_started.size() == 1U);
+    // Every stream that was announced is also reported gone, exactly once.
+    CHECK_TRUE(sink.audio_stopped.size() == 2U);
+    CHECK_TRUE(sink.mic_stopped.size() == 1U);
+    CHECK_TRUE(sink.screen_active.size() == 2U && sink.screen_active.back().second == false);
+
+    // The server accepts a fresh session afterwards (persisted pairing, no pair-setup).
+    NetPhoneClient phone2(rig.reactor, "re-ltsk", "5C5C5C5C-0000-4000-8000-000000000002", "re-eph2");
+    phone2.acc_id = phone.acc_id;
+    phone2.acc_ltpk = phone.acc_ltpk;
+    CHECK_TRUE(phone2.connectControl(plat::Address::ipv4Loopback(server.controlPort())));
+    CHECK_TRUE(phone2.pairVerify());
+    server.stop();
+    return true;
+}
+
+bool testSinkClosesSessionFromStreamCallbacks() {
+    for (int mode = 0; mode <= 5; ++mode) {
+        if (!runReentrantCloseScenario(mode)) {
+            printf("  [FAIL] re-entrant close scenario %d\n", mode);
+            return false;
+        }
+    }
+    return true;
+}
+
+// =============================================================================================
+// Test 7: iAP2 DataStream tunnel: peer EOF keeps the listener (IapTunnel.kt accept loop)
+// =============================================================================================
+
+bool testIapTunnelReconnectAndErrors() {
+    Rig rig("iap_tunnel");
+    CHECK_TRUE(rig.ok);
+    RecordingSink sink;
+    plat::MediaEngine media_engine(rig.reactor, sink);
+    plat::SessionServer server(rig.reactor, info::bmwEntryNav2_800x480(false), rig.identity, rig.store,
+                               rig.rng, rig.listener, media_engine, NULL, quietServerConfig());
+    CHECK_TRUE(server.start(plat::Address::ipv4Loopback(0)));
+    NetPhoneClient phone(rig.reactor, "iap-ltsk", "5C5C5C5C-0000-4000-8000-000000000003", "iap-eph");
+    CHECK_TRUE(pairAndVerify(phone, plat::Address::ipv4Loopback(server.controlPort()), "iap-srp"));
+
+    std::vector<bplist::Value> entries;
+    entries.push_back(iapEntry(555));
+    std::vector<bplist::Value> resp;
+    CHECK_TRUE(setupStreams(phone, entries, resp));
+    CHECK_TRUE(resp.size() == 1U && intAt(resp[0], "streamID") == 1 && intAt(resp[0], "type") == 130);
+    CHECK_TRUE(resp[0].find("streamConnectionID") == NULL);  // only echoed when the phone sent one
+    const uint16_t port = static_cast<uint16_t>(intAt(resp[0], "dataPort"));
+    const Bytes key = phone.streamOutputKey(555);
+    const Bytes msg_a = test_support::hexToBytes("ff5a000a40aa");
+    const Bytes msg_b = test_support::hexToBytes("ff5a000a40bb");
+
+    {
+        plat::TcpConnection iap;
+        CHECK_TRUE(connectTcp(rig.reactor, iap, port));
+        // A non-'comm' package is skipped; an empty-bodied 'comm' package is delivered empty; the
+        // frames may arrive split at any byte.
+        Bytes other(32, 0);
+        putBe(other, 0, 32, 4);
+        putBe(other, 16, 0x70696e67U, 4);  // 'ping'
+        Bytes aad(2, 0);
+        putLe(aad, 0, other.size(), 2);
+        uint8_t nonce[12];
+        crypto::makeCounterNonce(0, nonce);
+        Bytes sealed;
+        crypto::chacha20Poly1305Seal(&key[0], nonce, &aad[0], 2, &other[0], other.size(), sealed);
+        Bytes wire = aad;
+        cat(wire, sealed);
+        cat(wire, buildIapSealedCommPackage(key, 1, msg_a));
+        cat(wire, buildIapSealedCommPackage(key, 2, Bytes()));
+        for (size_t off = 0; off < wire.size(); off += 7) {
+            const size_t n = wire.size() - off < 7 ? wire.size() - off : 7;
+            CHECK_TRUE(phone.sendAll(iap, Bytes(wire.begin() + static_cast<ptrdiff_t>(off),
+                                                wire.begin() + static_cast<ptrdiff_t>(off + n))));
+        }
+        pump(rig.reactor);
+        CHECK_TRUE(sink.iap_messages.size() == 2U);
+        CHECK_TRUE(sink.iap_messages[0] == msg_a && sink.iap_messages[1].empty());
+        // Leave half a frame behind and close: the remainder is dropped with the connection.
+        const Bytes partial = buildIapSealedCommPackage(key, 3, msg_b);
+        CHECK_TRUE(phone.sendAll(iap, Bytes(partial.begin(), partial.begin() + 9)));
+        pump(rig.reactor, 3);
+        CHECK_TRUE(iap.shutdownWrite());
+        pump(rig.reactor);
+    }
+    // Peer EOF is not an error: the tunnel keeps listening and the session stays up.
+    CHECK_TRUE(server.hasActiveSession());
+    CHECK_TRUE(media_engine.hasDataStream());
+
+    {
+        // The phone reconnects to the same port; the read counter restarts at 0.
+        plat::TcpConnection iap;
+        CHECK_TRUE(connectTcp(rig.reactor, iap, port));
+        CHECK_TRUE(phone.sendAll(iap, buildIapSealedCommPackage(key, 0, msg_b)));
+        pump(rig.reactor);
+        CHECK_TRUE(sink.iap_messages.size() == 3U && sink.iap_messages[2] == msg_b);
+
+        // A frame sealed with the wrong counter fails authentication: tunnel and session close.
+        CHECK_TRUE(phone.sendAll(iap, buildIapSealedCommPackage(key, 9, msg_b)));
+        pump(rig.reactor, 10);
+        CHECK_TRUE(!server.hasActiveSession());
+        CHECK_TRUE(!media_engine.hasDataStream());
+        CHECK_TRUE(sink.iap_messages.size() == 3U);
+    }
+    server.stop();
+    return true;
+}
+
+// =============================================================================================
+// Test 8: Microphone start rules, uplink gating, stream replacement, /feedback wire form
+// =============================================================================================
+
+bool testMicrophoneStartAndFeedbackWireForm() {
+    Rig rig("mic_rules");
+    CHECK_TRUE(rig.ok);
+    RecordingSink sink;
+    plat::MediaEngineConfig me_cfg;
+    me_cfg.mic_silent_start_ms = 30;
+    me_cfg.max_audio_streams = 3;
+    plat::MediaEngine media_engine(rig.reactor, sink, me_cfg);
+    // Start the clock in the wall-clock NTP domain (seconds since 1900, as wallClockNtpOffsetNs
+    // gives on the car): such timestamps have the top bit set until 2036.
+    plat::SessionServerConfig srv_cfg = quietServerConfig();
+    srv_cfg.initial_ntp_offset_ns = 3900000000LL * 1000000000LL;
+    plat::SessionServer server(rig.reactor, info::bmwEntryNav2_800x480(true), rig.identity, rig.store,
+                               rig.rng, rig.listener, media_engine, NULL, srv_cfg);
+    CHECK_TRUE(server.start(plat::Address::ipv4Loopback(0)));
+    NetPhoneClient phone(rig.reactor, "mic-ltsk", "5C5C5C5C-0000-4000-8000-000000000004", "mic-eph");
+    CHECK_TRUE(pairAndVerify(phone, plat::Address::ipv4Loopback(server.controlPort()), "mic-srp"));
+
+    plat::UdpSocket phone_udp;
+    CHECK_TRUE(phone_udp.open(plat::Address::ipv4Loopback(0)));
+    const uint64_t kCallId = 0xfedcba9876543210ULL;  // >= 2^63: sent by the phone as a negative int64
+
+    // Telephony waits for its downlink (MicrophoneStart.startsWithoutDownlink == false).
+    bplist::Value call = audioEntry(100, "Telephony", 0x10, static_cast<int64_t>(kCallId));
+    call.set("dataPort", bplist::Value::makeInt(phone_udp.port()));
+    call.set("audioLatencyMs", bplist::Value::makeInt(0));
+    std::vector<bplist::Value> entries;
+    entries.push_back(call);
+    std::vector<bplist::Value> resp;
+    CHECK_TRUE(setupStreams(phone, entries, resp));
+    CHECK_TRUE(resp.size() == 1U);
+    const uint16_t call_port = static_cast<uint16_t>(intAt(resp[0], "dataPort"));
+    CHECK_TRUE(intAt(resp[0], "controlPort") > 0 && intAt(resp[0], "controlPort") != call_port);
+    // The echoed id keeps the phone's own 8-byte form (unsignedPlistInteger), never 16 bytes.
+    const bplist::Value* echoed = resp[0].find("streamConnectionID");
+    uint64_t echoed_id = 0;
+    CHECK_TRUE(echoed != NULL && echoed->isInt() && session::Session::plistUnsignedId(*echoed, echoed_id));
+    CHECK_TRUE(echoed_id == kCallId);
+
+    const int64_t wait_until = plat::monotonicMillis() + 120;
+    while (plat::monotonicMillis() < wait_until) rig.reactor.runOnce(5);
+    CHECK_TRUE(sink.mic_started.empty());
+    CHECK_TRUE(!media_engine.microphoneActive());
+    CHECK_TRUE(media_engine.activeMicrophoneParams() != NULL);
+
+    // Captured audio handed over before the microphone started is not transmitted.
+    const size_t spf = media_engine.activeMicrophoneParams()->samplesPerFrame();
+    CHECK_TRUE(spf > 0);
+    std::vector<int16_t> frame(spf, 1234);
+    CHECK_TRUE(media_engine.pushMicrophonePcm(&frame[0], frame.size()) == 0U);
+    CHECK_TRUE(media_engine.submitMicrophonePcm(&frame[0], frame.size()));
+    pump(rig.reactor);
+    {
+        uint8_t rx[2048];
+        size_t got = 0;
+        plat::Address from;
+        CHECK_TRUE(phone_udp.receiveFrom(rx, sizeof(rx), got, from) == plat::kIoWouldBlock);
+    }
+
+    // The first downlink packet starts it.
+    const Bytes call_key = phone.streamOutputKey(kCallId);
+    const Bytes first = buildAudioPacket(call_key, 100, 7, 4000, 0, 50);
+    CHECK_TRUE(phone_udp.sendTo(&first[0], first.size(), plat::Address::ipv4Loopback(call_port)) ==
+               plat::kIoOk);
+    pump(rig.reactor);
+    CHECK_TRUE(sink.mic_started.size() == 1U && sink.mic_started[0].audio_type == "telephony");
+    CHECK_TRUE(media_engine.microphoneActive());
+    CHECK_TRUE(sink.last_mic_dest.port() == phone_udp.port());
+    CHECK_TRUE(media_engine.pushMicrophonePcm(&frame[0], frame.size()) == 1U);
+    {
+        uint8_t rx[2048];
+        size_t got = 0;
+        plat::Address from;
+        CHECK_TRUE(phone_udp.receiveFrom(rx, sizeof(rx), got, from) == plat::kIoOk);
+        const Bytes in_key = phone.streamInputKey(kCallId);
+        audio::RtpHeader hdr;
+        Bytes payload;
+        CHECK_TRUE(audio::openPacket(&in_key[0], rx, got, hdr, payload) == audio::kOpenOk);
+        CHECK_TRUE(hdr.sequence == 0U && hdr.payload_type == 100U && payload.size() == spf * 2U);
+    }
+
+    // POST /feedback: the NTP timestamp (always >= 2^63 in this NTP era) and the stream id travel as
+    // 8-byte integers like the reference's BplistCodec.encodeUnsignedInt, not as 16-byte ones.
+    {
+        int status = 0;
+        rtsp::Request raw;
+        CHECK_TRUE(phone.call("POST", "/feedback", "", Bytes(), status, raw));
+        CHECK_TRUE(status == 200);
+        bplist::Value fb;
+        CHECK_TRUE(bplist::decode(raw.body, fb));
+        const bplist::Value* streams = fb.find("streams");
+        CHECK_TRUE(streams != NULL && streams->isArray() && streams->asArray().size() == 1U);
+        const bplist::Value& entry = streams->asArray()[0];
+        CHECK_TRUE(intAt(entry, "type") == 100 && intAt(entry, "sampleRate") == 16000);
+        const bplist::Value* ts = entry.find("timestamp");
+        const bplist::Value* cid = entry.find("streamConnectionID");
+        uint64_t ts_u = 0;
+        uint64_t cid_u = 0;
+        // isInt(): decoded from an 8-byte (0x13) integer. The 16-byte 0x14 form would decode as
+        // TYPE_UINT64 instead. Both values are >= 2^63, i.e. negative when read as int64.
+        CHECK_TRUE(ts != NULL && ts->isInt() && ts->asInt() < 0);
+        CHECK_TRUE(cid != NULL && cid->isInt() && cid->asInt() < 0);
+        CHECK_TRUE(session::Session::plistUnsignedId(*ts, ts_u));
+        CHECK_TRUE(session::Session::plistUnsignedId(*cid, cid_u));
+        CHECK_TRUE(cid_u == kCallId);
+        CHECK_TRUE((ts_u >> 32) >= 3900000000ULL);
+        CHECK_TRUE(intAt(entry, "timestampRawNs") > 0);
+        const int64_t sample_time = intAt(entry, "sampleTime");
+        CHECK_TRUE(sample_time >= 4000 && sample_time < 4000 + 16000 * 5);
+    }
+
+    // A non-telephony input stream with no downlink starts after mic_silent_start_ms.
+    bplist::Value note = audioEntry(100, "default", 0x10, 808);
+    note.set("input", bplist::Value::makeBool(true));
+    note.set("dataPort", bplist::Value::makeInt(phone_udp.port()));
+    entries.clear();
+    entries.push_back(note);
+    CHECK_TRUE(setupStreams(phone, entries, resp));
+    CHECK_TRUE(resp.size() == 1U);
+    CHECK_TRUE(sink.mic_started.size() == 1U);
+    const int64_t deadline = plat::monotonicMillis() + 1000;
+    while (sink.mic_started.size() < 2U && plat::monotonicMillis() < deadline) rig.reactor.runOnce(5);
+    CHECK_TRUE(sink.mic_started.size() == 2U && sink.mic_started[1].audio_type == "default");
+
+    // Re-SETUP of the same (type, audioType) replaces the stream: old one reported stopped, new
+    // ports, the pending silent start of the old one never fires.
+    const int64_t old_port = intAt(resp[0], "dataPort");
+    note.set("streamConnectionID", bplist::Value::makeInt(809));
+    entries.clear();
+    entries.push_back(note);
+    const size_t stopped_before = sink.audio_stopped.size();
+    const size_t mic_stopped_before = sink.mic_stopped.size();
+    CHECK_TRUE(setupStreams(phone, entries, resp));
+    CHECK_TRUE(resp.size() == 1U);
+    CHECK_TRUE(media_engine.activeAudioCount() == 2U);
+    CHECK_TRUE(sink.audio_stopped.size() == stopped_before + 1U);
+    CHECK_TRUE(sink.mic_stopped.size() == mic_stopped_before + 1U);
+    CHECK_TRUE(intAt(resp[0], "dataPort") > 0);
+    (void)old_port;
+
+    // max_audio_streams (3 here) bounds concurrently open streams; replacing still works.
+    entries.clear();
+    entries.push_back(audioEntry(101, "media", 0x800, 900));
+    entries.push_back(audioEntry(102, "alert", 0x800, 901));
+    CHECK_TRUE(setupStreams(phone, entries, resp));
+    CHECK_TRUE(resp.size() == 1U && intAt(resp[0], "type") == 101);
+    CHECK_TRUE(media_engine.activeAudioCount() == 3U);
+
+    // An unsupported downlink format is declined, but (like the reference) the stream it would
+    // have replaced is gone.
+    entries.clear();
+    entries.push_back(audioEntry(101, "media", 0x400000, 902));  // AAC-LC: not offered on the F20 profile
+    CHECK_TRUE(setupStreams(phone, entries, resp));
+    CHECK_TRUE(resp.empty());
+    CHECK_TRUE(media_engine.activeAudioCount() == 2U);
+
+    server.stop();
+    return true;
+}
+
+// =============================================================================================
+// Test 9: Lifetime: engine destroyed with a queued worker post, server destroyed before the
+// engine, session closed behind the server's back
+// =============================================================================================
+
+bool testLifetimeEdges() {
+    Rig rig("lifetime");
+    CHECK_TRUE(rig.ok);
+    RecordingSink sink;
+
+    // (a) A worker-thread submit leaves a task queued in the reactor; destroying the engine before
+    //     the reactor runs it must not leave the task pointing at freed memory.
+    {
+        plat::MediaEngine short_lived(rig.reactor, sink);
+        const int16_t pcm[4] = {1, 2, 3, 4};
+        CHECK_TRUE(short_lived.submitMicrophonePcm(pcm, 4));
+        CHECK_TRUE(!short_lived.submitMicrophonePcm(NULL, 4));
+        CHECK_TRUE(!short_lived.submitMicrophonePcm(pcm, 0));
+        // The queue is bounded (~1 s of 48 kHz stereo).
+        std::vector<int16_t> big(96000, 0);
+        CHECK_TRUE(!short_lived.submitMicrophonePcm(&big[0], big.size()));
+    }
+    pump(rig.reactor, 3);
+
+    plat::MediaEngine media_engine(rig.reactor, sink);
+    // (b) A server that goes away detaches its callbacks from the engine it was wired to.
+    {
+        plat::SessionServer gone(rig.reactor, info::bmwEntryNav2_800x480(false), rig.identity, rig.store,
+                                 rig.rng, rig.listener, media_engine, NULL, quietServerConfig());
+        CHECK_TRUE(gone.start(plat::Address::ipv4Loopback(0)));
+        CHECK_TRUE(media_engine.hasSessionCallbacks());
+    }
+    CHECK_TRUE(!media_engine.hasSessionCallbacks());
+
+    plat::SessionServer server(rig.reactor, info::bmwEntryNav2_800x480(false), rig.identity, rig.store,
+                               rig.rng, rig.listener, media_engine, NULL, quietServerConfig());
+    CHECK_TRUE(server.start(plat::Address::ipv4Loopback(0)));
+    const plat::Address addr = plat::Address::ipv4Loopback(server.controlPort());
+
+    // (c) The application closes the Session object directly (not through the server). The next
+    //     control connection must get a clean, working session.
+    NetPhoneClient phone(rig.reactor, "life-ltsk", "5C5C5C5C-0000-4000-8000-000000000005", "life-eph");
+    CHECK_TRUE(pairAndVerify(phone, addr, "life-srp"));
+    CHECK_TRUE(server.hasActiveSession());
+    server.activeSession()->close();
+    CHECK_TRUE(!server.hasActiveSession());
+    CHECK_TRUE(rig.listener.ended_count == 1);
+
+    NetPhoneClient phone2(rig.reactor, "life-ltsk", "5C5C5C5C-0000-4000-8000-000000000005", "life-eph2");
+    phone2.acc_id = phone.acc_id;
+    phone2.acc_ltpk = phone.acc_ltpk;
+    CHECK_TRUE(phone2.connectControl(addr));
+    CHECK_TRUE(server.hasActiveSession());
+    CHECK_TRUE(phone2.pairVerify());
+    int status = 0;
+    rtsp::Request raw;
+    CHECK_TRUE(phone2.call("GET", "/info", "", Bytes(), status, raw));
+    CHECK_TRUE(status == 200);
+    CHECK_TRUE(rig.listener.ended_count == 1);
+    CHECK_TRUE(rig.reactor.socketCount() == 2U);  // control listener + the one live control connection
+
+    server.stop();
+    CHECK_TRUE(rig.reactor.socketCount() == 0U);
+    CHECK_TRUE(rig.reactor.timerCount() == 0U);
+    return true;
+}
+
 void runTest(const char* name, bool (*fn)()) {
     if (fn()) {
         printf("  [PASS] %s\n", name);
@@ -1590,6 +2291,11 @@ int main() {
     runTest("peerFilteringAndSingleSessionProtection", &testPeerFilteringAndSingleSessionProtection);
     runTest("rateLimitingAndUnverifiedTimeout", &testRateLimitingAndUnverifiedTimeout);
     runTest("backpressureOverflowAndScreenErrorCleanup", &testBackpressureOverflowAndScreenErrorCleanup);
+    runTest("screenStreamEdgeCases", &testScreenStreamEdgeCases);
+    runTest("sinkClosesSessionFromStreamCallbacks", &testSinkClosesSessionFromStreamCallbacks);
+    runTest("iapTunnelReconnectAndErrors", &testIapTunnelReconnectAndErrors);
+    runTest("microphoneStartAndFeedbackWireForm", &testMicrophoneStartAndFeedbackWireForm);
+    runTest("lifetimeEdges", &testLifetimeEdges);
 
     printf("test_network_session: %d/%d passed\n", g_passed, g_passed + g_failed);
     return g_failed == 0 ? 0 : 1;

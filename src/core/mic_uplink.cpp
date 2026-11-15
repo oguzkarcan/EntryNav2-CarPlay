@@ -130,6 +130,8 @@ void MicPacketizer::reset() {
     configured_ = false;
     params_ = MicStreamParams();
     counters_ = MicCounters();
+    // Captured cabin audio: do not leave it behind in freed heap memory.
+    if (!pending_.empty()) crypto::wipe(&pending_[0], pending_.size() * sizeof(pending_[0]));
     pending_.clear();
     if (!wire_.empty()) crypto::wipe(&wire_[0], wire_.size());
     wire_.clear();

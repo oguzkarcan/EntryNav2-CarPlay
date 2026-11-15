@@ -308,6 +308,34 @@ bool Reactor::post(TaskFn fn, void* ctx) {
     return true;
 }
 
+size_t Reactor::cancelPosted(TaskFn fn, void* ctx) {
+    size_t dropped = 0;
+    {
+        LockGuard lock(mutex_);
+        size_t w = 0;
+        for (size_t r = 0; r < posted_.size(); ++r) {
+            if (posted_[r].fn == fn && posted_[r].ctx == ctx) {
+                ++dropped;
+                continue;
+            }
+            if (w != r) {
+                posted_[w] = posted_[r];
+            }
+            ++w;
+        }
+        posted_.resize(w);
+    }
+    // The batch runTasks() is iterating right now (when called from inside a task): keep the
+    // vector's size, just neutralise the entries.
+    for (size_t i = 0; i < run_tasks_.size(); ++i) {
+        if (run_tasks_[i].fn == fn && run_tasks_[i].ctx == ctx) {
+            run_tasks_[i].fn = NULL;
+            ++dropped;
+        }
+    }
+    return dropped;
+}
+
 void Reactor::stop() {
     bool need_wake = false;
     {
@@ -335,9 +363,15 @@ int Reactor::runTasks() {
         }
         run_tasks_.swap(posted_);  // both vectors hold kMaxPostedTasks capacity: no allocation
     }
-    const int n = static_cast<int>(run_tasks_.size());
+    int n = 0;
     for (size_t i = 0; i < run_tasks_.size(); ++i) {
-        run_tasks_[i].fn(run_tasks_[i].ctx);
+        const Task t = run_tasks_[i];
+        if (t.fn == NULL) {
+            continue;  // cancelled by cancelPosted() from an earlier task of this batch
+        }
+        run_tasks_[i].fn = NULL;  // a task that cancels itself must not be counted as dropped
+        t.fn(t.ctx);
+        ++n;
     }
     run_tasks_.clear();
     return n;

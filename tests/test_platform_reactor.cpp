@@ -645,6 +645,65 @@ TEST_CASE(postFromAnotherThreadWakesReactor) {
     CHECK_EQ(accepted, r.runOnce(0));
 }
 
+namespace {
+
+struct CancelState {
+    Reactor* reactor;
+    PostState* victim;
+    int ran;
+};
+
+// Runs as the first task of a batch and cancels the victim's tasks queued behind it.
+void cancelVictimTask(void* ctx) {
+    CancelState* cs = static_cast<CancelState*>(ctx);
+    ++cs->ran;
+    cs->reactor->cancelPosted(&incrementTask, cs->victim);
+}
+
+}  // namespace
+
+TEST_CASE(cancelPostedDropsQueuedAndInFlightTasks) {
+    Reactor r;
+    REQUIRE(r.init());
+    PostState a;
+    a.reactor = &r;
+    a.executed = 0;
+    PostState b;
+    b.reactor = &r;
+    b.executed = 0;
+
+    // Queued, not yet picked up: only the matching (fn, ctx) pairs go away.
+    REQUIRE(r.post(&incrementTask, &a));
+    REQUIRE(r.post(&incrementTask, &b));
+    REQUIRE(r.post(&incrementTask, &a));
+    CHECK_EQ(static_cast<size_t>(2), r.cancelPosted(&incrementTask, &a));
+    CHECK_EQ(static_cast<size_t>(0), r.cancelPosted(&incrementTask, &a));
+    CHECK_EQ(1, r.runOnce(0));
+    CHECK_EQ(0, a.executed);
+    CHECK_EQ(1, b.executed);
+
+    // Cancelled from inside a task of the same batch (the destructor-in-a-callback case): the
+    // victim's tasks behind it never run, the others do.
+    CancelState cs;
+    cs.reactor = &r;
+    cs.victim = &a;
+    cs.ran = 0;
+    REQUIRE(r.post(&incrementTask, &b));
+    REQUIRE(r.post(&cancelVictimTask, &cs));
+    REQUIRE(r.post(&incrementTask, &a));
+    REQUIRE(r.post(&incrementTask, &b));
+    REQUIRE(r.post(&incrementTask, &a));
+    CHECK_EQ(3, r.runOnce(0));
+    CHECK_EQ(1, cs.ran);
+    CHECK_EQ(0, a.executed);
+    CHECK_EQ(3, b.executed);
+
+    // The queue is fully usable afterwards.
+    REQUIRE(r.post(&incrementTask, &a));
+    CHECK_EQ(1, r.runOnce(0));
+    CHECK_EQ(1, a.executed);
+}
+
 TEST_CASE(stopFromAnotherThreadEndsRun) {
     Reactor r;
     REQUIRE(r.init());

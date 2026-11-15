@@ -1,6 +1,5 @@
 #include "carplay/platform/media_engine.hpp"
 
-#include <ctype.h>
 #include <math.h>
 #include <string.h>
 
@@ -25,6 +24,17 @@ static const size_t kIapTagBytes = 16U;
 static const size_t kIapPackageHeaderBytes = 32U;
 static const size_t kIapMessageTypeOffset = 16U;
 static const uint32_t kIapMsgTypeComm = 0x636f6d6dU;  // 'comm'
+
+// Work done per readiness callback is bounded so that one busy (or hostile) socket cannot keep
+// the single reactor thread away from the other sockets and the timers. poll() is level
+// triggered: whatever is left is picked up in the next round.
+static const int kMaxAcceptsPerWakeup = 8;
+static const int kMaxTcpReadsPerWakeup = 32;
+static const int kMaxDatagramsPerWakeup = 64;
+
+static const size_t kScreenReadChunkBytes = 64U * 1024U;
+static const size_t kIapReadChunkBytes = 16U * 1024U;  // IapTunnel.kt READ_CHUNK_BYTES
+static const size_t kCompactThresholdBytes = 64U * 1024U;
 
 uint16_t readU16Le(const uint8_t* p) {
     return static_cast<uint16_t>(static_cast<uint16_t>(p[0]) |
@@ -59,27 +69,25 @@ bool isRealtimeAudioStreamType(int32_t type) {
            type == kStreamTypeMainHighAudio;
 }
 
-bool startsWithAnnexB(const uint8_t* data, size_t len) {
-    if (len >= 4U && data[0] == 0 && data[1] == 0 && data[2] == 0 && data[3] == 1) {
-        return true;
-    }
-    if (len >= 3U && data[0] == 0 && data[1] == 0 && data[2] == 1) {
-        return true;
-    }
-    return false;
+// ScreenStream.kt startsWithStartCode: ONLY the 4-byte start code counts. A 3-byte test
+// (00 00 01) would also match the length prefix of every first NAL of 256..511 bytes
+// (00 00 01 xx) and leave such frames unconverted.
+bool startsWithStartCode(const uint8_t* data, size_t len) {
+    return len >= 4U && data[0] == 0 && data[1] == 0 && data[2] == 0 && data[3] == 1;
 }
 
-// Validates that every 4-byte length-prefixed NAL unit fits exactly in `data[0..len)`
-// before replacing the lengths with 00 00 00 01 start codes (ScreenCodec.lengthPrefixedToAnnexB).
+// ScreenCodec.lengthPrefixedToAnnexB: replaces each 4-byte NAL length with 00 00 00 01, but only
+// if every length-prefixed NAL fits exactly in the payload; otherwise the payload keeps its
+// original bytes for the decoder's normal error path.
 void convertFrameToAnnexBIfValid(std::vector<uint8_t>& payload) {
-    if (payload.size() < 4U || startsWithAnnexB(&payload[0], payload.size())) {
+    if (payload.size() < 4U || startsWithStartCode(&payload[0], payload.size())) {
         return;
     }
     size_t offset = 0;
     while (offset + 4U <= payload.size()) {
         const uint32_t nal_len = readU32Be(&payload[offset]);
         offset += 4U;
-        if (nal_len == 0 || offset + nal_len > payload.size()) {
+        if (nal_len == 0 || nal_len > payload.size() - offset) {
             return;
         }
         offset += nal_len;
@@ -91,36 +99,42 @@ void convertFrameToAnnexBIfValid(std::vector<uint8_t>& payload) {
 }
 
 // Strips an outer ISO BMFF atom box header if "avcC" or "hvcC" appears at index >= 4
-// (ScreenCodec.detectConfig in ScreenStream.kt:200-207).
+// (ScreenCodec.detectConfig in ScreenStream.kt:200-207). The fourcc found decides the codec.
 void stripCodecBoxWrapper(const uint8_t* body,
                           size_t body_len,
                           const uint8_t*& config_ptr_out,
                           size_t& config_len_out,
-                          stream::VideoCodecType& box_hint_out) {
+                          stream::VideoCodecType& box_codec_out) {
     config_ptr_out = body;
     config_len_out = body_len;
-    box_hint_out = stream::CODEC_UNKNOWN;
+    box_codec_out = stream::CODEC_UNKNOWN;
     if (body == NULL || body_len < 8U) {
         return;
     }
     for (size_t idx = 4U; idx + 4U <= body_len; ++idx) {
-        if (memcmp(body + idx, "avcC", 4U) == 0) {
-            config_ptr_out = body + idx + 4U;
-            config_len_out = body_len - (idx + 4U);
-            box_hint_out = stream::CODEC_H264_AVCC;
-            return;
-        }
         if (memcmp(body + idx, "hvcC", 4U) == 0) {
             config_ptr_out = body + idx + 4U;
             config_len_out = body_len - (idx + 4U);
-            box_hint_out = stream::CODEC_HEVC_HVCC;
+            box_codec_out = stream::CODEC_HEVC_HVCC;
+            return;
+        }
+        if (memcmp(body + idx, "avcC", 4U) == 0) {
+            config_ptr_out = body + idx + 4U;
+            config_len_out = body_len - (idx + 4U);
+            box_codec_out = stream::CODEC_H264_AVCC;
             return;
         }
     }
 }
 
+// unsignedPlistInteger / BplistCodec.encodeUnsignedInt of the reference: an unsigned 64-bit value
+// travels as an ordinary bplist integer of at most 8 bytes, i.e. a value >= 2^63 is marker 0x13
+// plus its raw bits. That is also the form the iPhone itself sends (Session::plistUnsignedId reads
+// it back as unsigned). bplist::Value::makeUInt() would emit the 16-byte 0x14 form instead, which
+// the reference never puts on the wire; NTP timestamps are >= 2^63 for the whole current NTP era,
+// so every /feedback answer depends on this.
 bplist::Value makeUnsignedPlistInteger(uint64_t v) {
-    return bplist::Value::makeUInt(v);
+    return bplist::Value::makeInt(static_cast<int64_t>(v));
 }
 
 void unregisterAndClose(Reactor& reactor, TcpListener& listener) {
@@ -144,13 +158,62 @@ void unregisterAndClose(Reactor& reactor, UdpSocket& sock) {
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// Slot lifetime
+//
+// MediaSink callbacks run from inside a slot's own reactor callback and may re-enter the engine:
+// sink -> SessionServer::closeActiveSession() -> Session::close() -> onSessionClosed() releases
+// every slot, including the one whose member function is still on the stack. A slot is therefore
+// never deleted while it dispatches: releaseSlot() closes it (no further callbacks, `closing`
+// set) and the outermost DispatchScope deletes it on the way out. Slot code checks `closing`
+// after every sink callback and returns without touching anything else.
+// ---------------------------------------------------------------------------------------------
+
+struct SlotLifetime {
+    bool closing;        // close() ran: sockets and timers are gone, deliver nothing further
+    bool doomed;         // released while dispatching: delete when dispatch_depth returns to 0
+    int dispatch_depth;
+
+    SlotLifetime() : closing(false), doomed(false), dispatch_depth(0) {}
+};
+
+template <typename SlotT>
+void releaseSlot(SlotT* slot) {
+    if (slot == NULL) {
+        return;
+    }
+    slot->close();
+    if (slot->dispatch_depth > 0) {
+        slot->doomed = true;
+    } else {
+        delete slot;
+    }
+}
+
+template <typename SlotT>
+class DispatchScope {
+public:
+    explicit DispatchScope(SlotT* slot) : slot_(slot) { slot_->dispatch_depth += 1; }
+    ~DispatchScope() {
+        slot_->dispatch_depth -= 1;
+        if (slot_->dispatch_depth == 0 && slot_->doomed) {
+            delete slot_;
+        }
+    }
+
+private:
+    DispatchScope(const DispatchScope&) = delete;
+    DispatchScope& operator=(const DispatchScope&) = delete;
+    SlotT* slot_;
+};
+
 }  // namespace
 
 // =============================================================================================
 // ScreenSlot (stream types 110 / 111)
 // =============================================================================================
 
-struct MediaEngine::ScreenSlot : public IoHandler {
+struct MediaEngine::ScreenSlot : public IoHandler, public SlotLifetime {
     MediaEngine* engine;
     int32_t type;
     uint8_t key[crypto::kKeyBytes];
@@ -159,10 +222,11 @@ struct MediaEngine::ScreenSlot : public IoHandler {
     TcpConnection conn;
     std::vector<uint8_t> rx_buf;
     size_t rx_head;
-    bool closing;
+    std::vector<uint8_t> frame_plain;  // reused across frames
+    std::vector<uint8_t> annexb_cfg;
 
     ScreenSlot(MediaEngine* eng, int32_t t, const uint8_t k[crypto::kKeyBytes])
-        : engine(eng), type(t), frame_counter(0), rx_head(0), closing(false) {
+        : engine(eng), type(t), frame_counter(0), rx_head(0) {
         memcpy(key, k, crypto::kKeyBytes);
     }
 
@@ -171,12 +235,11 @@ struct MediaEngine::ScreenSlot : public IoHandler {
         crypto::wipe(key, sizeof(key));
     }
 
+    // Idempotent. Keeps the buffers: a sink callback further up the stack may still read them.
     void close() {
         closing = true;
         unregisterAndClose(engine->reactor_, conn);
         unregisterAndClose(engine->reactor_, listener);
-        rx_buf.clear();
-        rx_head = 0;
     }
 
     static bool acceptFilter(void* ctx, const Address& peer) {
@@ -191,55 +254,55 @@ struct MediaEngine::ScreenSlot : public IoHandler {
         return true;
     }
 
+    // The listener and the connection share this handler; only one of them is open at a time
+    // (the listener closes when the one screen connection has been accepted).
     virtual void onReadable() {
-        if (closing) return;
-        if (listener.isOpen()) {
-            onAcceptReady();
+        DispatchScope<ScreenSlot> scope(this);
+        if (closing) {
             return;
         }
         if (conn.isOpen()) {
             onDataReady();
+        } else if (listener.isOpen()) {
+            onAcceptReady();
         }
     }
 
     virtual void onError() {
-        if (closing) return;
-        handleStreamTerminated();
+        DispatchScope<ScreenSlot> scope(this);
+        terminate();
     }
 
     void onAcceptReady() {
-        for (;;) {
-            TcpListener::AcceptResult ar = listener.accept(conn);
+        for (int n = 0; n < kMaxAcceptsPerWakeup; ++n) {
+            const TcpListener::AcceptResult ar = listener.accept(conn);
             if (ar == TcpListener::kRejected) {
                 continue;
             }
             if (ar != TcpListener::kAccepted) {
-                break;
+                return;
             }
             // Only one screen connection per SETUP: close the listener once accepted.
             unregisterAndClose(engine->reactor_, listener);
             conn.setLingerZero();
             conn.setNoDelay(true);
             if (!engine->reactor_.add(conn.handle(), this, kPollIn)) {
-                handleStreamTerminated();
+                terminate();
             }
-            break;
+            return;
         }
     }
 
     void onDataReady();
     bool processMessages();
-    void handleStreamTerminated();
+    void terminate();
 };
-
-// Wait: let's make sure `onAcceptReady` passes `conn` directly to `listener.accept(conn)`!
-// Because `listener.accept(conn)` accepts directly into `conn`!
 
 // =============================================================================================
 // AudioSlot (stream types 100 / 101 / 102)
 // =============================================================================================
 
-struct MediaEngine::AudioSlot : public IoHandler, public TimerHandler {
+struct MediaEngine::AudioSlot : public IoHandler, public TimerHandler, public SlotLifetime {
     MediaEngine* engine;
     AudioStreamId id;
     audio::AudioFormat format;
@@ -265,6 +328,8 @@ struct MediaEngine::AudioSlot : public IoHandler, public TimerHandler {
     audio::MicStreamParams mic_params;
     audio::MicPacketizer mic_packetizer;
 
+    // The RTCP control port is bound because the phone expects it; like AudioStream.kt runControl
+    // its datagrams are read and discarded.
     struct CtrlHandler : public IoHandler {
         AudioSlot* slot;
         explicit CtrlHandler(AudioSlot* s) : slot(s) {}
@@ -303,7 +368,9 @@ struct MediaEngine::AudioSlot : public IoHandler, public TimerHandler {
         crypto::wipe(output_key, sizeof(output_key));
     }
 
+    // Idempotent. Wipes the uplink key (MicPacketizer::reset); the downlink key goes with the slot.
     void close() {
+        closing = true;
         if (mic_silent_timer_id != Reactor::kNoTimer) {
             engine->reactor_.cancelTimer(mic_silent_timer_id);
             mic_silent_timer_id = Reactor::kNoTimer;
@@ -313,8 +380,11 @@ struct MediaEngine::AudioSlot : public IoHandler, public TimerHandler {
         mic_packetizer.reset();
     }
 
+    // MicrophoneStart: at most once, by the first downlink packet or the silent-start timer,
+    // whichever comes first. The sink callback is the last thing done here: it may release
+    // this slot.
     void triggerMicrophoneStart() {
-        if (!mic_wanted || mic_started) {
+        if (closing || !mic_wanted || mic_started) {
             return;
         }
         if (mic_silent_timer_id != Reactor::kNoTimer) {
@@ -326,35 +396,34 @@ struct MediaEngine::AudioSlot : public IoHandler, public TimerHandler {
     }
 
     virtual void onTimer(uint32_t timer_id) {
-        if (timer_id == mic_silent_timer_id) {
-            mic_silent_timer_id = Reactor::kNoTimer;
-            triggerMicrophoneStart();
+        DispatchScope<AudioSlot> scope(this);
+        if (closing || timer_id != mic_silent_timer_id) {
+            return;
         }
+        mic_silent_timer_id = Reactor::kNoTimer;
+        triggerMicrophoneStart();
     }
 
     virtual void onReadable() {
-        uint8_t buf[4096];
-        for (;;) {
+        DispatchScope<AudioSlot> scope(this);
+        uint8_t buf[4096];  // AudioStream.kt DATAGRAM_BYTES
+        audio::JitterBuffer::Packet pkt;
+        for (int n = 0; n < kMaxDatagramsPerWakeup && !closing; ++n) {
             size_t got = 0;
             Address from;
-            IoStatus st = data_sock.receiveFrom(buf, sizeof(buf), got, from);
-            if (st == kIoWouldBlock) {
-                break;
+            const IoStatus st = data_sock.receiveFrom(buf, sizeof(buf), got, from);
+            if (st == kIoTruncated) {
+                continue;  // longer than any CarPlay audio datagram: cannot authenticate, drop
             }
             if (st != kIoOk) {
-                if (st == kIoTruncated) {
-                    continue;
-                }
-                break;
+                return;  // kIoWouldBlock (drained) or a socket error
             }
             if (!engine->peerAllowed(from)) {
                 engine->audio_stranger_drops_ += 1;
                 continue;
             }
             audio::RtpHeader hdr;
-            audio::OpenResult or_res =
-                audio::openPacket(output_key, buf, got, hdr, decrypted_payload);
-            if (or_res != audio::kOpenOk) {
+            if (audio::openPacket(output_key, buf, got, hdr, decrypted_payload) != audio::kOpenOk) {
                 engine->audio_auth_failures_ += 1;
                 continue;
             }
@@ -363,29 +432,44 @@ struct MediaEngine::AudioSlot : public IoHandler, public TimerHandler {
                 first_sample = hdr.timestamp;
                 origin_mono_ns = engine->reactor_.now();
                 engine->sink_.onAudioStarted(id, format, first_sample);
+                if (closing) {
+                    return;
+                }
                 triggerMicrophoneStart();
+                if (closing) {
+                    return;
+                }
             }
             const uint8_t* payload_ptr =
                 decrypted_payload.empty() ? NULL : &decrypted_payload[0];
             engine->sink_.onAudioRtp(id, format, hdr, payload_ptr, decrypted_payload.size());
+            if (closing) {
+                return;
+            }
 
-            if (format.codec == audio::kCodecLpcm) {
-                jitter.push(hdr.sequence, hdr.timestamp, payload_ptr, decrypted_payload.size());
-                audio::JitterBuffer::Packet pkt;
-                for (;;) {
-                    audio::JitterBuffer::PopResult pop_res = jitter.pop(pkt);
-                    if (pop_res == audio::JitterBuffer::kPopEmpty) {
-                        break;
+            if (format.codec != audio::kCodecLpcm) {
+                continue;  // AAC-LC / Opus: the sink decodes from onAudioRtp
+            }
+            jitter.push(hdr.sequence, hdr.timestamp, payload_ptr, decrypted_payload.size());
+            for (;;) {
+                const audio::JitterBuffer::PopResult pop_res = jitter.pop(pkt);
+                if (pop_res == audio::JitterBuffer::kPopEmpty) {
+                    break;
+                }
+                if (pop_res == audio::JitterBuffer::kPopLost) {
+                    engine->sink_.onAudioPacketLost(id, format, pkt.sequence);
+                    if (closing) {
+                        return;
                     }
-                    if (pop_res == audio::JitterBuffer::kPopLost) {
-                        engine->sink_.onAudioPacketLost(id, format, pkt.sequence);
-                        continue;
-                    }
-                    const uint8_t* p = pkt.payload.empty() ? NULL : &pkt.payload[0];
-                    audio::lpcmToInt16(p, pkt.payload.size(), pcm_samples, audio::kBigEndianSamples);
-                    const int16_t* s_ptr = pcm_samples.empty() ? NULL : &pcm_samples[0];
-                    engine->sink_.onAudioPcm(
-                        id, format, s_ptr, pcm_samples.size(), pkt.sequence, pkt.timestamp);
+                    continue;
+                }
+                const uint8_t* p = pkt.payload.empty() ? NULL : &pkt.payload[0];
+                audio::lpcmToInt16(p, pkt.payload.size(), pcm_samples, audio::kBigEndianSamples);
+                const int16_t* s_ptr = pcm_samples.empty() ? NULL : &pcm_samples[0];
+                engine->sink_.onAudioPcm(
+                    id, format, s_ptr, pcm_samples.size(), pkt.sequence, pkt.timestamp);
+                if (closing) {
+                    return;
                 }
             }
         }
@@ -393,12 +477,12 @@ struct MediaEngine::AudioSlot : public IoHandler, public TimerHandler {
 
     void onControlReadable() {
         uint8_t buf[2048];
-        for (;;) {
+        for (int n = 0; n < kMaxDatagramsPerWakeup; ++n) {
             size_t got = 0;
             Address from;
-            IoStatus st = ctrl_sock.receiveFrom(buf, sizeof(buf), got, from);
+            const IoStatus st = ctrl_sock.receiveFrom(buf, sizeof(buf), got, from);
             if (st != kIoOk && st != kIoTruncated) {
-                break;
+                return;
             }
         }
     }
@@ -410,7 +494,7 @@ struct MediaEngine::AudioSlot : public IoHandler, public TimerHandler {
 // IapSlot (stream type 130)
 // =============================================================================================
 
-struct MediaEngine::IapSlot : public IoHandler {
+struct MediaEngine::IapSlot : public IoHandler, public SlotLifetime {
     MediaEngine* engine;
     uint8_t read_key[crypto::kKeyBytes];
     uint64_t read_counter;
@@ -420,14 +504,9 @@ struct MediaEngine::IapSlot : public IoHandler {
     size_t cipher_head;
     std::vector<uint8_t> plain_buf;
     size_t plain_head;
-    bool closing;
 
     IapSlot(MediaEngine* eng, const uint8_t key[crypto::kKeyBytes])
-        : engine(eng),
-          read_counter(0),
-          cipher_head(0),
-          plain_head(0),
-          closing(false) {
+        : engine(eng), read_counter(0), cipher_head(0), plain_head(0) {
         memcpy(read_key, key, crypto::kKeyBytes);
     }
 
@@ -436,10 +515,15 @@ struct MediaEngine::IapSlot : public IoHandler {
         crypto::wipe(read_key, sizeof(read_key));
     }
 
+    // Idempotent. Keeps the buffers: a sink callback further up the stack may still read them.
     void close() {
         closing = true;
         unregisterAndClose(engine->reactor_, conn);
         unregisterAndClose(engine->reactor_, listener);
+    }
+
+    void resetStreamState() {
+        read_counter = 0;
         cipher_buf.clear();
         cipher_head = 0;
         plain_buf.clear();
@@ -454,76 +538,90 @@ struct MediaEngine::IapSlot : public IoHandler {
         return self->engine->peerAllowed(peer);
     }
 
+    // The listener and the connection share this handler. While a connection is open the
+    // listener stays bound but is not polled (interest 0), so only one of them can be ready:
+    // like IapTunnel.kt, whose accept thread is busy in run(), a further connection waits in the
+    // backlog until the current one ends.
     virtual void onReadable() {
-        if (closing) return;
-        if (listener.isOpen()) {
-            for (;;) {
-                TcpListener::AcceptResult ar = listener.accept(conn);
-                if (ar == TcpListener::kRejected) {
-                    continue;
-                }
-                if (ar != TcpListener::kAccepted) {
-                    break;
-                }
-                unregisterAndClose(engine->reactor_, listener);
-                conn.setLingerZero();
-                conn.setNoDelay(true);
-                read_counter = 0;
-                if (!engine->reactor_.add(conn.handle(), this, kPollIn)) {
-                    handleTerminated(true);
-                }
-                break;
-            }
+        DispatchScope<IapSlot> scope(this);
+        if (closing) {
             return;
         }
         if (conn.isOpen()) {
             onDataReady();
+        } else if (listener.isOpen()) {
+            onAcceptReady();
         }
     }
 
     virtual void onError() {
-        if (closing) return;
-        handleTerminated(true);
+        DispatchScope<IapSlot> scope(this);
+        terminateFatal();
+    }
+
+    void onAcceptReady() {
+        for (int n = 0; n < kMaxAcceptsPerWakeup; ++n) {
+            const TcpListener::AcceptResult ar = listener.accept(conn);
+            if (ar == TcpListener::kRejected) {
+                continue;
+            }
+            if (ar != TcpListener::kAccepted) {
+                return;
+            }
+            conn.setLingerZero();
+            conn.setNoDelay(true);
+            resetStreamState();  // IapTunnel.kt accept(): readCounter.set(0) per connection
+            if (!engine->reactor_.add(conn.handle(), this, kPollIn)) {
+                terminateFatal();
+                return;
+            }
+            engine->reactor_.modify(listener.handle(), 0);
+            return;
+        }
     }
 
     void onDataReady() {
-        bool fatal = false;
-        bool eof = false;
-        for (;;) {
-            IoStatus st = conn.readAppend(cipher_buf, 16 * 1024);
-            if (st == kIoOk) {
-                if (!processCiphertext()) {
-                    fatal = true;
-                    break;
-                }
-                continue;
-            }
+        for (int n = 0; n < kMaxTcpReadsPerWakeup; ++n) {
+            const IoStatus st = conn.readAppend(cipher_buf, kIapReadChunkBytes);
             if (st == kIoWouldBlock) {
-                break;
+                return;
             }
             if (st == kIoClosed) {
-                eof = true;
-            } else {
-                fatal = true;
+                onPeerEof();
+                return;
             }
-            break;
-        }
-        if (fatal || eof) {
-            handleTerminated(fatal);
+            if (st != kIoOk || !processCiphertext()) {
+                terminateFatal();  // no-op when a sink callback already released this slot
+                return;
+            }
+            if (closing) {
+                return;
+            }
         }
     }
 
+    // IapTunnel.kt run(): a clean EOF is not a failure (onClosed is not called). The connection
+    // goes away with whatever partial frame it left behind and the accept loop continues.
+    void onPeerEof() {
+        unregisterAndClose(engine->reactor_, conn);
+        resetStreamState();
+        if (listener.isOpen()) {
+            engine->reactor_.modify(listener.handle(), kPollIn);
+        }
+    }
+
+    // false = authentication or framing failure (fatal). true with `closing` set = a sink
+    // callback released this slot: the caller must return at once.
     bool processCiphertext() {
         while (cipher_buf.size() - cipher_head >= kIapFrameHeaderBytes) {
             const uint8_t* frame_ptr = &cipher_buf[cipher_head];
-            const uint16_t pt_len = readU16Le(frame_ptr);
-            const size_t total_frame = kIapFrameHeaderBytes + static_cast<size_t>(pt_len) + kIapTagBytes;
+            const size_t pt_len = readU16Le(frame_ptr);
+            const size_t total_frame = kIapFrameHeaderBytes + pt_len + kIapTagBytes;
             if (cipher_buf.size() - cipher_head < total_frame) {
                 break;
             }
             uint8_t nonce[crypto::kNonceBytes];
             crypto::makeCounterNonce(read_counter, nonce);
-            read_counter += 1;
 
             const size_t old_plain_size = plain_buf.size();
             plain_buf.resize(old_plain_size + pt_len);
@@ -533,14 +631,16 @@ struct MediaEngine::IapSlot : public IoHandler {
 
             if (!crypto::chacha20Poly1305OpenDetached(
                     read_key, nonce, frame_ptr, kIapFrameHeaderBytes, ct_ptr, pt_len, tag_ptr, out_ptr)) {
+                plain_buf.resize(old_plain_size);
                 return false;
             }
+            read_counter += 1;
             cipher_head += total_frame;
         }
         if (cipher_head == cipher_buf.size()) {
             cipher_buf.clear();
             cipher_head = 0;
-        } else if (cipher_head >= 64 * 1024) {
+        } else if (cipher_head >= kCompactThresholdBytes) {
             cipher_buf.erase(cipher_buf.begin(),
                              cipher_buf.begin() + static_cast<ptrdiff_t>(cipher_head));
             cipher_head = 0;
@@ -557,6 +657,7 @@ struct MediaEngine::IapSlot : public IoHandler {
                 break;
             }
             const uint32_t msg_type = readU32Be(pkg_ptr + kIapMessageTypeOffset);
+            plain_head += pkg_size;  // consumed before the callback, which may release this slot
             if (msg_type == kIapMsgTypeComm) {
                 const size_t body_len = static_cast<size_t>(pkg_size) - kIapPackageHeaderBytes;
                 const uint8_t* body_ptr = body_len > 0 ? (pkg_ptr + kIapPackageHeaderBytes) : NULL;
@@ -565,12 +666,11 @@ struct MediaEngine::IapSlot : public IoHandler {
                     return true;
                 }
             }
-            plain_head += pkg_size;
         }
         if (plain_head == plain_buf.size()) {
             plain_buf.clear();
             plain_head = 0;
-        } else if (plain_head >= 64 * 1024) {
+        } else if (plain_head >= kCompactThresholdBytes) {
             plain_buf.erase(plain_buf.begin(),
                             plain_buf.begin() + static_cast<ptrdiff_t>(plain_head));
             plain_head = 0;
@@ -578,13 +678,17 @@ struct MediaEngine::IapSlot : public IoHandler {
         return true;
     }
 
-    void handleTerminated(bool close_session) {
+    // IapTunnel.Listener.onClosed(failure) -> session.close(). Only called while dispatching.
+    void terminateFatal() {
+        if (closing) {
+            return;
+        }
         MediaEngine* eng = engine;
         if (eng->iap_stream_ == this) {
             eng->iap_stream_ = NULL;
         }
-        delete this;
-        if (close_session && !eng->shutting_down_) {
+        releaseSlot(this);  // closed now, deleted by the DispatchScope
+        if (!eng->shutting_down_) {
             eng->requestSessionClose();
         }
     }
@@ -595,34 +699,26 @@ struct MediaEngine::IapSlot : public IoHandler {
 // =============================================================================================
 
 void MediaEngine::ScreenSlot::onDataReady() {
-    bool ok = true;
-    bool closed_or_err = false;
-    for (;;) {
-        IoStatus st = conn.readAppend(rx_buf, 64 * 1024);
-        if (st == kIoOk) {
-            if (!processMessages()) {
-                ok = false;
-                break;
-            }
-            if (closing) {
-                return;
-            }
-            continue;
-        }
+    for (int n = 0; n < kMaxTcpReadsPerWakeup; ++n) {
+        const IoStatus st = conn.readAppend(rx_buf, kScreenReadChunkBytes);
         if (st == kIoWouldBlock) {
-            break;
+            return;
         }
-        closed_or_err = true;
-        break;
-    }
-    if (!ok || closed_or_err) {
-        handleStreamTerminated();
+        // ScreenStream.kt run(): EOF, a read error, an oversized body and a decrypt failure all
+        // end in onClosed -> session.close().
+        if (st != kIoOk || !processMessages()) {
+            terminate();  // no-op when a sink callback already released this slot
+            return;
+        }
+        if (closing) {
+            return;
+        }
     }
 }
 
+// false = fatal. true with `closing` set = a sink callback released this slot: the caller must
+// return at once.
 bool MediaEngine::ScreenSlot::processMessages() {
-    std::vector<uint8_t> frame_plain;
-    std::vector<uint8_t> annexb_cfg;
     while (rx_buf.size() - rx_head >= stream::kScreenHeaderBytes) {
         const uint8_t* hdr_ptr = &rx_buf[rx_head];
         stream::ScreenPacketHeader hdr;
@@ -632,27 +728,27 @@ bool MediaEngine::ScreenSlot::processMessages() {
         if (hdr.payload_size > engine->config_.max_screen_payload_bytes) {
             return false;
         }
-        const size_t total_msg = stream::kScreenHeaderBytes + static_cast<size_t>(hdr.payload_size);
+        const size_t body_len = static_cast<size_t>(hdr.payload_size);
+        const size_t total_msg = stream::kScreenHeaderBytes + body_len;
         if (rx_buf.size() - rx_head < total_msg) {
             break;
         }
         const int64_t arrival_ns = engine->reactor_.now();
         const uint8_t* body_ptr = hdr_ptr + stream::kScreenHeaderBytes;
-        const size_t body_len = static_cast<size_t>(hdr.payload_size);
+        rx_head += total_msg;  // consumed before the callbacks, which may release this slot
 
         if (hdr.opcode == stream::kOpVideoFrame) {
             if (body_len < crypto::kTagBytes) {
-                return false;
+                continue;  // ScreenStream.kt:103: ignored, the frame counter does not advance
             }
             const size_t ct_len = body_len - crypto::kTagBytes;
-            const uint8_t* tag_ptr = body_ptr + ct_len;
             if (!stream::decryptFrame(key,
                                       frame_counter,
                                       hdr_ptr,
                                       stream::kScreenHeaderBytes,
                                       body_ptr,
                                       ct_len,
-                                      tag_ptr,
+                                      body_ptr + ct_len,
                                       frame_plain)) {
                 return false;
             }
@@ -667,11 +763,13 @@ bool MediaEngine::ScreenSlot::processMessages() {
         } else if (hdr.opcode == stream::kOpVideoConfig) {
             const uint8_t* cfg_ptr = NULL;
             size_t cfg_len = 0;
-            stream::VideoCodecType box_hint = stream::CODEC_UNKNOWN;
-            stripCodecBoxWrapper(body_ptr, body_len, cfg_ptr, cfg_len, box_hint);
-            stream::VideoCodecType codec = stream::detectConfigCodec(cfg_ptr, cfg_len);
-            if (codec == stream::CODEC_UNKNOWN && box_hint != stream::CODEC_UNKNOWN) {
-                codec = box_hint;
+            // ScreenCodec.detectConfig: an avcC / hvcC box decides the codec. Only a bare record
+            // is classified by its content (the reference then knows just "avcC-like or HEVC";
+            // detectConfigCodec additionally recognises Annex B and reports UNKNOWN otherwise).
+            stream::VideoCodecType codec = stream::CODEC_UNKNOWN;
+            stripCodecBoxWrapper(body_ptr, body_len, cfg_ptr, cfg_len, codec);
+            if (codec == stream::CODEC_UNKNOWN) {
+                codec = stream::detectConfigCodec(cfg_ptr, cfg_len);
             }
             annexb_cfg.clear();
             if (codec == stream::CODEC_H264_AVCC) {
@@ -684,7 +782,7 @@ bool MediaEngine::ScreenSlot::processMessages() {
                                         codec,
                                         ab_ptr,
                                         annexb_cfg.size(),
-                                        cfg_ptr,
+                                        cfg_len > 0 ? cfg_ptr : NULL,
                                         cfg_len,
                                         hdr.width_px,
                                         hdr.height_px);
@@ -692,20 +790,26 @@ bool MediaEngine::ScreenSlot::processMessages() {
                 return true;
             }
         }
-        rx_head += total_msg;
+        // Any other opcode: skipped (ScreenStream.kt onMessage has no else branch).
     }
 
     if (rx_head == rx_buf.size()) {
         rx_buf.clear();
         rx_head = 0;
-    } else if (rx_head >= 64 * 1024) {
+    } else if (rx_head >= kCompactThresholdBytes) {
         rx_buf.erase(rx_buf.begin(), rx_buf.begin() + static_cast<ptrdiff_t>(rx_head));
         rx_head = 0;
     }
     return true;
 }
 
-void MediaEngine::ScreenSlot::handleStreamTerminated() {
+// ScreenStream.Listener.onClosed in CarPlayMediaEngine.kt:160-169: report the screen inactive
+// if this is still the current stream of its type, then close the session. Only called while
+// dispatching.
+void MediaEngine::ScreenSlot::terminate() {
+    if (closing) {
+        return;
+    }
     MediaEngine* eng = engine;
     const int32_t stream_type = type;
     bool removed = false;
@@ -716,17 +820,15 @@ void MediaEngine::ScreenSlot::handleStreamTerminated() {
             break;
         }
     }
-    delete this;
+    releaseSlot(this);  // closed now, deleted by the DispatchScope
+    if (eng->shutting_down_) {
+        return;
+    }
     if (removed) {
         eng->sink_.onScreenStreamActive(stream_type, false);
     }
-    if (!eng->shutting_down_) {
-        eng->requestSessionClose();
-    }
+    eng->requestSessionClose();
 }
-
-// Also fix ScreenSlot::onAcceptReady so it accepts directly into `conn`:
-// wait: we defined onAcceptReady inline inside ScreenSlot above; let's inspect and refine it!
 
 // =============================================================================================
 // MediaEngine
@@ -753,6 +855,8 @@ MediaEngine::MediaEngine(Reactor& reactor,
 MediaEngine::~MediaEngine() {
     shutting_down_ = true;
     closeAllStreams();
+    // A worker-thread submit may have left onMicWorkerPost(this) queued in the reactor.
+    reactor_.cancelPosted(&MediaEngine::onMicWorkerPost, this);
 }
 
 void MediaEngine::setControlPeer(const Address& peer) {
@@ -767,6 +871,17 @@ void MediaEngine::setSyncedNtpCallback(SyncedNtpFn fn, void* ctx) {
 void MediaEngine::setCloseSessionCallback(SessionActionFn fn, void* ctx) {
     close_session_fn_ = fn;
     close_session_ctx_ = ctx;
+}
+
+void MediaEngine::clearSessionCallbacks(void* ctx) {
+    if (synced_ntp_ctx_ == ctx) {
+        synced_ntp_fn_ = NULL;
+        synced_ntp_ctx_ = NULL;
+    }
+    if (close_session_ctx_ == ctx) {
+        close_session_fn_ = NULL;
+        close_session_ctx_ = NULL;
+    }
 }
 
 bool MediaEngine::peerAllowed(const Address& from) const {
@@ -818,18 +933,20 @@ bool MediaEngine::onScreen(session::Session& session,
     }
     data_port_out = static_cast<int32_t>(slot->listener.port());
 
-    // Replace any existing screen stream of the same type cleanly.
+    // Replace any existing screen stream of the same type (streams.put(...)?.close()).
+    ScreenSlot* old = NULL;
     for (size_t i = 0; i < screens_.size(); ++i) {
         if (screens_[i]->type == type) {
-            ScreenSlot* old = screens_[i];
+            old = screens_[i];
             screens_[i] = slot;
-            delete old;
-            sink_.onScreenStreamActive(type, true);
-            return true;
+            break;
         }
     }
-    screens_.push_back(slot);
-    sink_.onScreenStreamActive(type, true);
+    if (old == NULL) {
+        screens_.push_back(slot);
+    }
+    releaseSlot(old);
+    sink_.onScreenStreamActive(type, true);  // last: the sink may re-enter
     return true;
 }
 
@@ -845,25 +962,27 @@ bool MediaEngine::onAudio(session::Session& session,
     }
 
     const audio::AudioFormat format = audio::streamAudioFormat(stream, type);
-    if (!info::isSupportedOutputFormat(session.config(), format)) {
-        return false;
-    }
     const AudioStreamId stream_id(type, format.audio_type);
 
-    // Replace any existing stream with the same (type, audioType) pair first
-    // (CarPlayMediaEngine.kt:183-187).
+    // A SETUP for an existing (type, audioType) pair first retires the previous stream, before
+    // anything that can still decline the new one (CarPlayMediaEngine.kt:183-187).
     for (size_t i = 0; i < audios_.size(); ++i) {
         if (audios_[i]->id == stream_id) {
             AudioSlot* old = audios_[i];
             audios_.erase(audios_.begin() + static_cast<ptrdiff_t>(i));
-            const bool had_mic = old->mic_wanted;
-            delete old;
-            if (had_mic) {
-                sink_.onMicrophoneStopped(stream_id);
-            }
-            sink_.onAudioStopped(stream_id);
+            retireAudioSlot(old);
             break;
         }
+    }
+    if (session.closed()) {
+        return false;  // a sink callback above closed the session
+    }
+
+    if (!info::isSupportedOutputFormat(session.config(), format)) {
+        return false;
+    }
+    if (audios_.size() >= config_.max_audio_streams) {
+        return false;
     }
 
     uint8_t out_key[crypto::kKeyBytes];
@@ -873,19 +992,15 @@ bool MediaEngine::onAudio(session::Session& session,
 
     uint64_t conn_id = 0;
     bool has_conn_id = false;
-    if (stream.isDict()) {
-        const bplist::Value* cid_val = stream.find("streamConnectionID");
-        if (cid_val != NULL) {
-            has_conn_id = session::Session::plistUnsignedId(*cid_val, conn_id);
-        }
+    const bplist::Value* cid_val = stream.find("streamConnectionID");
+    if (cid_val != NULL) {
+        has_conn_id = session::Session::plistUnsignedId(*cid_val, conn_id);
     }
 
     int32_t latency_ms = 0;
-    if (stream.isDict()) {
-        const bplist::Value* lat_val = stream.find("audioLatencyMs");
-        if (lat_val != NULL) {
-            session::plistNumberToInt(*lat_val, latency_ms);
-        }
+    const bplist::Value* lat_val = stream.find("audioLatencyMs");
+    if (lat_val != NULL && !session::plistNumberToInt(*lat_val, latency_ms)) {
+        latency_ms = 0;
     }
 
     AudioSlot* slot = new AudioSlot(this,
@@ -913,7 +1028,8 @@ bool MediaEngine::onAudio(session::Session& session,
         return false;
     }
 
-    // Check whether this stream wants a microphone uplink (type == 100).
+    // Microphone uplink (microphoneConfig, CarPlayMediaEngine.kt:624-663): type 100 only, the
+    // stream must ask for input, name a dataPort, and its INPUT key must be derivable.
     audio::MicStreamParams mic_params;
     if (audio::parseMicrophoneStream(
             type, stream, config_.microphone_enabled && session.config().microphone, mic_params) &&
@@ -933,17 +1049,6 @@ bool MediaEngine::onAudio(session::Session& session,
 
     audios_.push_back(slot);
 
-    // MicrophoneStart.startsWithoutDownlink: non-telephony streams start after
-    // mic_silent_start_ms even if no downlink audio packet arrives.
-    if (slot->mic_wanted && format.audio_type != "telephony") {
-        if (config_.mic_silent_start_ms == 0) {
-            slot->triggerMicrophoneStart();
-        } else if (config_.mic_silent_start_ms > 0) {
-            slot->mic_silent_timer_id =
-                reactor_.startTimer(config_.mic_silent_start_ms, 0, slot);
-        }
-    }
-
     response_out = bplist::Value::makeDict();
     response_out.set("type", bplist::Value::makeInt(type));
     response_out.set("dataPort",
@@ -952,6 +1057,21 @@ bool MediaEngine::onAudio(session::Session& session,
                      bplist::Value::makeInt(static_cast<int64_t>(slot->ctrl_sock.port())));
     response_out.set("streamConnectionID",
                      makeUnsignedPlistInteger(has_conn_id ? conn_id : 0ULL));
+
+    // MicrophoneStart.startsWithoutDownlink: every audioType except "telephony" starts after
+    // mic_silent_start_ms even if no downlink packet arrives (a call waits for its downlink, the
+    // echo reference). Last step: starting the microphone calls the sink, which may re-enter and
+    // release `slot`.
+    if (slot->mic_wanted && format.audio_type != "telephony") {
+        if (config_.mic_silent_start_ms > 0) {
+            slot->mic_silent_timer_id =
+                reactor_.startTimer(config_.mic_silent_start_ms, 0, slot);
+        }
+        if (config_.mic_silent_start_ms == 0 ||
+            (config_.mic_silent_start_ms > 0 && slot->mic_silent_timer_id == Reactor::kNoTimer)) {
+            slot->triggerMicrophoneStart();  // immediate, also when the timer table is full
+        }
+    }
     return true;
 }
 
@@ -987,11 +1107,9 @@ bool MediaEngine::onDataStream(session::Session& session,
         return false;
     }
 
-    if (iap_stream_ != NULL) {
-        delete iap_stream_;
-        iap_stream_ = NULL;
-    }
+    IapSlot* old = iap_stream_;
     iap_stream_ = slot;
+    releaseSlot(old);
 
     response_out = bplist::Value::makeDict();
     response_out.set("type", bplist::Value::makeInt(kStreamTypeData));
@@ -1016,6 +1134,8 @@ bool MediaEngine::onFeedback(session::Session& /*session*/, bplist::Value& respo
 
     for (size_t i = 0; i < audios_.size(); ++i) {
         const AudioSlot* slot = audios_[i];
+        // sampleTime counts on the stream's RTP clock, not on the decode rate
+        // (CarPlayMediaEngine.kt onFeedback).
         const uint32_t clock_rate = slot->format.rtp_clock_rate;
         bplist::Value entry = bplist::Value::makeDict();
         entry.set("type", bplist::Value::makeInt(slot->id.type));
@@ -1025,7 +1145,7 @@ bool MediaEngine::onFeedback(session::Session& /*session*/, bplist::Value& respo
             double elapsed_sec =
                 static_cast<double>(now_ns - slot->origin_mono_ns) / 1e9 -
                 static_cast<double>(slot->playout_latency_ms) / 1000.0;
-            if (elapsed_sec < 0.0) {
+            if (!(elapsed_sec > 0.0)) {
                 elapsed_sec = 0.0;
             }
             const uint64_t advanced =
@@ -1047,12 +1167,24 @@ bool MediaEngine::onFeedback(session::Session& /*session*/, bplist::Value& respo
     return true;
 }
 
+void MediaEngine::retireAudioSlot(AudioSlot* slot) {
+    const AudioStreamId aid = slot->id;
+    const bool had_mic = slot->mic_wanted;
+    releaseSlot(slot);
+    if (shutting_down_) {
+        return;  // the sink may already be gone
+    }
+    if (had_mic) {
+        sink_.onMicrophoneStopped(aid);
+    }
+    sink_.onAudioStopped(aid);
+}
+
 void MediaEngine::onTeardown(session::Session& /*session*/, int32_t type) {
     if (type == kStreamTypeData) {
-        if (iap_stream_ != NULL) {
-            delete iap_stream_;
-            iap_stream_ = NULL;
-        }
+        IapSlot* old = iap_stream_;
+        iap_stream_ = NULL;
+        releaseSlot(old);
         return;
     }
 
@@ -1062,7 +1194,7 @@ void MediaEngine::onTeardown(session::Session& /*session*/, int32_t type) {
             if (screens_[i]->type == type) {
                 ScreenSlot* s = screens_[i];
                 screens_.erase(screens_.begin() + static_cast<ptrdiff_t>(i));
-                delete s;
+                releaseSlot(s);
                 had_screen = true;
             } else {
                 ++i;
@@ -1075,18 +1207,13 @@ void MediaEngine::onTeardown(session::Session& /*session*/, int32_t type) {
     }
 
     // TEARDOWN carries only the stream type; release every audioType variant of it
-    // (CarPlayMediaEngine.kt:531-542).
+    // (CarPlayMediaEngine.kt:531-542). The sink callbacks may re-enter and change audios_, so
+    // the vector is re-examined from the current index after each one.
     for (size_t i = 0; i < audios_.size();) {
         if (audios_[i]->id.type == type) {
             AudioSlot* a = audios_[i];
-            const AudioStreamId aid = a->id;
-            const bool had_mic = a->mic_wanted;
             audios_.erase(audios_.begin() + static_cast<ptrdiff_t>(i));
-            delete a;
-            if (had_mic) {
-                sink_.onMicrophoneStopped(aid);
-            }
-            sink_.onAudioStopped(aid);
+            retireAudioSlot(a);
         } else {
             ++i;
         }
@@ -1099,6 +1226,7 @@ void MediaEngine::onAudioDuck(session::Session& /*session*/, bool ducked) {
 }
 
 void MediaEngine::onSessionClosed(session::Session& /*session*/) {
+    // A phone that disconnects during a prompt never sends unduckAudio.
     if (ducked_) {
         ducked_ = false;
         sink_.onAudioDuck(false);
@@ -1106,32 +1234,27 @@ void MediaEngine::onSessionClosed(session::Session& /*session*/) {
     closeAllStreams();
 }
 
+// May run while one of the slots is dispatching (a sink callback closed the session): every slot
+// leaves its container BEFORE its sink notification, and releaseSlot() defers the delete of a
+// dispatching slot.
 void MediaEngine::closeAllStreams() {
-    if (iap_stream_ != NULL) {
-        delete iap_stream_;
-        iap_stream_ = NULL;
-    }
+    IapSlot* iap = iap_stream_;
+    iap_stream_ = NULL;
+    releaseSlot(iap);
+
     while (!screens_.empty()) {
         ScreenSlot* s = screens_.back();
         const int32_t stype = s->type;
         screens_.pop_back();
-        delete s;
+        releaseSlot(s);
         if (!shutting_down_) {
             sink_.onScreenStreamActive(stype, false);
         }
     }
     while (!audios_.empty()) {
         AudioSlot* a = audios_.back();
-        const AudioStreamId aid = a->id;
-        const bool had_mic = a->mic_wanted;
         audios_.pop_back();
-        delete a;
-        if (!shutting_down_) {
-            if (had_mic) {
-                sink_.onMicrophoneStopped(aid);
-            }
-            sink_.onAudioStopped(aid);
-        }
+        retireAudioSlot(a);
     }
     LockGuard lock(mic_mutex_);
     submitted_mic_pcm_.clear();
@@ -1141,16 +1264,17 @@ size_t MediaEngine::pushMicrophonePcm(const int16_t* samples, size_t sample_coun
     if (samples == NULL || sample_count == 0) {
         return 0;
     }
-    // Find the most recently added type-100 stream with a configured microphone.
+    // The most recently set up stream whose microphone has started. Capture is only meant to
+    // run between onMicrophoneStarted and onMicrophoneStopped; anything else is discarded.
     AudioSlot* target = NULL;
     for (size_t i = audios_.size(); i > 0; --i) {
         AudioSlot* s = audios_[i - 1];
-        if (s->mic_wanted && s->mic_packetizer.configured()) {
+        if (s->mic_started && s->mic_packetizer.configured() && s->data_sock.isOpen()) {
             target = s;
             break;
         }
     }
-    if (target == NULL || !target->data_sock.isOpen()) {
+    if (target == NULL) {
         return 0;
     }
     std::vector<std::vector<uint8_t> > packets;
@@ -1158,10 +1282,9 @@ size_t MediaEngine::pushMicrophonePcm(const int16_t* samples, size_t sample_coun
     size_t sent_count = 0;
     for (size_t i = 0; i < packets.size(); ++i) {
         const std::vector<uint8_t>& pkt = packets[i];
-        if (!pkt.empty()) {
-            if (target->data_sock.sendTo(&pkt[0], pkt.size(), target->mic_dest) == kIoOk) {
-                sent_count += 1;
-            }
+        if (!pkt.empty() &&
+            target->data_sock.sendTo(&pkt[0], pkt.size(), target->mic_dest) == kIoOk) {
+            sent_count += 1;
         }
     }
     return sent_count;
@@ -1171,12 +1294,14 @@ bool MediaEngine::submitMicrophonePcm(const int16_t* samples, size_t sample_coun
     if (samples == NULL || sample_count == 0) {
         return false;
     }
+    // Queued worker samples are capped at ~1 second of 48 kHz stereo to bound memory when the
+    // reactor thread is stalled.
+    static const size_t kMaxQueuedSamples = 96000U;
     bool need_post = false;
     {
         LockGuard lock(mic_mutex_);
-        // Cap queued worker samples at ~1 second of 48k stereo (96000 samples) to bound memory.
-        static const size_t kMaxQueuedSamples = 96000U;
-        if (submitted_mic_pcm_.size() + sample_count > kMaxQueuedSamples) {
+        if (sample_count > kMaxQueuedSamples ||
+            submitted_mic_pcm_.size() > kMaxQueuedSamples - sample_count) {
             return false;
         }
         submitted_mic_pcm_.insert(submitted_mic_pcm_.end(), samples, samples + sample_count);
@@ -1185,12 +1310,13 @@ bool MediaEngine::submitMicrophonePcm(const int16_t* samples, size_t sample_coun
             need_post = true;
         }
     }
-    if (need_post) {
-        if (!reactor_.post(&MediaEngine::onMicWorkerPost, this)) {
-            LockGuard lock(mic_mutex_);
-            mic_post_pending_ = false;
-            return false;
-        }
+    if (need_post && !reactor_.post(&MediaEngine::onMicWorkerPost, this)) {
+        // Nothing will drain the queue: take the samples back out so that the next submit
+        // starts clean and retries the post.
+        LockGuard lock(mic_mutex_);
+        mic_post_pending_ = false;
+        submitted_mic_pcm_.clear();
+        return false;
     }
     return true;
 }
@@ -1214,8 +1340,7 @@ void MediaEngine::drainSubmittedMicPcm() {
 
 bool MediaEngine::microphoneActive() const {
     for (size_t i = audios_.size(); i > 0; --i) {
-        const AudioSlot* s = audios_[i - 1];
-        if (s->mic_wanted && s->mic_started) {
+        if (audios_[i - 1]->mic_started) {
             return true;
         }
     }

@@ -7,7 +7,10 @@
 //     - accepts a single connection only from the active control peer's host address;
 //     - parses 128-byte ScreenPacketHeader records, extracts avcC/hvcC config to Annex B,
 //       decrypts ChaCha20-Poly1305 video frames and converts 4-byte length-prefixed NALs
-//       in-place to Annex B before handing them to MediaSink.
+//       in-place to Annex B before handing them to MediaSink;
+//     - like ScreenStream.kt: a frame body shorter than the tag and unknown opcodes are skipped;
+//       a decrypt failure, an oversized body, peer EOF or a socket error end the stream AND the
+//       session.
 //   * Realtime Audio UDP receivers (stream types 100 / 101 / 102):
 //     - binds ephemeral data + control UDP sockets per (type, audioType) stream, requesting
 //       a 512 KiB kernel receive buffer on the data socket;
@@ -19,13 +22,28 @@
 //       non-telephony streams (e.g. Siri / voice notes with no downlink audio);
 //     - accepts host-order int16 PCM on the reactor thread (pushMicrophonePcm) or from a
 //       capture worker thread (submitMicrophonePcm), seals RTP packets with MicPacketizer,
-//       and sends them to the phone's UDP dataPort.
+//       and sends them to the phone's UDP dataPort; PCM handed over before the microphone
+//       started (MediaSink::onMicrophoneStarted) is discarded.
 //   * iAP2-over-CarPlay DataStream TCP receiver (stream type 130, UUID E9459FD0-...):
 //     - binds an ephemeral dual-stack TcpListener with peer-host filtering;
 //     - decrypts [u16 LE len | ciphertext | tag16] frames with the seed-derived output key,
-//       parses 32-byte APTransportPackage headers, and forwards 'comm' payloads to MediaSink.
+//       parses 32-byte APTransportPackage headers, and forwards 'comm' payloads to MediaSink;
+//     - like IapTunnel.kt: one connection at a time, peer EOF keeps the port listening for a
+//       reconnect (read counter restarts at 0); a decrypt / framing failure or a socket error
+//       ends the tunnel AND the session.
 //   * POST /feedback responder reporting active audio streams' sampleRate, streamConnectionID,
 //     synced NTP timestamp, raw monotonic ns, and estimated sampleTime.
+//
+// Threading and lifetime:
+//   * Everything except submitMicrophonePcm() belongs to the reactor thread, the destructor
+//     included. Stop the capture thread (no more submitMicrophonePcm calls) before destroying
+//     the engine.
+//   * MediaSink callbacks run synchronously from the stream's own socket / timer callback and
+//     MAY re-enter the engine or the SessionServer, e.g. close the session from onVideoFrame()
+//     or onIapMessage(). A stream released that way delivers nothing further; pointers handed
+//     to the callback stay valid until it returns.
+//   * Sockets come out of the Reactor's fixed table: 1 per screen / iAP stream, 2 per audio
+//     stream.
 
 #include <stddef.h>
 #include <stdint.h>
@@ -147,6 +165,11 @@ struct MediaEngineConfig {
     /// Per-stream JitterBuffer capacity and reorder depth for LPCM downlink audio.
     size_t audio_jitter_capacity;
     uint16_t audio_jitter_reorder_depth;
+    /// Upper bound on concurrently open audio streams (each takes two reactor sockets). The
+    /// stream id is (type, audioType) with a peer-chosen audioType string, so without a bound a
+    /// verified peer could fill the reactor's socket table. A SETUP beyond the bound is declined;
+    /// replacing an existing (type, audioType) is always possible.
+    size_t max_audio_streams;
     /// Maximum allowed ScreenPacketHeader::payload_size (8 MiB in reference ScreenStream).
     size_t max_screen_payload_bytes;
     /// Maximum allowed APTransportPackage size on the iAP2 DataStream (4 MiB in reference).
@@ -160,6 +183,7 @@ struct MediaEngineConfig {
           mic_silent_start_ms(500),
           audio_jitter_capacity(audio::JitterBuffer::kDefaultCapacity),
           audio_jitter_reorder_depth(audio::JitterBuffer::kDefaultReorderDepth),
+          max_audio_streams(16),
           max_screen_payload_bytes(8U * 1024U * 1024U),
           max_iap_package_bytes(4U * 1024U * 1024U),
           enforce_peer_address(true) {}
@@ -184,9 +208,14 @@ public:
     /// for POST /feedback responses. When unset, ntp::ntpFromNanos(reactor.now()) is used.
     void setSyncedNtpCallback(SyncedNtpFn fn, void* ctx);
 
-    /// Optional callback invoked when a fatal error or unexpected peer EOF on a screen or
-    /// iAP2 stream requires closing the owning CarPlay session (ScreenStream.kt / IapTunnel.kt).
+    /// Optional callback invoked when a screen stream ends (peer EOF included) or the iAP2 tunnel
+    /// fails and the owning CarPlay session must close (ScreenStream.kt / IapTunnel.kt onClosed).
     void setCloseSessionCallback(SessionActionFn fn, void* ctx);
+
+    /// Forgets the two callbacks above if they were registered with `ctx` (their owner is going
+    /// away). Callbacks registered by someone else are left alone.
+    void clearSessionCallbacks(void* ctx);
+    bool hasSessionCallbacks() const { return synced_ntp_fn_ != NULL || close_session_fn_ != NULL; }
 
     // ---- session::MediaHandler implementation ----
     virtual bool onScreen(session::Session& session,
@@ -207,16 +236,20 @@ public:
 
     // ---- Microphone uplink ----
 
-    /// Reactor-thread only: pushes interleaved host-order int16 PCM samples into the active
-    /// microphone packetizer and sends each completed RTP frame over UDP to the phone.
-    /// Returns the number of UDP RTP packets transmitted (0 if buffered or no active mic).
+    /// Reactor-thread only: pushes interleaved host-order int16 PCM samples into the packetizer
+    /// of the most recently set up STARTED microphone and sends each completed RTP frame over UDP
+    /// to the phone. Returns the number of UDP RTP packets transmitted (0 if only buffered, or if
+    /// no microphone has started: such samples are discarded).
     size_t pushMicrophonePcm(const int16_t* samples, size_t sample_count);
 
     /// Thread-safe: queues captured PCM samples from an audio worker thread and wakes the
-    /// reactor to packetize and transmit them.
+    /// reactor to packetize and transmit them. false when nothing was queued: NULL / empty
+    /// input, the queue (about 1 s of 48 kHz stereo) is full, or the reactor refused the wake-up.
     bool submitMicrophonePcm(const int16_t* samples, size_t sample_count);
 
+    /// A microphone has started (onMicrophoneStarted was delivered and not yet stopped).
     bool microphoneActive() const;
+    /// Parameters of the most recently set up stream that wants a microphone, started or not.
     const audio::MicStreamParams* activeMicrophoneParams() const;
 
     // ---- Diagnostics / inspection ----
@@ -239,6 +272,8 @@ private:
     static void onMicWorkerPost(void* ctx);
     void drainSubmittedMicPcm();
     void closeAllStreams();
+    /// Releases an audio slot that is no longer in audios_ and reports it stopped to the sink.
+    void retireAudioSlot(AudioSlot* slot);
     bool peerAllowed(const Address& from) const;
     uint64_t currentSyncedNtp() const;
     void requestSessionClose();
