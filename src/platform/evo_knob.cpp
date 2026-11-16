@@ -28,6 +28,19 @@ bool isCarPlayKnobBit(uint8_t bit) {
     return bit == kCcsBtnMenu || bit == kCcsBtnBack || bit == kCcsBtnMedia || bit == kCcsBtnCom;
 }
 
+uint8_t hardKeyBit(CcsKey key) {
+    switch (key) {
+        case kCcsKeyMenu: return kCcsBtnMenu;
+        case kCcsKeyBack: return kCcsBtnBack;
+        case kCcsKeyOption: return kCcsBtnOption;
+        case kCcsKeyMedia: return kCcsBtnMedia;
+        case kCcsKeyNav: return kCcsBtnNav;
+        case kCcsKeyMap: return kCcsBtnMap;
+        case kCcsKeyCom: return kCcsBtnCom;
+        default: return 0U;
+    }
+}
+
 int decodeMflButton(const VmostMsgView& m, uint16_t fkt) {
     if (m.fblock != kVolumeFblock || m.inst != kVolumeMflInstance || m.fkt != fkt ||
         m.op != kMostOpStatus || m.data == NULL || m.len < 1U) {
@@ -110,20 +123,6 @@ bool decodeVolumeLevel(const VmostMsgView& m, VolumeLevel& out) {
 EvoKnob::EvoKnob()
     : mode_(kInputOff),
       query_older_immediately_(false),
-      event_cb_(NULL),
-      event_user_(NULL),
-      zbe3_cb_(NULL),
-      zbe3_user_(NULL),
-      mfl_tel_cb_(NULL),
-      mfl_tel_user_(NULL),
-      mfl_ptt_cb_(NULL),
-      mfl_ptt_user_(NULL),
-      hard_key_cb_(NULL),
-      hard_key_user_(NULL),
-      vol_cb_(NULL),
-      vol_user_(NULL),
-      level_cb_(NULL),
-      level_user_(NULL),
       running_(false),
       owned_(false),
       phone_to_idrive_(false),
@@ -139,6 +138,7 @@ EvoKnob::EvoKnob()
       ptt_forwarded_(false),
       sent_push_(false),
       sent_buttons_(0U),
+      hard_key_down_(0U),
       gets_(0U),
       messages_(0U),
       e5_messages_(0U) {
@@ -151,40 +151,42 @@ EvoKnob::~EvoKnob() {
     stop();
 }
 
+void EvoKnob::setEventCallback(EventCallback cb, void* user) {
+    detail::EvoStateLock lock(state_sync_);
+    event_slot_.setAndWaitLocked(cb, user, detail::currentCallbackThreadId(), state_sync_);
+}
+
 void EvoKnob::setZbe3Callback(Zbe3Callback cb, void* user) {
-    LockGuard lock(state_mutex_);
-    zbe3_cb_ = cb;
-    zbe3_user_ = user;
+    detail::EvoStateLock lock(state_sync_);
+    zbe3_slot_.setAndWaitLocked(cb, user, detail::currentCallbackThreadId(), state_sync_);
 }
 
 void EvoKnob::setMflTelephoneCallback(MflButtonCallback cb, void* user) {
-    LockGuard lock(state_mutex_);
-    mfl_tel_cb_ = cb;
-    mfl_tel_user_ = user;
+    detail::EvoStateLock lock(state_sync_);
+    mfl_tel_slot_.setAndWaitLocked(cb, user, detail::currentCallbackThreadId(), state_sync_);
 }
 
 void EvoKnob::setMflPttCallback(MflButtonCallback cb, void* user) {
-    LockGuard lock(state_mutex_);
-    mfl_ptt_cb_ = cb;
-    mfl_ptt_user_ = user;
+    detail::EvoStateLock lock(state_sync_);
+    mfl_ptt_slot_.setAndWaitLocked(cb, user, detail::currentCallbackThreadId(), state_sync_);
 }
 
 void EvoKnob::setHardKeyCallback(HardKeyCallback cb, void* user) {
-    LockGuard lock(state_mutex_);
-    hard_key_cb_ = cb;
-    hard_key_user_ = user;
+    detail::EvoStateLock lock(state_sync_);
+    if (cb != hard_key_slot_.fn || user != hard_key_slot_.user || cb == NULL) {
+        hard_key_down_ = 0U;
+    }
+    hard_key_slot_.setAndWaitLocked(cb, user, detail::currentCallbackThreadId(), state_sync_);
 }
 
 void EvoKnob::setVolumeCallback(VolumeCallback cb, void* user) {
-    LockGuard lock(state_mutex_);
-    vol_cb_ = cb;
-    vol_user_ = user;
+    detail::EvoStateLock lock(state_sync_);
+    vol_slot_.setAndWaitLocked(cb, user, detail::currentCallbackThreadId(), state_sync_);
 }
 
 void EvoKnob::setVolumeLevelCallback(VolumeLevelCallback cb, void* user) {
-    LockGuard lock(state_mutex_);
-    level_cb_ = cb;
-    level_user_ = user;
+    detail::EvoStateLock lock(state_sync_);
+    level_slot_.setAndWaitLocked(cb, user, detail::currentCallbackThreadId(), state_sync_);
 }
 
 void EvoKnob::setQueryOlderImmediately(bool immediate) {
@@ -197,22 +199,22 @@ void EvoKnob::setApiOverride(const VmostApi* api) {
 }
 
 void EvoKnob::setOwned(bool owned) {
-    LockGuard lock(state_mutex_);
+    detail::EvoStateLock lock(state_sync_);
     owned_ = owned;
 }
 
 bool EvoKnob::owned() const {
-    LockGuard lock(state_mutex_);
+    detail::EvoStateLock lock(state_sync_);
     return owned_;
 }
 
 void EvoKnob::setPhoneToIdrive(bool phone_to_idrive) {
-    LockGuard lock(state_mutex_);
+    detail::EvoStateLock lock(state_sync_);
     phone_to_idrive_ = phone_to_idrive;
 }
 
 bool EvoKnob::phoneToIdrive() const {
-    LockGuard lock(state_mutex_);
+    detail::EvoStateLock lock(state_sync_);
     return phone_to_idrive_;
 }
 
@@ -221,9 +223,9 @@ CcsProtocol::Kind EvoKnob::protocol() const {
 }
 
 void EvoKnob::attachForTest(InputMode mode, EventCallback cb, void* user) {
+    detail::EvoStateLock lock(state_sync_);
     mode_ = mode;
-    event_cb_ = cb;
-    event_user_ = user;
+    event_slot_.setAndWaitLocked(cb, user, detail::currentCallbackThreadId(), state_sync_);
 }
 
 void EvoKnob::pollTurnForTest() {
@@ -260,23 +262,25 @@ bool EvoKnob::start(const EvoKnobConfig& cfg, EventCallback cb, void* user) {
     if (started_ || cfg.mode == kInputOff) {
         return cfg.mode == kInputOff;
     }
-    mode_ = cfg.mode;
     query_older_immediately_ = cfg.query_older_immediately;
     protocol_.setQueryOlderImmediately(cfg.query_older_immediately);
     if (cfg.use_api_override) {
         vmost_.setApiOverride(&cfg.api_override);
     }
-    event_cb_ = cb;
-    event_user_ = user;
+    {
+        detail::EvoStateLock lock(state_sync_);
+        mode_ = cfg.mode;
+        event_slot_.setAndWaitLocked(cb, user, detail::currentCallbackThreadId(), state_sync_);
+    }
     if (!load()) {
         return false;
     }
     {
-        LockGuard lock(state_mutex_);
+        detail::EvoStateLock lock(state_sync_);
         running_ = true;
     }
     if (!thread_.start(&EvoKnob::threadEntry, this)) {
-        LockGuard lock(state_mutex_);
+        detail::EvoStateLock lock(state_sync_);
         running_ = false;
         CARPLAY_LOG_ERROR("knob", "cannot start vMOST reader thread");
         return false;
@@ -290,7 +294,7 @@ void EvoKnob::stop() {
         return;
     }
     {
-        LockGuard lock(state_mutex_);
+        detail::EvoStateLock lock(state_sync_);
         running_ = false;
     }
     thread_.join();
@@ -311,28 +315,30 @@ void EvoKnob::vmostCallback(void* msg, void* user) {
 void EvoKnob::emitZbe3(const hid::Zbe3Event& hw) {
     Zbe3Callback cb = NULL;
     void* user = NULL;
+    uint64_t gen = 0U;
+    const detail::CallbackThreadId tid = detail::currentCallbackThreadId();
+    bool entered = false;
     {
-        LockGuard lock(state_mutex_);
-        cb = zbe3_cb_;
-        user = zbe3_user_;
+        detail::EvoStateLock lock(state_sync_);
+        entered = zbe3_slot_.tryEnterLocked(tid, cb, user, gen);
     }
-    if (cb != NULL) {
+    if (entered) {
         cb(hw, user);
+        detail::EvoStateLock lock(state_sync_);
+        zbe3_slot_.exitLocked(tid, gen, state_sync_);
     }
 }
 
 void EvoKnob::releaseHeldKeys(const char* why) {
-    const bool had_held = sent_push_ || sent_buttons_ != 0U;
+    CcsEvent rel_evs[8];
+    int rel_n = 0;
     if (sent_push_) {
         sent_push_ = false;
-        if (event_cb_ != NULL) {
-            CcsEvent ev;
-            ev.kind = CcsEvent::kKey;
-            ev.key = kCcsKeyCenter;
-            ev.down = false;
-            ev.name = "RELEASE";
-            event_cb_(ev, event_user_);
-        }
+        CcsEvent& ev = rel_evs[rel_n++];
+        ev.kind = CcsEvent::kKey;
+        ev.key = kCcsKeyCenter;
+        ev.down = false;
+        ev.name = "RELEASE";
     }
     if (sent_buttons_ != 0U) {
         struct BitKey {
@@ -351,22 +357,49 @@ void EvoKnob::releaseHeldKeys(const char* why) {
         for (size_t i = 0; i < sizeof(kBits) / sizeof(kBits[0]); ++i) {
             if ((sent_buttons_ & kBits[i].bit) != 0U) {
                 sent_buttons_ &= static_cast<uint8_t>(~kBits[i].bit);
-                if (event_cb_ != NULL) {
-                    CcsEvent ev;
-                    ev.kind = CcsEvent::kKey;
-                    ev.key = kBits[i].key;
-                    ev.btn_mask = kBits[i].bit;
-                    ev.down = false;
-                    ev.name = "RELEASE";
-                    event_cb_(ev, event_user_);
-                }
+                CcsEvent& ev = rel_evs[rel_n++];
+                ev.kind = CcsEvent::kKey;
+                ev.key = kBits[i].key;
+                ev.btn_mask = kBits[i].bit;
+                ev.down = false;
+                ev.name = "RELEASE";
             }
         }
     }
-    if (had_held) {
-        CARPLAY_LOG_DEBUG("knob", "released held ZBE3 keys (%s)", why != NULL ? why : "");
-        hid::Zbe3Event zero;
-        emitZbe3(zero);
+    if (rel_n == 0) {
+        return;
+    }
+
+    CARPLAY_LOG_DEBUG("knob", "released held ZBE3 keys (%s)", why != NULL ? why : "");
+    const detail::CallbackThreadId tid = detail::currentCallbackThreadId();
+    EventCallback ecb = NULL;
+    void* euser = NULL;
+    uint64_t egen = 0U;
+    bool e_entered = false;
+    Zbe3Callback zcb = NULL;
+    void* zuser = NULL;
+    uint64_t zgen = 0U;
+    bool z_entered = false;
+    {
+        detail::EvoStateLock lock(state_sync_);
+        e_entered = event_slot_.tryEnterLocked(tid, ecb, euser, egen);
+        if (!e_entered) {
+            z_entered = zbe3_slot_.tryEnterLocked(tid, zcb, zuser, zgen);
+        }
+    }
+    if (e_entered) {
+        for (int i = 0; i < rel_n; ++i) {
+            ecb(rel_evs[i], euser);
+        }
+        detail::EvoStateLock lock(state_sync_);
+        event_slot_.exitLocked(tid, egen, state_sync_);
+        z_entered = zbe3_slot_.tryEnterLocked(tid, zcb, zuser, zgen);
+    }
+    if (z_entered) {
+        const hid::Zbe3Event zero;
+        zcb(zero, zuser);
+        detail::EvoStateLock lock(state_sync_);
+        zbe3_slot_.exitLocked(tid, zgen, state_sync_);
     }
 }
 
@@ -378,13 +411,17 @@ void EvoKnob::onMessage(const VmostMsgView& m) {
         if (decodeVolumeLevel(m, level)) {
             VolumeLevelCallback cb = NULL;
             void* user = NULL;
+            uint64_t gen = 0U;
+            const detail::CallbackThreadId tid = detail::currentCallbackThreadId();
+            bool entered = false;
             {
-                LockGuard lock(state_mutex_);
-                cb = level_cb_;
-                user = level_user_;
+                detail::EvoStateLock lock(state_sync_);
+                entered = level_slot_.tryEnterLocked(tid, cb, user, gen);
             }
-            if (cb != NULL) {
+            if (entered) {
                 cb(level, user);
+                detail::EvoStateLock lock(state_sync_);
+                level_slot_.exitLocked(tid, gen, state_sync_);
             }
         }
         return;
@@ -396,14 +433,19 @@ void EvoKnob::onMessage(const VmostMsgView& m) {
         if (decodeVolumeButton(m, &steps, &dir)) {
             VolumeCallback cb = NULL;
             void* user = NULL;
+            uint64_t gen = 0U;
+            const detail::CallbackThreadId tid = detail::currentCallbackThreadId();
+            bool entered = false;
             {
-                LockGuard lock(state_mutex_);
-                cb = vol_cb_;
-                user = vol_user_;
+                detail::EvoStateLock lock(state_sync_);
+                entered = vol_slot_.tryEnterLocked(tid, cb, user, gen);
             }
-            if (cb != NULL) {
+            if (entered) {
                 cb(steps, dir, user);
+                detail::EvoStateLock lock(state_sync_);
+                vol_slot_.exitLocked(tid, gen, state_sync_);
             }
+            return;
         }
 
         const int tel = decodeTelephoneButton(m);
@@ -411,32 +453,42 @@ void EvoKnob::onMessage(const VmostMsgView& m) {
             tel_down_ = true;
             MflButtonCallback cb = NULL;
             void* user = NULL;
-            bool allow = false;
+            uint64_t gen = 0U;
+            const detail::CallbackThreadId tid = detail::currentCallbackThreadId();
+            bool entered = false;
             {
-                LockGuard lock(state_mutex_);
-                cb = mfl_tel_cb_;
-                user = mfl_tel_user_;
-                allow = (mode_ == kInputForward && owned_ && !phone_to_idrive_ && cb != NULL);
+                detail::EvoStateLock lock(state_sync_);
+                if (mode_ == kInputForward && owned_ && !phone_to_idrive_) {
+                    entered = mfl_tel_slot_.tryEnterLocked(tid, cb, user, gen);
+                }
             }
-            if (allow) {
+            if (entered) {
                 tel_forwarded_ = true;
                 cb(true, user);
+                detail::EvoStateLock lock(state_sync_);
+                mfl_tel_slot_.exitLocked(tid, gen, state_sync_);
             }
+            return;
         } else if (tel == 0 && tel_down_) {
             tel_down_ = false;
             if (tel_forwarded_) {
                 tel_forwarded_ = false;
                 MflButtonCallback cb = NULL;
                 void* user = NULL;
+                uint64_t gen = 0U;
+                const detail::CallbackThreadId tid = detail::currentCallbackThreadId();
+                bool entered = false;
                 {
-                    LockGuard lock(state_mutex_);
-                    cb = mfl_tel_cb_;
-                    user = mfl_tel_user_;
+                    detail::EvoStateLock lock(state_sync_);
+                    entered = mfl_tel_slot_.tryEnterLocked(tid, cb, user, gen);
                 }
-                if (cb != NULL) {
+                if (entered) {
                     cb(false, user);
+                    detail::EvoStateLock lock(state_sync_);
+                    mfl_tel_slot_.exitLocked(tid, gen, state_sync_);
                 }
             }
+            return;
         }
 
         const int ptt = decodePttButton(m);
@@ -444,16 +496,20 @@ void EvoKnob::onMessage(const VmostMsgView& m) {
             ptt_down_ = true;
             MflButtonCallback cb = NULL;
             void* user = NULL;
-            bool allow = false;
+            uint64_t gen = 0U;
+            const detail::CallbackThreadId tid = detail::currentCallbackThreadId();
+            bool entered = false;
             {
-                LockGuard lock(state_mutex_);
-                cb = mfl_ptt_cb_;
-                user = mfl_ptt_user_;
-                allow = (mode_ == kInputForward && owned_ && cb != NULL);
+                detail::EvoStateLock lock(state_sync_);
+                if (mode_ == kInputForward && owned_) {
+                    entered = mfl_ptt_slot_.tryEnterLocked(tid, cb, user, gen);
+                }
             }
-            if (allow) {
+            if (entered) {
                 ptt_forwarded_ = true;
                 cb(true, user);
+                detail::EvoStateLock lock(state_sync_);
+                mfl_ptt_slot_.exitLocked(tid, gen, state_sync_);
             }
         } else if (ptt == 0 && ptt_down_) {
             ptt_down_ = false;
@@ -461,13 +517,17 @@ void EvoKnob::onMessage(const VmostMsgView& m) {
                 ptt_forwarded_ = false;
                 MflButtonCallback cb = NULL;
                 void* user = NULL;
+                uint64_t gen = 0U;
+                const detail::CallbackThreadId tid = detail::currentCallbackThreadId();
+                bool entered = false;
                 {
-                    LockGuard lock(state_mutex_);
-                    cb = mfl_ptt_cb_;
-                    user = mfl_ptt_user_;
+                    detail::EvoStateLock lock(state_sync_);
+                    entered = mfl_ptt_slot_.tryEnterLocked(tid, cb, user, gen);
                 }
-                if (cb != NULL) {
+                if (entered) {
                     cb(false, user);
+                    detail::EvoStateLock lock(state_sync_);
+                    mfl_ptt_slot_.exitLocked(tid, gen, state_sync_);
                 }
             }
         }
@@ -518,16 +578,32 @@ void EvoKnob::onMessage(const VmostMsgView& m) {
                                 m.len,
                                 ev,
                                 8);
-    const bool is_owned = owned();
-    const bool phone_idrive = phoneToIdrive();
-    const bool send = (mode_ == kInputForward && is_owned);
+    if (n <= 0) {
+        return;
+    }
 
+    const detail::CallbackThreadId tid = detail::currentCallbackThreadId();
     for (int i = 0; i < n; ++i) {
         if (ev[i].kind == CcsEvent::kRotary) {
-            if (send) {
-                if (event_cb_ != NULL) {
-                    event_cb_(ev[i], event_user_);
+            EventCallback ecb = NULL;
+            void* euser = NULL;
+            uint64_t egen = 0U;
+            bool e_entered = false;
+            Zbe3Callback zcb = NULL;
+            void* zuser = NULL;
+            uint64_t zgen = 0U;
+            bool z_entered = false;
+            {
+                detail::EvoStateLock lock(state_sync_);
+                if (mode_ == kInputForward && owned_) {
+                    e_entered = event_slot_.tryEnterLocked(tid, ecb, euser, egen);
+                    z_entered = zbe3_slot_.tryEnterLocked(tid, zcb, zuser, zgen);
                 }
+            }
+            if (e_entered) {
+                ecb(ev[i], euser);
+            }
+            if (z_entered) {
                 int rem = ev[i].delta;
                 while (rem != 0) {
                     int chunk = rem;
@@ -539,7 +615,16 @@ void EvoKnob::onMessage(const VmostMsgView& m) {
                     hw.button_mask = sent_buttons_;
                     hw.dir_mask = 0U;
                     hw.rotary_delta = static_cast<int8_t>(chunk);
-                    emitZbe3(hw);
+                    zcb(hw, zuser);
+                }
+            }
+            if (e_entered || z_entered) {
+                detail::EvoStateLock lock(state_sync_);
+                if (z_entered) {
+                    zbe3_slot_.exitLocked(tid, zgen, state_sync_);
+                }
+                if (e_entered) {
+                    event_slot_.exitLocked(tid, egen, state_sync_);
                 }
             }
             continue;
@@ -549,95 +634,143 @@ void EvoKnob::onMessage(const VmostMsgView& m) {
             continue;
         }
 
-        // Notify hard key observer (e.g. MENU / OPTION / NAV / MAP / BACK).
-        if (ev[i].key == kCcsKeyMenu || ev[i].key == kCcsKeyBack ||
-            ev[i].key == kCcsKeyOption || ev[i].key == kCcsKeyMedia ||
-            ev[i].key == kCcsKeyNav || ev[i].key == kCcsKeyMap ||
-            ev[i].key == kCcsKeyCom) {
-            HardKeyCallback hcb = NULL;
-            void* huser = NULL;
-            {
-                LockGuard lock(state_mutex_);
-                hcb = hard_key_cb_;
-                huser = hard_key_user_;
-            }
-            if (hcb != NULL &&
-                (send || !ev[i].down ||
-                 (mode_ == kInputForward && ev[i].key == kCcsKeyMedia))) {
-                hcb(ev[i].key, ev[i].down, ev[i].name, huser);
-            }
-        }
+        const uint8_t hbit = hardKeyBit(ev[i].key);
+        HardKeyCallback hcb = NULL;
+        void* huser = NULL;
+        uint64_t hgen = 0U;
+        bool h_entered = false;
 
-        if (ev[i].dir_mask != 0U) {
-            // Tilt: forward press and matching release (or press only for Zbe3Event wheel step).
-            if (ev[i].down) {
-                if (send) {
-                    if (event_cb_ != NULL) {
-                        event_cb_(ev[i], event_user_);
+        EventCallback ecb = NULL;
+        void* euser = NULL;
+        uint64_t egen = 0U;
+        bool e_entered = false;
+        Zbe3Callback zcb = NULL;
+        void* zuser = NULL;
+        uint64_t zgen = 0U;
+        bool z_entered = false;
+
+        bool forward_ccs = false;
+        bool emit_zbe3 = false;
+        hid::Zbe3Event zbe3_hw;
+
+        {
+            detail::EvoStateLock lock(state_sync_);
+            const bool send = (mode_ == kInputForward && owned_);
+            const bool phone_idrive = phone_to_idrive_;
+
+            if (hbit != 0U) {
+                if (ev[i].down) {
+                    if (send || (mode_ == kInputForward && ev[i].key == kCcsKeyMedia)) {
+                        h_entered = hard_key_slot_.tryEnterLocked(tid, hcb, huser, hgen);
+                        if (h_entered) {
+                            hard_key_down_ |= hbit;
+                        }
                     }
-                    hid::Zbe3Event hw;
-                    hw.center_pressed = sent_push_;
-                    hw.button_mask = sent_buttons_;
-                    hw.dir_mask = ev[i].dir_mask;
-                    hw.rotary_delta = 0;
-                    emitZbe3(hw);
+                } else if ((hard_key_down_ & hbit) != 0U) {
+                    hard_key_down_ &= static_cast<uint8_t>(~hbit);
+                    h_entered = hard_key_slot_.tryEnterLocked(tid, hcb, huser, hgen);
                 }
-            } else if (send && event_cb_ != NULL) {
-                event_cb_(ev[i], event_user_);
             }
-            continue;
-        }
 
-        if (ev[i].key == kCcsKeyCenter) {
-            bool forward = false;
-            if (ev[i].down) {
-                if (send) {
-                    sent_push_ = true;
-                    forward = true;
+            if (!h_entered) {
+                if (ev[i].dir_mask != 0U) {
+                    if (send) {
+                        forward_ccs = true;
+                        if (ev[i].down) {
+                            emit_zbe3 = true;
+                            zbe3_hw.center_pressed = sent_push_;
+                            zbe3_hw.button_mask = sent_buttons_;
+                            zbe3_hw.dir_mask = ev[i].dir_mask;
+                            zbe3_hw.rotary_delta = 0;
+                        }
+                    }
+                } else if (ev[i].key == kCcsKeyCenter) {
+                    if (ev[i].down) {
+                        if (send) {
+                            sent_push_ = true;
+                            forward_ccs = true;
+                        }
+                    } else if (sent_push_) {
+                        sent_push_ = false;
+                        forward_ccs = true;
+                    }
+                    if (forward_ccs) {
+                        emit_zbe3 = true;
+                        zbe3_hw.center_pressed = sent_push_;
+                        zbe3_hw.button_mask = sent_buttons_;
+                    }
+                } else {
+                    const uint8_t bit = ev[i].btn_mask;
+                    if (bit != 0U && isCarPlayKnobBit(bit) &&
+                        !(bit == kCcsBtnCom && phone_idrive && ev[i].down)) {
+                        if (ev[i].down) {
+                            if (send) {
+                                sent_buttons_ |= bit;
+                                forward_ccs = true;
+                            }
+                        } else if ((sent_buttons_ & bit) != 0U) {
+                            sent_buttons_ &= static_cast<uint8_t>(~bit);
+                            forward_ccs = true;
+                        }
+                        if (forward_ccs) {
+                            emit_zbe3 = true;
+                            zbe3_hw.center_pressed = sent_push_;
+                            zbe3_hw.button_mask = sent_buttons_;
+                        }
+                    }
                 }
-            } else if (sent_push_) {
-                sent_push_ = false;
-                forward = true;
-            }
-            if (forward) {
-                if (event_cb_ != NULL) {
-                    event_cb_(ev[i], event_user_);
+                if (forward_ccs) {
+                    e_entered = event_slot_.tryEnterLocked(tid, ecb, euser, egen);
                 }
-                hid::Zbe3Event hw;
-                hw.center_pressed = sent_push_;
-                hw.button_mask = sent_buttons_;
-                emitZbe3(hw);
+                if (emit_zbe3) {
+                    z_entered = zbe3_slot_.tryEnterLocked(tid, zcb, zuser, zgen);
+                }
             }
-            continue;
         }
 
-        const uint8_t bit = ev[i].btn_mask;
-        if (bit == 0U || !isCarPlayKnobBit(bit)) {
-            continue;
-        }
-        if (bit == kCcsBtnCom && phone_idrive && ev[i].down) {
-            continue;
+        if (h_entered) {
+            hcb(ev[i].key, ev[i].down, ev[i].name, huser);
+            detail::EvoStateLock lock(state_sync_);
+            hard_key_slot_.exitLocked(tid, hgen, state_sync_);
+
+            const bool send = (mode_ == kInputForward && owned_);
+            const bool phone_idrive = phone_to_idrive_;
+            const uint8_t bit = ev[i].btn_mask;
+            if (bit != 0U && isCarPlayKnobBit(bit) &&
+                !(bit == kCcsBtnCom && phone_idrive && ev[i].down)) {
+                if (ev[i].down) {
+                    if (send) {
+                        sent_buttons_ |= bit;
+                        forward_ccs = true;
+                    }
+                } else if ((sent_buttons_ & bit) != 0U) {
+                    sent_buttons_ &= static_cast<uint8_t>(~bit);
+                    forward_ccs = true;
+                }
+                if (forward_ccs) {
+                    emit_zbe3 = true;
+                    zbe3_hw.center_pressed = sent_push_;
+                    zbe3_hw.button_mask = sent_buttons_;
+                    e_entered = event_slot_.tryEnterLocked(tid, ecb, euser, egen);
+                    z_entered = zbe3_slot_.tryEnterLocked(tid, zcb, zuser, zgen);
+                }
+            }
         }
 
-        bool forward = false;
-        if (ev[i].down) {
-            if (send) {
-                sent_buttons_ |= bit;
-                forward = true;
-            }
-        } else if ((sent_buttons_ & bit) != 0U) {
-            sent_buttons_ &= static_cast<uint8_t>(~bit);
-            forward = true;
+        if (e_entered) {
+            ecb(ev[i], euser);
         }
-
-        if (forward) {
-            if (event_cb_ != NULL) {
-                event_cb_(ev[i], event_user_);
+        if (z_entered) {
+            zcb(zbe3_hw, zuser);
+        }
+        if (e_entered || z_entered) {
+            detail::EvoStateLock lock(state_sync_);
+            if (z_entered) {
+                zbe3_slot_.exitLocked(tid, zgen, state_sync_);
             }
-            hid::Zbe3Event hw;
-            hw.center_pressed = sent_push_;
-            hw.button_mask = sent_buttons_;
-            emitZbe3(hw);
+            if (e_entered) {
+                event_slot_.exitLocked(tid, egen, state_sync_);
+            }
         }
     }
 }
@@ -727,7 +860,7 @@ void EvoKnob::run() {
 #ifndef _WIN32
         for (;;) {
             {
-                LockGuard lock(state_mutex_);
+                detail::EvoStateLock lock(state_sync_);
                 if (!running_) {
                     break;
                 }

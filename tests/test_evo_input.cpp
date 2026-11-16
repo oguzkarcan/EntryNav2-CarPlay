@@ -36,6 +36,7 @@
 #include <vector>
 
 #ifndef _WIN32
+#include <pthread.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
@@ -718,9 +719,58 @@ struct LoopbackPhone {
 // ---- Recording helpers for callbacks ----
 
 struct TouchRecord {
+    plat::Mutex mutex;
+#ifndef _WIN32
+    pthread_mutex_t cv_mu;
+    pthread_cond_t cv;
+#endif
     std::vector<plat::TouchEventOut> events;
+
+    TouchRecord() {
+#ifndef _WIN32
+        pthread_mutex_init(&cv_mu, NULL);
+        pthread_cond_init(&cv, NULL);
+#endif
+    }
+    ~TouchRecord() {
+#ifndef _WIN32
+        pthread_cond_destroy(&cv);
+        pthread_mutex_destroy(&cv_mu);
+#endif
+    }
+
     static void cb(const plat::TouchEventOut& ev, void* user) {
-        static_cast<TouchRecord*>(user)->events.push_back(ev);
+        TouchRecord* r = static_cast<TouchRecord*>(user);
+        {
+            plat::LockGuard lock(r->mutex);
+            r->events.push_back(ev);
+        }
+#ifndef _WIN32
+        pthread_mutex_lock(&r->cv_mu);
+        pthread_cond_broadcast(&r->cv);
+        pthread_mutex_unlock(&r->cv_mu);
+#endif
+    }
+
+    size_t waitCount(size_t target) {
+#ifndef _WIN32
+        pthread_mutex_lock(&cv_mu);
+        for (;;) {
+            size_t cur = 0U;
+            {
+                plat::LockGuard lock(mutex);
+                cur = events.size();
+            }
+            if (cur >= target) {
+                pthread_mutex_unlock(&cv_mu);
+                return cur;
+            }
+            pthread_cond_wait(&cv, &cv_mu);
+        }
+#else
+        plat::LockGuard lock(mutex);
+        return events.size();
+#endif
     }
 };
 
@@ -1321,16 +1371,15 @@ TEST_CASE(testEvoTouchUdpWorkerAndTimeout) {
              static_cast<int>(sender.sendTo(frame, sizeof(frame), plat::Address::ipv4Loopback(port))));
 
     // Wait for kPress via UDP worker
-    const int64_t dl1 = plat::monotonicMillis() + 2000;
-    while (plat::monotonicMillis() < dl1) {
-        if (!rec.events.empty()) break;
-        sleepMs(5);
-    }
+    REQUIRE(rec.waitCount(1U) >= 1U);
     touch.stop();
-    REQUIRE(!rec.events.empty());
-    CHECK_EQ(static_cast<int>(plat::TouchEventOut::kPress), rec.events[0].action);
-    CHECK_EQ(250, rec.events[0].p[0].x);
-    CHECK_EQ(180, rec.events[0].p[0].y);
+    {
+        plat::LockGuard lock(rec.mutex);
+        REQUIRE(!rec.events.empty());
+        CHECK_EQ(static_cast<int>(plat::TouchEventOut::kPress), rec.events[0].action);
+        CHECK_EQ(250, rec.events[0].p[0].x);
+        CHECK_EQ(180, rec.events[0].p[0].y);
+    }
 
     // Timeout release check (synchronous test helper)
     TouchRecord rec2;
@@ -1340,10 +1389,16 @@ TEST_CASE(testEvoTouchUdpWorkerAndTimeout) {
     t2.attachForTest(plat::kInputForward, &TouchRecord::cb, &rec2);
     t2.feedUdpPayload(frame, sizeof(frame), 0x7F000001U, 30501U, 1000U);
     t2.checkTimeoutForTest(1200U);
-    CHECK_EQ(1U, rec2.events.size());
+    {
+        plat::LockGuard lock(rec2.mutex);
+        CHECK_EQ(1U, rec2.events.size());
+    }
     t2.checkTimeoutForTest(1400U);
-    REQUIRE(rec2.events.size() == 2U);
-    CHECK_EQ(static_cast<int>(plat::TouchEventOut::kRelease), rec2.events[1].action);
+    {
+        plat::LockGuard lock(rec2.mutex);
+        REQUIRE(rec2.events.size() == 2U);
+        CHECK_EQ(static_cast<int>(plat::TouchEventOut::kRelease), rec2.events[1].action);
+    }
 }
 
 // =============================================================================================
@@ -1565,6 +1620,1400 @@ TEST_CASE(testEvoInputBridgeE2eOverEncryptedEventChannel) {
     bridge.detach();
     server.stop();
     g_fake_vmost = NULL;
+}
+
+// =============================================================================================
+// 5. Barriers, cancelPosted, enqueue failure, reassembly, 0xC47/0xC4F, hard-key pairing, TSan
+// =============================================================================================
+
+#ifndef _WIN32
+struct TestCondSignal {
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    bool flag;
+
+    TestCondSignal() : flag(false) {
+        pthread_mutex_init(&mu, NULL);
+        pthread_cond_init(&cv, NULL);
+    }
+    ~TestCondSignal() {
+        pthread_cond_destroy(&cv);
+        pthread_mutex_destroy(&mu);
+    }
+    void set() {
+        pthread_mutex_lock(&mu);
+        flag = true;
+        pthread_cond_broadcast(&cv);
+        pthread_mutex_unlock(&mu);
+    }
+    void reset() {
+        pthread_mutex_lock(&mu);
+        flag = false;
+        pthread_mutex_unlock(&mu);
+    }
+    bool isSet() {
+        pthread_mutex_lock(&mu);
+        const bool v = flag;
+        pthread_mutex_unlock(&mu);
+        return v;
+    }
+    void wait() {
+        pthread_mutex_lock(&mu);
+        while (!flag) {
+            pthread_cond_wait(&cv, &mu);
+        }
+        pthread_mutex_unlock(&mu);
+    }
+};
+
+struct BarrierCbState {
+    TestCondSignal entered;
+    TestCondSignal allow_return;
+    TestCondSignal exited;
+    TestCondSignal clearer_started;
+    TestCondSignal clearer_returned;
+    plat::Mutex count_mu;
+    int calls;
+    bool reentrant_clear;
+    plat::EvoTouch* touch;
+    plat::EvoKnob* knob;
+    int which_knob_cb;  // 0=zbe3, 1=hard_key, 2=vol, 3=level, 4=tel, 5=ptt, 6=event
+
+    BarrierCbState()
+        : calls(0), reentrant_clear(false), touch(NULL), knob(NULL), which_knob_cb(0) {}
+
+    static void touchCb(const plat::TouchEventOut& /*ev*/, void* user) {
+        BarrierCbState* s = static_cast<BarrierCbState*>(user);
+        {
+            plat::LockGuard lock(s->count_mu);
+            ++s->calls;
+        }
+        if (s->reentrant_clear && s->touch != NULL) {
+            s->touch->setCallback(NULL, NULL);
+            s->exited.set();
+            return;
+        }
+        s->entered.set();
+        s->allow_return.wait();
+        s->exited.set();
+    }
+
+    void handleKnobEnter() {
+        {
+            plat::LockGuard lock(count_mu);
+            ++calls;
+        }
+        if (reentrant_clear && knob != NULL) {
+            switch (which_knob_cb) {
+                case 0: knob->setZbe3Callback(NULL, NULL); break;
+                case 1: knob->setHardKeyCallback(NULL, NULL); break;
+                case 2: knob->setVolumeCallback(NULL, NULL); break;
+                case 3: knob->setVolumeLevelCallback(NULL, NULL); break;
+                case 4: knob->setMflTelephoneCallback(NULL, NULL); break;
+                case 5: knob->setMflPttCallback(NULL, NULL); break;
+                case 6: knob->setEventCallback(NULL, NULL); break;
+            }
+            exited.set();
+            return;
+        }
+        entered.set();
+        allow_return.wait();
+        exited.set();
+    }
+
+    static void knobZbe3Cb(const hid::Zbe3Event& /*hw*/, void* user) {
+        static_cast<BarrierCbState*>(user)->handleKnobEnter();
+    }
+    static void knobHardKeyCb(plat::CcsKey /*k*/, bool /*p*/, const char* /*n*/, void* user) {
+        static_cast<BarrierCbState*>(user)->handleKnobEnter();
+    }
+    static void knobVolCb(unsigned /*steps*/, uint8_t /*dir*/, void* user) {
+        static_cast<BarrierCbState*>(user)->handleKnobEnter();
+    }
+    static void knobLevelCb(const plat::VolumeLevel& /*lvl*/, void* user) {
+        static_cast<BarrierCbState*>(user)->handleKnobEnter();
+    }
+    static void knobMflCb(bool /*pressed*/, void* user) {
+        static_cast<BarrierCbState*>(user)->handleKnobEnter();
+    }
+    static void knobEventCb(const plat::CcsEvent& /*ev*/, void* user) {
+        static_cast<BarrierCbState*>(user)->handleKnobEnter();
+    }
+
+    static void clearTouchThread(void* arg) {
+        BarrierCbState* s = static_cast<BarrierCbState*>(arg);
+        s->clearer_started.set();
+        s->touch->setCallback(NULL, NULL);
+        s->clearer_returned.set();
+    }
+
+    static void clearKnobThread(void* arg) {
+        BarrierCbState* s = static_cast<BarrierCbState*>(arg);
+        s->clearer_started.set();
+        switch (s->which_knob_cb) {
+            case 0: s->knob->setZbe3Callback(NULL, NULL); break;
+            case 1: s->knob->setHardKeyCallback(NULL, NULL); break;
+            case 2: s->knob->setVolumeCallback(NULL, NULL); break;
+            case 3: s->knob->setVolumeLevelCallback(NULL, NULL); break;
+            case 4: s->knob->setMflTelephoneCallback(NULL, NULL); break;
+            case 5: s->knob->setMflPttCallback(NULL, NULL); break;
+            case 6: s->knob->setEventCallback(NULL, NULL); break;
+        }
+        s->clearer_returned.set();
+    }
+};
+
+void waitFakeGets(FakeVmostServer& fake, size_t target) {
+    const int64_t dl = plat::monotonicMillis() + 3000;
+    while (plat::monotonicMillis() < dl) {
+        {
+            plat::LockGuard lock(fake.mutex);
+            if (fake.sent_gets.size() >= target) {
+                return;
+            }
+        }
+        sleepMs(1);
+    }
+}
+
+void noopPostedTask(void* /*ctx*/) {}
+
+struct ConcurrentEnqueueArgs {
+    plat::EvoInputBridge* bridge;
+    pthread_mutex_t* mu;
+    pthread_cond_t* cv;
+    int* ready_count;
+    bool* go;
+    unsigned steps;
+    uint8_t dir;
+    bool result;
+
+    static void run(void* p) {
+        ConcurrentEnqueueArgs* a = static_cast<ConcurrentEnqueueArgs*>(p);
+        pthread_mutex_lock(a->mu);
+        ++(*a->ready_count);
+        pthread_cond_broadcast(a->cv);
+        while (!(*a->go)) {
+            pthread_cond_wait(a->cv, a->mu);
+        }
+        pthread_mutex_unlock(a->mu);
+        a->result = a->bridge->submitVolumeStep(a->steps, a->dir);
+    }
+};
+
+struct DisplayScaleWorkerArgs {
+    plat::EvoTouch* touch;
+    TestCondSignal start;
+    TestCondSignal stop;
+    int mode;  // 0 = scale/offset, 1 = displaySize
+
+    static void run(void* p) {
+        DisplayScaleWorkerArgs* a = static_cast<DisplayScaleWorkerArgs*>(p);
+        a->start.wait();
+        bool alt = false;
+        while (!a->stop.isSet()) {
+            alt = !alt;
+            if (a->mode == 0) {
+                if (alt) {
+                    a->touch->setScaleOffset(2.0, 2.0, 1000.0, 1000.0);
+                } else {
+                    a->touch->setScaleOffset(1.0, 1.0, 0.0, 0.0);
+                }
+            } else {
+                if (alt) {
+                    a->touch->setDisplaySize(1200U, 720U);
+                } else {
+                    a->touch->setDisplaySize(800U, 480U);
+                }
+            }
+            const int cnt = a->touch->activeCount();
+            (void)cnt;
+        }
+    }
+};
+
+bool expectEventReports(LoopbackPhone& phone,
+                        size_t expected_count,
+                        std::vector<bplist::Value>& out_cmds) {
+    return phone.readEventCommands(expected_count, out_cmds, 3000);
+}
+
+void injectKnobBarrierMsg(FakeVmostServer& fake, int kind, bool first) {
+    const uint8_t menu_dn[7] = {0, 0, 1, 1, 0, 0x00U, 0x01U};
+    const uint8_t menu_up[7] = {0, 0, 2, 0, 0, 0x00U, 0x00U};
+    const uint8_t vol_dn[2] = {1U, 1U};
+    const uint8_t lvl_msg[5] = {0U, 0U, 20U, 0U, 64U};
+    const uint8_t btn_dn[1] = {1U};
+    const uint8_t btn_up[1] = {0U};
+
+    switch (kind) {
+        case 0:
+        case 1:
+        case 6:
+            REQUIRE(fake.inject(0xE5U, 0x01U, 0xC20U, 0xCU, first ? menu_dn : menu_up, 7U));
+            break;
+        case 2:
+            REQUIRE(fake.inject(0x15U, 0x0CU, 0xC01U, 0xCU, vol_dn, 2U));
+            break;
+        case 3:
+            REQUIRE(fake.inject(0x20U, 0x00U, 0xC08U, 0xCU, lvl_msg, 5U));
+            break;
+        case 4:
+            REQUIRE(fake.inject(0x15U, 0x02U, 0x400U, 0xCU, first ? btn_dn : btn_up, 1U));
+            break;
+        case 5:
+            REQUIRE(fake.inject(0x15U, 0x02U, 0x512U, 0xCU, first ? btn_dn : btn_up, 1U));
+            break;
+    }
+}
+#endif  // !_WIN32
+
+TEST_CASE(testTouchReassemblyAndMalformedIpv4Udp) {
+    plat::RawTouchContact c;
+    c.id = 0;
+    c.state = 1;
+    c.x = 320;
+    c.y = 240;
+    c.size = 10;
+
+    uint8_t frame[plat::touchpdu::kFrameBytes];
+    plat::buildTouchFrame(frame, &c, 1, 1U, 0xFAU);  // 12 recs: 0xFA..0xFF, 0x00..0x05
+
+    const int recs[3] = {4, 4, 4};
+    uint8_t dg[plat::touchpdu::kFrameBytes * 3];
+    int sizes[3] = {0, 0, 0};
+    REQUIRE(plat::splitTouchFrame(frame, recs, 3, dg, sizes) == 3);
+
+    plat::TouchReassembler r;
+    plat::TouchMsg msgs[plat::kTouchMaxMsgs];
+
+    // 1. Sequence wrap from 0xFF to 0x00 across fragment boundary (part 0 has FA..FD, part 1 has FE..01).
+    CHECK_EQ(0, r.feed(dg, static_cast<size_t>(sizes[0]), msgs, plat::kTouchMaxMsgs));
+    CHECK_EQ(0, r.feed(dg + plat::touchpdu::kFrameBytes, static_cast<size_t>(sizes[1]), msgs,
+                       plat::kTouchMaxMsgs));
+    CHECK_EQ(1, r.feed(dg + plat::touchpdu::kFrameBytes * 2, static_cast<size_t>(sizes[2]), msgs,
+                       plat::kTouchMaxMsgs));
+    CHECK_EQ(static_cast<uint8_t>(0xFAU), msgs[0].seq0);
+    CHECK_EQ(static_cast<uint8_t>(0x05U), msgs[0].seq1);
+    CHECK_EQ(0U, r.dropped());
+
+    // 2. Out-of-order fragments: part 2 before part 1 -> dropped, then part 1 ignored, then recovery.
+    r.reset();
+    CHECK_EQ(0, r.feed(dg, static_cast<size_t>(sizes[0]), msgs, plat::kTouchMaxMsgs));
+    CHECK_EQ(0, r.feed(dg + plat::touchpdu::kFrameBytes * 2, static_cast<size_t>(sizes[2]), msgs,
+                       plat::kTouchMaxMsgs));
+    CHECK_EQ(1U, r.dropped());
+    CHECK_EQ(0, r.feed(dg + plat::touchpdu::kFrameBytes, static_cast<size_t>(sizes[1]), msgs,
+                       plat::kTouchMaxMsgs));
+    CHECK_EQ(1, r.feed(frame, sizeof(frame), msgs, plat::kTouchMaxMsgs));
+
+    // 3. Duplicate fragment -> seq != last_seq + 1 drops incomplete frame, next frame recovers.
+    r.reset();
+    CHECK_EQ(0, r.feed(dg, static_cast<size_t>(sizes[0]), msgs, plat::kTouchMaxMsgs));
+    CHECK_EQ(0, r.feed(dg, static_cast<size_t>(sizes[0]), msgs, plat::kTouchMaxMsgs));
+    CHECK_EQ(1U, r.dropped());
+    CHECK_EQ(1, r.feed(frame, sizeof(frame), msgs, plat::kTouchMaxMsgs));
+
+    // 4. Missing middle fragment followed by recovery on next frame.
+    r.reset();
+    CHECK_EQ(0, r.feed(dg, static_cast<size_t>(sizes[0]), msgs, plat::kTouchMaxMsgs));
+    CHECK_EQ(0, r.feed(dg + plat::touchpdu::kFrameBytes * 2, static_cast<size_t>(sizes[2]), msgs,
+                       plat::kTouchMaxMsgs));
+    CHECK_EQ(1U, r.dropped());
+    CHECK_EQ(1, r.feed(frame, sizeof(frame), msgs, plat::kTouchMaxMsgs));
+
+    // 5. Bad record header mid-frame increments dropped() and returns -1.
+    r.reset();
+    CHECK_EQ(0, r.feed(dg, static_cast<size_t>(sizes[0]), msgs, plat::kTouchMaxMsgs));
+    uint8_t bad_rec[plat::touchpdu::kHeader + plat::touchpdu::kRecord];
+    memcpy(bad_rec, dg + plat::touchpdu::kFrameBytes, sizeof(bad_rec));
+    bad_rec[7] = static_cast<uint8_t>(sizeof(bad_rec) - 8U);
+    bad_rec[plat::touchpdu::kHeader] = 0x01U;  // record[0] != 0x00
+    CHECK_EQ(-1, r.feed(bad_rec, sizeof(bad_rec), msgs, plat::kTouchMaxMsgs));
+    CHECK_EQ(1U, r.dropped());
+
+    uint8_t bad_type[plat::touchpdu::kHeader + plat::touchpdu::kRecord];
+    memcpy(bad_type, frame, sizeof(bad_type));
+    bad_type[7] = static_cast<uint8_t>(sizeof(bad_type) - 8U);
+    bad_type[plat::touchpdu::kHeader + 1] = 0x05U;  // (type & 0xC0) != 0xC0
+    CHECK_EQ(-1, r.feed(bad_type, sizeof(bad_type), msgs, plat::kTouchMaxMsgs));
+
+    // 6. More than 32 records (33 records) drops cleanly without buffer overflow.
+    r.reset();
+    const size_t n33 = plat::touchpdu::kHeader + plat::touchpdu::kRecord * 33U;
+    Bytes long_frame(n33, 0U);
+    long_frame[0] = 0xB0U;
+    long_frame[1] = 0x04U;
+    long_frame[2] = 0x80U;
+    long_frame[3] = 0x02U;
+    long_frame[6] = static_cast<uint8_t>(((n33 - 8U) >> 8) & 0xFFU);
+    long_frame[7] = static_cast<uint8_t>((n33 - 8U) & 0xFFU);
+    for (int i = 0; i < 33; ++i) {
+        uint8_t* rec_p = &long_frame[plat::touchpdu::kHeader + plat::touchpdu::kRecord * i];
+        rec_p[0] = 0x00U;
+        rec_p[1] = (i == 0) ? 0xC5U : (i == 32 ? 0xC3U : 0xC1U);
+        rec_p[2] = 0x40U;
+        rec_p[3] = static_cast<uint8_t>(i);
+    }
+    CHECK_EQ(0, r.feed(&long_frame[0], long_frame.size(), msgs, plat::kTouchMaxMsgs));
+    CHECK_EQ(1U, r.dropped());
+
+    // 7. Malformed IPv4/UDP inputs to parseIpv4Udp.
+    const uint8_t payload[4] = {0xB0U, 0x04U, 0x80U, 0x02U};
+    plat::UdpView u;
+    CHECK(!plat::parseIpv4Udp(NULL, 32U, u));
+
+    Bytes base = buildIpv4Udp(0x7F000001U, 0x7F000001U, 30501U, 30567U, payload, sizeof(payload));
+    // IHL < 20 (version=4, IHL=4 => 16 bytes)
+    Bytes bad_ihl = base;
+    bad_ihl[0] = 0x44U;
+    CHECK(!plat::parseIpv4Udp(&bad_ihl[0], bad_ihl.size(), u));
+
+    // UDP length < 8
+    Bytes bad_ulen_small = base;
+    bad_ulen_small[24] = 0U;
+    bad_ulen_small[25] = 7U;
+    CHECK(!plat::parseIpv4Udp(&bad_ulen_small[0], bad_ulen_small.size(), u));
+
+    // UDP length > IP payload
+    Bytes bad_ulen_big = base;
+    bad_ulen_big[24] = 0U;
+    bad_ulen_big[25] = 64U;
+    CHECK(!plat::parseIpv4Udp(&bad_ulen_big[0], bad_ulen_big.size(), u));
+
+    // Fragmented IPv4: MF bit and non-zero fragment offset
+    const Bytes mf_frag = buildIpv4Udp(0x7F000001U, 0x7F000001U, 1U, 30567U, payload, 4U, 0x2000U);
+    CHECK(!plat::parseIpv4Udp(&mf_frag[0], mf_frag.size(), u));
+    const Bytes off_frag = buildIpv4Udp(0x7F000001U, 0x7F000001U, 1U, 30567U, payload, 4U, 0x0001U);
+    CHECK(!plat::parseIpv4Udp(&off_frag[0], off_frag.size(), u));
+
+    // Truncated datagram (total > n, and n < 20)
+    CHECK(!plat::parseIpv4Udp(&base[0], base.size() - 1U, u));
+    CHECK(!plat::parseIpv4Udp(&base[0], 19U, u));
+}
+
+TEST_CASE(testKnobC47C4fRealDecodeAndMalformedPayloads) {
+    // 1. Real decode path through CcsDecoder::feed() and EvoKnob::onMessage() for 0xC47 and 0xC4F.
+    for (int fkt_idx = 0; fkt_idx < 2; ++fkt_idx) {
+        const uint16_t fkt = (fkt_idx == 0) ? 0xC47U : 0xC4FU;
+        const uint16_t len = (fkt_idx == 0) ? 7U : 8U;
+
+        plat::CcsDecoder dec;
+        plat::CcsEvent ev[8];
+        // Press MENU(1), rest BACK(4 -> 0), no-info OPTION(7 -> keeps 0)
+        const uint8_t d1[8] = {1U, 4U, 7U, 0U, 0U, 0U, 0U, 0U};
+        CHECK_EQ(1, dec.feed(0xE5U, 0x03U, fkt, 0xCU, d1, len, ev, 8));
+        CHECK_EQ(static_cast<int>(plat::kCcsKeyMenu), static_cast<int>(ev[0].key));
+        CHECK(ev[0].down);
+        // No-info(7) on MENU keeps pressed; 4 on COM (from 0) emits nothing; 2 on BACK presses BACK
+        const uint8_t d2[8] = {7U, 2U, 0U, 4U, 0U, 0U, 0U, 0U};
+        CHECK_EQ(1, dec.feed(0xE5U, 0x03U, fkt, 0xCU, d2, len, ev, 8));
+        CHECK_EQ(static_cast<int>(plat::kCcsKeyBack), static_cast<int>(ev[0].key));
+        CHECK(ev[0].down);
+        // 4 on MENU (rest) releases MENU; 7 on BACK keeps BACK down
+        const uint8_t d3[8] = {4U, 7U, 0U, 0U, 0U, 0U, 0U, 0U};
+        CHECK_EQ(1, dec.feed(0xE5U, 0x03U, fkt, 0xCU, d3, len, ev, 8));
+        CHECK_EQ(static_cast<int>(plat::kCcsKeyMenu), static_cast<int>(ev[0].key));
+        CHECK(!ev[0].down);
+        // 0 on BACK releases BACK
+        const uint8_t d4[8] = {0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U};
+        CHECK_EQ(1, dec.feed(0xE5U, 0x03U, fkt, 0xCU, d4, len, ev, 8));
+        CHECK_EQ(static_cast<int>(plat::kCcsKeyBack), static_cast<int>(ev[0].key));
+        CHECK(!ev[0].down);
+
+        // Full EvoKnob::onMessage() path with 0xC47 / 0xC4F
+        KnobRecord rec;
+        plat::EvoKnob knob;
+        knob.setOwned(true);
+        knob.setHardKeyCallback(&KnobRecord::onHardKey, &rec);
+        knob.setZbe3Callback(&KnobRecord::onZbe3, &rec);
+        knob.attachForTest(plat::kInputForward, &KnobRecord::onCcs, &rec);
+
+        knob.onMessage(msgView(0xE5U, 0x03U, fkt, 0xCU, d1, len));
+        knob.onMessage(msgView(0xE5U, 0x03U, fkt, 0xCU, d2, len));
+        knob.onMessage(msgView(0xE5U, 0x03U, fkt, 0xCU, d3, len));
+        knob.onMessage(msgView(0xE5U, 0x03U, fkt, 0xCU, d4, len));
+
+        REQUIRE(rec.hard_keys.size() == 4U);
+        CHECK_EQ(static_cast<int>(plat::kCcsKeyMenu), static_cast<int>(rec.hard_keys[0].key));
+        CHECK(rec.hard_keys[0].pressed);
+        CHECK_EQ(static_cast<int>(plat::kCcsKeyBack), static_cast<int>(rec.hard_keys[1].key));
+        CHECK(rec.hard_keys[1].pressed);
+        CHECK_EQ(static_cast<int>(plat::kCcsKeyMenu), static_cast<int>(rec.hard_keys[2].key));
+        CHECK(!rec.hard_keys[2].pressed);
+        CHECK_EQ(static_cast<int>(plat::kCcsKeyBack), static_cast<int>(rec.hard_keys[3].key));
+        CHECK(!rec.hard_keys[3].pressed);
+    }
+
+    // 2. Short, oversized, and malformed payloads across all handled message IDs (ASan coverage).
+    KnobRecord mal_rec;
+    plat::EvoKnob mal_knob;
+    mal_knob.setOwned(true);
+    mal_knob.setZbe3Callback(&KnobRecord::onZbe3, &mal_rec);
+    mal_knob.setMflTelephoneCallback(&KnobRecord::onTel, &mal_rec);
+    mal_knob.setMflPttCallback(&KnobRecord::onPtt, &mal_rec);
+    mal_knob.setHardKeyCallback(&KnobRecord::onHardKey, &mal_rec);
+    mal_knob.setVolumeCallback(&KnobRecord::onVolStep, &mal_rec);
+    mal_knob.setVolumeLevelCallback(&KnobRecord::onVolLevel, &mal_rec);
+    mal_knob.attachForTest(plat::kInputForward, &KnobRecord::onCcs, &mal_rec);
+
+    const uint8_t junk[16] = {
+        0xFFU, 0x07U, 0xFFU, 0x09U, 0x00U, 0x00U, 0x00U, 0x00U,
+        0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U
+    };
+    const uint8_t bad_lvl_bounds[5] = {0U, 0U, 10U, 20U, 20U};  // max <= min
+    const uint8_t bad_lvl_low[5] = {0U, 0U, 5U, 10U, 50U};     // value < min
+    const uint8_t bad_lvl_high[5] = {0U, 0U, 60U, 10U, 50U};   // value > max
+    const uint8_t bad_vol_dir[4] = {3U, 1U, 0U, 1U};           // dir != 1 && dir != 2
+    const uint8_t bad_mfl_val[1] = {2U};
+
+    // Non-status ops & NULL payloads (including non-zero len with NULL data)
+    mal_knob.onMessage(msgView(0xE5U, 0x03U, 0xC46U, 0xCU, NULL, 0U));
+    mal_knob.onMessage(msgView(0xE5U, 0x03U, 0xC46U, 0xCU, NULL, 5U));
+    mal_knob.onMessage(msgView(0xE5U, 0x03U, 0xC46U, 0xCU, junk, 4U));  // < 5
+    mal_knob.onMessage(msgView(0xE5U, 0x03U, 0xC47U, 0xCU, NULL, 7U));
+    mal_knob.onMessage(msgView(0xE5U, 0x03U, 0xC47U, 0xCU, junk, 0U));
+    mal_knob.onMessage(msgView(0xE5U, 0x03U, 0xC4FU, 0xCU, junk, 12U)); // > 8
+    mal_knob.onMessage(msgView(0xE5U, 0x03U, 0xC46U, 0x1U, junk, 5U));  // OpGet ignored
+    mal_knob.onMessage(msgView(0x15U, 0x0CU, 0xC01U, 0xCU, junk, 1U));  // < 2
+    mal_knob.onMessage(msgView(0x15U, 0x0CU, 0xC01U, 0xCU, bad_vol_dir, 2U));
+    mal_knob.onMessage(msgView(0x15U, 0x02U, 0x401U, 0xCU, junk, 3U));  // < 4
+    mal_knob.onMessage(msgView(0x15U, 0x02U, 0x401U, 0xCU, bad_vol_dir, 4U));
+    mal_knob.onMessage(msgView(0x15U, 0x02U, 0x400U, 0xCU, NULL, 1U));
+    mal_knob.onMessage(msgView(0x15U, 0x02U, 0x400U, 0xCU, bad_mfl_val, 1U));
+    mal_knob.onMessage(msgView(0x15U, 0x02U, 0x512U, 0xCU, junk, 0U));
+    mal_knob.onMessage(msgView(0x15U, 0x02U, 0x512U, 0xCU, bad_mfl_val, 1U));
+    mal_knob.onMessage(msgView(0x20U, 0x00U, 0xC08U, 0xCU, junk, 4U));  // < 5
+    mal_knob.onMessage(msgView(0x20U, 0x00U, 0xC08U, 0xCU, bad_lvl_bounds, 5U));
+    mal_knob.onMessage(msgView(0x20U, 0x00U, 0xC08U, 0xCU, bad_lvl_low, 5U));
+    mal_knob.onMessage(msgView(0x20U, 0x00U, 0xC08U, 0xCU, bad_lvl_high, 5U));
+
+    // Separate knob for older E5.01 protocol malformed payloads (protocol locks onto E5.01)
+    KnobRecord e501_rec;
+    plat::EvoKnob e501_knob;
+    e501_knob.setOwned(true);
+    e501_knob.setHardKeyCallback(&KnobRecord::onHardKey, &e501_rec);
+    e501_knob.setZbe3Callback(&KnobRecord::onZbe3, &e501_rec);
+    e501_knob.attachForTest(plat::kInputForward, &KnobRecord::onCcs, &e501_rec);
+    e501_knob.onMessage(msgView(0xE5U, 0x01U, 0xC10U, 0xCU, NULL, 7U));
+    e501_knob.onMessage(msgView(0xE5U, 0x01U, 0xC10U, 0xCU, junk, 3U));  // < 4
+    e501_knob.onMessage(msgView(0xE5U, 0x01U, 0xC10U, 0xCU, junk, 7U));  // d[2]==0xFF
+    e501_knob.onMessage(msgView(0xE5U, 0x01U, 0xC20U, 0xCU, junk, 6U));  // < 7
+    e501_knob.onMessage(msgView(0xE5U, 0x01U, 0xC20U, 0xCU, junk, 7U));  // d[2]==0xFF
+
+    CHECK(mal_rec.ccs.empty());
+    CHECK(mal_rec.zbe3.empty());
+    CHECK(mal_rec.tel.empty());
+    CHECK(mal_rec.ptt.empty());
+    CHECK(mal_rec.hard_keys.empty());
+    CHECK(mal_rec.vol_steps.empty());
+    CHECK(mal_rec.vol_levels.empty());
+    CHECK(e501_rec.ccs.empty());
+    CHECK(e501_rec.hard_keys.empty());
+}
+
+TEST_CASE(testKnobHardKeyPairingAndComToggle) {
+    const uint8_t menu_dn[7] = {0, 0, 1, 1, 0, 0x00U, 0x01U};
+    const uint8_t menu_up[7] = {0, 0, 2, 0, 0, 0x00U, 0x00U};
+    const uint8_t med_dn[7] = {0, 0, 3, 1, 0, 0x00U, 0x08U};
+    const uint8_t med_up[7] = {0, 0, 4, 0, 0, 0x00U, 0x00U};
+    const uint8_t com_dn[7] = {0, 0, 5, 1, 0, 0x00U, 0x40U};
+    const uint8_t com_up[7] = {0, 0, 6, 0, 0, 0x00U, 0x00U};
+
+    // 1. Observe mode: press and release suppress BOTH press and release for all hard keys incl MEDIA.
+    {
+        KnobRecord rec;
+        plat::EvoKnob knob;
+        knob.setOwned(true);
+        knob.setHardKeyCallback(&KnobRecord::onHardKey, &rec);
+        knob.attachForTest(plat::kInputObserve, &KnobRecord::onCcs, &rec);
+        knob.onMessage(msgView(0xE5U, 0x01U, 0xC20U, 0xCU, menu_dn, 7U));
+        knob.onMessage(msgView(0xE5U, 0x01U, 0xC20U, 0xCU, menu_up, 7U));
+        knob.onMessage(msgView(0xE5U, 0x01U, 0xC20U, 0xCU, med_dn, 7U));
+        knob.onMessage(msgView(0xE5U, 0x01U, 0xC20U, 0xCU, med_up, 7U));
+        CHECK(rec.hard_keys.empty());
+        CHECK(rec.ccs.empty());
+    }
+
+    // 2. Forward mode while not owned: MENU/COM suppressed cleanly (no unpaired release), MEDIA paired.
+    {
+        KnobRecord rec;
+        plat::EvoKnob knob;
+        knob.setOwned(false);
+        knob.setHardKeyCallback(&KnobRecord::onHardKey, &rec);
+        knob.setZbe3Callback(&KnobRecord::onZbe3, &rec);
+        knob.attachForTest(plat::kInputForward, &KnobRecord::onCcs, &rec);
+
+        knob.onMessage(msgView(0xE5U, 0x01U, 0xC20U, 0xCU, menu_dn, 7U));
+        knob.onMessage(msgView(0xE5U, 0x01U, 0xC20U, 0xCU, menu_up, 7U));
+        knob.onMessage(msgView(0xE5U, 0x01U, 0xC20U, 0xCU, com_dn, 7U));
+        knob.onMessage(msgView(0xE5U, 0x01U, 0xC20U, 0xCU, com_up, 7U));
+        CHECK(rec.hard_keys.empty());
+
+        knob.onMessage(msgView(0xE5U, 0x01U, 0xC20U, 0xCU, med_dn, 7U));
+        knob.onMessage(msgView(0xE5U, 0x01U, 0xC20U, 0xCU, med_up, 7U));
+        REQUIRE(rec.hard_keys.size() == 2U);
+        CHECK_EQ(static_cast<int>(plat::kCcsKeyMedia), static_cast<int>(rec.hard_keys[0].key));
+        CHECK(rec.hard_keys[0].pressed);
+        CHECK_EQ(static_cast<int>(plat::kCcsKeyMedia), static_cast<int>(rec.hard_keys[1].key));
+        CHECK(!rec.hard_keys[1].pressed);
+        CHECK(rec.zbe3.empty());
+    }
+
+    // 3. Press started while not owned -> setOwned(true) -> release: no lone release on hard_key or zbe3.
+    {
+        KnobRecord rec;
+        plat::EvoKnob knob;
+        knob.setOwned(false);
+        knob.setHardKeyCallback(&KnobRecord::onHardKey, &rec);
+        knob.setZbe3Callback(&KnobRecord::onZbe3, &rec);
+        knob.attachForTest(plat::kInputForward, &KnobRecord::onCcs, &rec);
+
+        knob.onMessage(msgView(0xE5U, 0x01U, 0xC20U, 0xCU, menu_dn, 7U));
+        knob.setOwned(true);
+        knob.onMessage(msgView(0xE5U, 0x01U, 0xC20U, 0xCU, menu_up, 7U));
+        CHECK(rec.hard_keys.empty());
+        CHECK(rec.zbe3.empty());
+
+        // MEDIA press started while !owned -> setOwned(true) -> release: paired hard_key, no lone zbe3 release.
+        knob.setOwned(false);
+        knob.onMessage(msgView(0xE5U, 0x01U, 0xC20U, 0xCU, med_dn, 7U));
+        knob.setOwned(true);
+        knob.onMessage(msgView(0xE5U, 0x01U, 0xC20U, 0xCU, med_up, 7U));
+        REQUIRE(rec.hard_keys.size() == 2U);
+        CHECK(rec.hard_keys[0].pressed);
+        CHECK(!rec.hard_keys[1].pressed);
+        CHECK(rec.zbe3.empty());
+    }
+
+    // 4. Ownership lost mid-hold: zbe3 releases on pollTurnForTest (once), hard_key pairs on physical release.
+    {
+        KnobRecord rec;
+        plat::EvoKnob knob;
+        knob.setOwned(true);
+        knob.setHardKeyCallback(&KnobRecord::onHardKey, &rec);
+        knob.setZbe3Callback(&KnobRecord::onZbe3, &rec);
+        knob.attachForTest(plat::kInputForward, &KnobRecord::onCcs, &rec);
+
+        knob.onMessage(msgView(0xE5U, 0x01U, 0xC20U, 0xCU, menu_dn, 7U));
+        REQUIRE(rec.zbe3.size() == 1U);
+        CHECK_EQ(hid::zbe3::kBtnMenu, rec.zbe3[0].button_mask);
+
+        knob.setOwned(false);
+        knob.pollTurnForTest();
+        REQUIRE(rec.zbe3.size() == 2U);
+        CHECK_EQ(static_cast<uint8_t>(0U), rec.zbe3[1].button_mask);
+
+        knob.onMessage(msgView(0xE5U, 0x01U, 0xC20U, 0xCU, menu_up, 7U));
+        CHECK_EQ(2U, rec.zbe3.size());  // no duplicate zbe3 release
+        REQUIRE(rec.hard_keys.size() == 2U);
+        CHECK_EQ(static_cast<int>(plat::kCcsKeyMenu), static_cast<int>(rec.hard_keys[0].key));
+        CHECK(rec.hard_keys[0].pressed);
+        CHECK_EQ(static_cast<int>(plat::kCcsKeyMenu), static_cast<int>(rec.hard_keys[1].key));
+        CHECK(!rec.hard_keys[1].pressed);
+    }
+
+    // 5. COM phone_to_idrive toggled mid-hold keeps COM release unblocked, and replacing hard_key_cb drops old down state.
+    {
+        KnobRecord rec;
+        plat::EvoKnob knob;
+        knob.setOwned(true);
+        knob.setPhoneToIdrive(false);
+        knob.setHardKeyCallback(&KnobRecord::onHardKey, &rec);
+        knob.setZbe3Callback(&KnobRecord::onZbe3, &rec);
+        knob.attachForTest(plat::kInputForward, &KnobRecord::onCcs, &rec);
+
+        knob.onMessage(msgView(0xE5U, 0x01U, 0xC20U, 0xCU, com_dn, 7U));
+        REQUIRE(rec.zbe3.size() == 1U);
+        CHECK_EQ(hid::zbe3::kBtnCom, rec.zbe3[0].button_mask);
+
+        knob.setPhoneToIdrive(true);
+        knob.onMessage(msgView(0xE5U, 0x01U, 0xC20U, 0xCU, com_up, 7U));
+        REQUIRE(rec.zbe3.size() == 2U);
+        CHECK_EQ(static_cast<uint8_t>(0U), rec.zbe3[1].button_mask);
+        REQUIRE(rec.hard_keys.size() == 2U);
+        CHECK(rec.hard_keys[0].pressed);
+        CHECK(!rec.hard_keys[1].pressed);
+
+        // Replacing hard_key callback mid-hold must not give new observer an unpaired release.
+        KnobRecord rec2;
+        knob.onMessage(msgView(0xE5U, 0x01U, 0xC20U, 0xCU, menu_dn, 7U));
+        knob.setHardKeyCallback(&KnobRecord::onHardKey, &rec2);
+        knob.onMessage(msgView(0xE5U, 0x01U, 0xC20U, 0xCU, menu_up, 7U));
+        CHECK(rec2.hard_keys.empty());
+    }
+}
+
+TEST_CASE(testEvoKnobAndEvoTouchCallbackBarriers) {
+#ifdef _WIN32
+    return;
+#endif
+    // 1. EvoTouch UDP worker barrier: clear waits for blocked cb, ignores subsequent frames, and supports re-entrancy.
+    {
+        plat::EvoTouch touch;
+        touch.setDisplaySize(800, 480);
+        touch.setOwned(true);
+
+        BarrierCbState state;
+        state.touch = &touch;
+        REQUIRE(touch.startUdpForTest(0, plat::kInputForward, &BarrierCbState::touchCb, &state));
+        const uint16_t port = touch.boundUdpPort();
+        REQUIRE(port > 0U);
+
+        plat::UdpSocket sender;
+        REQUIRE(sender.open(plat::Address::ipv4Loopback(0)));
+
+        uint8_t frame[plat::touchpdu::kFrameBytes];
+        plat::RawTouchContact c;
+        c.id = 0;
+        c.state = 1;
+        c.x = 120;
+        c.y = 220;
+        plat::buildTouchFrame(frame, &c, 1, 1U, 0x00U);
+        REQUIRE(sender.sendTo(frame, sizeof(frame), plat::Address::ipv4Loopback(port)) == plat::kIoOk);
+
+        state.entered.wait();
+
+        plat::Thread clearer;
+        REQUIRE(clearer.start(&BarrierCbState::clearTouchThread, &state));
+        state.clearer_started.wait();
+        // Callback has not returned yet; clearer must still be blocked on the barrier.
+        CHECK(!state.exited.isSet());
+        CHECK(!state.clearer_returned.isSet());
+
+        state.allow_return.set();
+        state.clearer_returned.wait();
+        clearer.join();
+        CHECK(state.exited.isSet());
+
+        // Keep sending frames while callback is NULL, then install TouchRecord and send a fresh frame.
+        c.state = 3;
+        plat::buildTouchFrame(frame, &c, 1, 2U, 0x0CU);
+        REQUIRE(sender.sendTo(frame, sizeof(frame), plat::Address::ipv4Loopback(port)) == plat::kIoOk);
+
+        TouchRecord post_rec;
+        touch.setCallback(&TouchRecord::cb, &post_rec);
+        c.state = 1;
+        c.x = 300;
+        c.y = 310;
+        plat::buildTouchFrame(frame, &c, 1, 3U, 0x18U);
+        REQUIRE(sender.sendTo(frame, sizeof(frame), plat::Address::ipv4Loopback(port)) == plat::kIoOk);
+        REQUIRE(post_rec.waitCount(1U) >= 1U);
+
+        {
+            plat::LockGuard lock(state.count_mu);
+            CHECK_EQ(1, state.calls);
+        }
+
+        // Re-entrant clear from inside EvoTouch callback on UDP worker thread does not deadlock.
+        BarrierCbState re_state;
+        re_state.touch = &touch;
+        re_state.reentrant_clear = true;
+        touch.setCallback(&BarrierCbState::touchCb, &re_state);
+        c.state = 3;
+        plat::buildTouchFrame(frame, &c, 1, 4U, 0x24U);
+        REQUIRE(sender.sendTo(frame, sizeof(frame), plat::Address::ipv4Loopback(port)) == plat::kIoOk);
+        re_state.exited.wait();
+
+        touch.stop();
+    }
+
+    // 2. EvoKnob worker barriers across callback kinds + re-entrant clear.
+    for (int kind = 0; kind < 7; ++kind) {
+        FakeVmostServer fake;
+        REQUIRE(fake.init());
+        g_fake_vmost = &fake;
+
+        plat::EvoKnob knob;
+        knob.setOwned(true);
+
+        BarrierCbState state;
+        state.knob = &knob;
+        state.which_knob_cb = kind;
+
+        plat::EvoKnobConfig kcfg;
+        kcfg.mode = plat::kInputForward;
+        kcfg.query_older_immediately = true;
+        kcfg.use_api_override = true;
+        kcfg.api_override = makeFakeVmostApi();
+
+        plat::EvoKnob::EventCallback init_ecb = NULL;
+        void* init_euser = NULL;
+        switch (kind) {
+            case 0: knob.setZbe3Callback(&BarrierCbState::knobZbe3Cb, &state); break;
+            case 1: knob.setHardKeyCallback(&BarrierCbState::knobHardKeyCb, &state); break;
+            case 2: knob.setVolumeCallback(&BarrierCbState::knobVolCb, &state); break;
+            case 3: knob.setVolumeLevelCallback(&BarrierCbState::knobLevelCb, &state); break;
+            case 4: knob.setMflTelephoneCallback(&BarrierCbState::knobMflCb, &state); break;
+            case 5: knob.setMflPttCallback(&BarrierCbState::knobMflCb, &state); break;
+            case 6:
+                init_ecb = &BarrierCbState::knobEventCb;
+                init_euser = &state;
+                break;
+        }
+        REQUIRE(knob.start(kcfg, init_ecb, init_euser));
+        waitFakeGets(fake, 10U);
+
+        injectKnobBarrierMsg(fake, kind, true);
+        state.entered.wait();
+
+        plat::Thread clearer;
+        REQUIRE(clearer.start(&BarrierCbState::clearKnobThread, &state));
+        state.clearer_started.wait();
+        CHECK(!state.exited.isSet());
+        CHECK(!state.clearer_returned.isSet());
+
+        state.allow_return.set();
+        state.clearer_returned.wait();
+        clearer.join();
+        CHECK(state.exited.isSet());
+
+        // Inject another matching message while cleared, then a different sentinel message to wait on.
+        injectKnobBarrierMsg(fake, kind, false);
+        BarrierCbState sentinel;
+        sentinel.knob = &knob;
+        sentinel.allow_return.set();
+        const int sentinel_kind = (kind == 2) ? 3 : 2;
+        if (sentinel_kind == 2) {
+            knob.setVolumeCallback(&BarrierCbState::knobVolCb, &sentinel);
+        } else {
+            knob.setVolumeLevelCallback(&BarrierCbState::knobLevelCb, &sentinel);
+        }
+        injectKnobBarrierMsg(fake, sentinel_kind, true);
+        sentinel.exited.wait();
+
+        {
+            plat::LockGuard lock(state.count_mu);
+            CHECK_EQ(1, state.calls);
+        }
+
+        // Re-entrant clear on worker thread for zbe3 (0) and hard_key (1).
+        if (kind == 0 || kind == 1) {
+            BarrierCbState re_state;
+            re_state.knob = &knob;
+            re_state.which_knob_cb = kind;
+            re_state.reentrant_clear = true;
+            if (kind == 0) {
+                knob.setZbe3Callback(&BarrierCbState::knobZbe3Cb, &re_state);
+            } else {
+                knob.setHardKeyCallback(&BarrierCbState::knobHardKeyCb, &re_state);
+            }
+            const uint8_t opt_dn[7] = {0, 0, 3, 1, 0, 0x00U, 0x04U};
+            const uint8_t rot1[7] = {0, 1, 1, 0x00U, 0x10U, 0x1EU, 0x00U};
+            const uint8_t rot2[7] = {0, 1, 2, 0x00U, 0x11U, 0x1EU, 0x00U};
+            if (kind == 1) {
+                REQUIRE(fake.inject(0xE5U, 0x01U, 0xC20U, 0xCU, opt_dn, 7U));
+            } else {
+                REQUIRE(fake.inject(0xE5U, 0x01U, 0xC10U, 0xCU, rot1, 7U));
+                REQUIRE(fake.inject(0xE5U, 0x01U, 0xC10U, 0xCU, rot2, 7U));
+            }
+            re_state.exited.wait();
+        }
+
+        knob.stop();
+        g_fake_vmost = NULL;
+    }
+}
+
+TEST_CASE(testBridgeDetachDestroyWhileWorkersBusyAndCancelPosted) {
+#ifdef _WIN32
+    return;
+#endif
+    plat::Reactor reactor;
+    REQUIRE(reactor.init());
+
+    DetRng rng("evo-barrier-cancel");
+    pairing::Identity identity;
+    REQUIRE(pairing::generateIdentity(rng, identity));
+    pairing::InMemoryPairingStore store;
+    session::SessionListener sess_listener;
+    session::MediaHandler media_handler;
+    const info::AirPlayConfig cfg = info::bmwEntryNav2_800x480(true);
+    plat::SessionServerConfig srv_cfg;
+    srv_cfg.control_port = 0;
+    srv_cfg.ntp_request_interval_ms = 0;
+    plat::SessionServer server(reactor, cfg, identity, store, rng, sess_listener, media_handler,
+                               NULL, srv_cfg);
+    REQUIRE(server.start(plat::Address::ipv4Loopback(0)));
+
+    // 1. cancelPosted with a drain task pending in Reactor queue when bridge is destroyed (ASan check).
+    {
+        ListenerRecord listener;
+        plat::EvoInputBridge* bridge =
+            new plat::EvoInputBridge(reactor, server, plat::EvoInputBridgeConfig(), &listener);
+        REQUIRE(bridge->submitVolumeStep(3U, 1U));
+        REQUIRE(bridge->submitHardKey(plat::kCcsKeyMenu, true, "MENU"));
+        delete bridge;
+        // Pending drain task must have been cancelled; running the reactor must not touch freed bridge.
+        CHECK_EQ(0, reactor.runOnce(0));
+        CHECK(listener.vol_steps.empty());
+        CHECK(listener.ui_keys.empty());
+    }
+
+    // 2. detach() and ~EvoInputBridge() while EvoKnob and EvoTouch workers are actively running (not stopped first).
+    for (int mode = 0; mode < 2; ++mode) {
+        FakeVmostServer fake;
+        REQUIRE(fake.init());
+        g_fake_vmost = &fake;
+
+        ListenerRecord listener;
+        plat::EvoInputBridge* bridge =
+            new plat::EvoInputBridge(reactor, server, plat::EvoInputBridgeConfig(), &listener);
+        plat::EvoKnob knob;
+        plat::EvoTouch touch;
+        bridge->attach(&knob, &touch);
+        bridge->setOwned(true);
+
+        plat::EvoKnobConfig kcfg;
+        kcfg.mode = plat::kInputForward;
+        kcfg.query_older_immediately = true;
+        kcfg.use_api_override = true;
+        kcfg.api_override = makeFakeVmostApi();
+        REQUIRE(knob.start(kcfg, NULL, NULL));
+        REQUIRE(touch.startUdpForTest(0, plat::kInputForward, NULL, NULL));
+        waitFakeGets(fake, 10U);
+
+        plat::UdpSocket sender;
+        REQUIRE(sender.open(plat::Address::ipv4Loopback(0)));
+        uint8_t frame[plat::touchpdu::kFrameBytes];
+        plat::RawTouchContact c;
+        c.id = 0;
+        c.state = 1;
+        c.x = 150;
+        c.y = 150;
+
+        for (int i = 0; i < 20; ++i) {
+            const uint8_t rot[7] = {0, 1, static_cast<uint8_t>(i + 1), 0x00U,
+                                    static_cast<uint8_t>(0x10U + i), 0x1EU, 0x00U};
+            REQUIRE(fake.inject(0xE5U, 0x01U, 0xC10U, 0xCU, rot, 7U));
+            plat::buildTouchFrame(frame, &c, 1, static_cast<uint8_t>(i + 1),
+                                  static_cast<uint8_t>((i * 12) & 0xFF));
+            REQUIRE(sender.sendTo(frame, sizeof(frame),
+                                  plat::Address::ipv4Loopback(touch.boundUdpPort())) == plat::kIoOk);
+        }
+
+        // Pump reactor briefly so some events arrive, then detach/destroy while workers are still active.
+        reactor.runOnce(10);
+
+        // Keep feeding input right up to and around detach/delete without stopping workers first.
+        const uint8_t rot_more[7] = {0, 1, 25, 0x00U, 0x30U, 0x1EU, 0x00U};
+        REQUIRE(fake.inject(0xE5U, 0x01U, 0xC10U, 0xCU, rot_more, 7U));
+        plat::buildTouchFrame(frame, &c, 1, 25U, 0xF0U);
+        REQUIRE(sender.sendTo(frame, sizeof(frame),
+                              plat::Address::ipv4Loopback(touch.boundUdpPort())) == plat::kIoOk);
+
+        if (mode == 0) {
+            bridge->detach();
+            // Workers are STILL running; inject more input to verify detached bridge receives nothing.
+            const uint8_t rot_after[7] = {0, 1, 26, 0x00U, 0x32U, 0x1EU, 0x00U};
+            REQUIRE(fake.inject(0xE5U, 0x01U, 0xC10U, 0xCU, rot_after, 7U));
+            delete bridge;
+        } else {
+            // Destroy directly without prior detach() while workers still run.
+            delete bridge;
+        }
+
+        reactor.runOnce(0);
+        knob.stop();
+        touch.stop();
+        g_fake_vmost = NULL;
+    }
+
+    server.stop();
+}
+
+TEST_CASE(testBridgeEnqueueWhenReactorPostFailsConcurrentProducers) {
+#ifdef _WIN32
+    return;
+#endif
+    plat::Reactor reactor;
+    REQUIRE(reactor.init());
+
+    DetRng rng("evo-enqueue-fail");
+    pairing::Identity identity;
+    REQUIRE(pairing::generateIdentity(rng, identity));
+    pairing::InMemoryPairingStore store;
+    session::SessionListener sess_listener;
+    session::MediaHandler media_handler;
+    const info::AirPlayConfig cfg = info::bmwEntryNav2_800x480(true);
+    plat::SessionServerConfig srv_cfg;
+    srv_cfg.control_port = 0;
+    srv_cfg.ntp_request_interval_ms = 0;
+    plat::SessionServer server(reactor, cfg, identity, store, rng, sess_listener, media_handler,
+                               NULL, srv_cfg);
+
+    ListenerRecord listener;
+    plat::EvoInputBridge bridge(reactor, server, plat::EvoInputBridgeConfig(), &listener);
+
+    // 1. Fill Reactor posted queue completely so both concurrent producers fail Reactor::post().
+    for (size_t i = 0; i < plat::Reactor::kMaxPostedTasks; ++i) {
+        REQUIRE(reactor.post(&noopPostedTask, NULL));
+    }
+    CHECK(!reactor.post(&noopPostedTask, NULL));
+
+    pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
+    pthread_cond_t cv = PTHREAD_COND_INITIALIZER;
+    int ready = 0;
+    bool go = false;
+
+    ConcurrentEnqueueArgs a1;
+    a1.bridge = &bridge;
+    a1.mu = &mu;
+    a1.cv = &cv;
+    a1.ready_count = &ready;
+    a1.go = &go;
+    a1.steps = 11U;
+    a1.dir = 1U;
+    a1.result = true;
+
+    ConcurrentEnqueueArgs a2 = a1;
+    a2.steps = 22U;
+    a2.dir = 2U;
+
+    plat::Thread t1;
+    plat::Thread t2;
+    REQUIRE(t1.start(&ConcurrentEnqueueArgs::run, &a1));
+    REQUIRE(t2.start(&ConcurrentEnqueueArgs::run, &a2));
+
+    pthread_mutex_lock(&mu);
+    while (ready < 2) {
+        pthread_cond_wait(&cv, &mu);
+    }
+    go = true;
+    pthread_cond_broadcast(&cv);
+    pthread_mutex_unlock(&mu);
+
+    t1.join();
+    t2.join();
+
+    CHECK(!a1.result);
+    CHECK(!a2.result);
+
+    // Drain all dummy tasks: neither failed submission may be stranded in queue_.
+    while (reactor.runOnce(0) > 0) {
+    }
+    CHECK(listener.vol_steps.empty());
+
+    // Subsequent valid submission must succeed and deliver cleanly.
+    REQUIRE(bridge.submitVolumeStep(42U, 1U));
+    while (reactor.runOnce(0) > 0) {
+    }
+    REQUIRE(listener.vol_steps.size() == 1U);
+    CHECK_EQ(42U, listener.vol_steps[0].steps);
+    CHECK_EQ(static_cast<uint8_t>(1U), listener.vol_steps[0].dir);
+
+    // 2. One slot free: two concurrent producers coalesce into one Reactor::post() and both arrive.
+    listener.vol_steps.clear();
+    for (size_t i = 0; i + 1U < plat::Reactor::kMaxPostedTasks; ++i) {
+        REQUIRE(reactor.post(&noopPostedTask, NULL));
+    }
+    ready = 0;
+    go = false;
+    a1.result = false;
+    a2.result = false;
+    REQUIRE(t1.start(&ConcurrentEnqueueArgs::run, &a1));
+    REQUIRE(t2.start(&ConcurrentEnqueueArgs::run, &a2));
+
+    pthread_mutex_lock(&mu);
+    while (ready < 2) {
+        pthread_cond_wait(&cv, &mu);
+    }
+    go = true;
+    pthread_cond_broadcast(&cv);
+    pthread_mutex_unlock(&mu);
+
+    t1.join();
+    t2.join();
+
+    CHECK(a1.result);
+    CHECK(a2.result);
+
+    while (reactor.runOnce(0) > 0) {
+    }
+    CHECK_EQ(2U, listener.vol_steps.size());
+
+    pthread_cond_destroy(&cv);
+    pthread_mutex_destroy(&mu);
+}
+
+TEST_CASE(testBridgeFocusLossHidBytesAndWorkerTouchPath) {
+#ifdef _WIN32
+    return;
+#endif
+    FakeVmostServer fake;
+    REQUIRE(fake.init());
+    g_fake_vmost = &fake;
+
+    plat::Reactor reactor;
+    REQUIRE(reactor.init());
+
+    DetRng rng("evo-focus-loss");
+    pairing::Identity identity;
+    REQUIRE(pairing::generateIdentity(rng, identity));
+    pairing::InMemoryPairingStore store;
+    LoopbackPhone phone(reactor, "phone-focus", "11223344-5566-4777-8888-99AABBCCDDEF");
+    phone.acc_id = identity.pairing_id;
+    phone.acc_ltpk.assign(identity.keys.public_key, identity.keys.public_key + 32);
+    REQUIRE(store.save(phone.id, phone.ltsk.public_key));
+
+    session::SessionListener sess_listener;
+    session::MediaHandler media_handler;
+    const info::AirPlayConfig cfg = info::bmwEntryNav2_800x480(true);
+    plat::SessionServerConfig srv_cfg;
+    srv_cfg.control_port = 0;
+    srv_cfg.ntp_request_interval_ms = 0;
+    plat::SessionServer server(reactor, cfg, identity, store, rng, sess_listener, media_handler,
+                               NULL, srv_cfg);
+    REQUIRE(server.start(plat::Address::ipv4Loopback(0)));
+
+    REQUIRE(phone.connectControl(plat::Address::ipv4Loopback(server.controlPort())));
+    REQUIRE(phone.pairVerify());
+    plat::UdpSocket phone_timing;
+    REQUIRE(phone_timing.open(plat::Address::ipv4Loopback(0)));
+    int64_t srv_event_port = 0;
+    REQUIRE(phone.setupSession(phone_timing.port(), srv_event_port));
+    REQUIRE(phone.connectEvent(plat::Address::ipv4Loopback(static_cast<uint16_t>(srv_event_port))));
+
+    ListenerRecord ui_listener;
+    plat::EvoInputBridgeConfig br_cfg;
+    br_cfg.display_width = 800;
+    br_cfg.display_height = 480;
+    plat::EvoInputBridge bridge(reactor, server, br_cfg, &ui_listener);
+
+    plat::EvoKnob knob;
+    plat::EvoTouch touch;
+    bridge.attach(&knob, &touch);
+    bridge.setOwned(true);
+
+    plat::EvoKnobConfig kcfg;
+    kcfg.mode = plat::kInputForward;
+    kcfg.query_older_immediately = true;
+    kcfg.use_api_override = true;
+    kcfg.api_override = makeFakeVmostApi();
+    REQUIRE(knob.start(kcfg, NULL, NULL));
+    REQUIRE(touch.startUdpForTest(0, plat::kInputForward, NULL, NULL));
+    waitFakeGets(fake, 10U);
+
+    // 1. Hold MENU + center PUSH + UDP touch contact while owned.
+    const uint8_t menu_dn[7] = {0, 0, 1, 1, 0, 0x00U, 0x01U};
+    const uint8_t push_dn[7] = {0, 0, 2, 1, 0, 0x1EU, 0x01U};
+    REQUIRE(fake.inject(0xE5U, 0x01U, 0xC20U, 0xCU, menu_dn, 7U));
+    REQUIRE(fake.inject(0xE5U, 0x01U, 0xC20U, 0xCU, push_dn, 7U));
+
+    plat::UdpSocket sender;
+    REQUIRE(sender.open(plat::Address::ipv4Loopback(0)));
+    uint8_t frame[plat::touchpdu::kFrameBytes];
+    plat::RawTouchContact tc;
+    tc.id = 0;
+    tc.state = 1;
+    tc.x = 321;
+    tc.y = 222;
+    plat::buildTouchFrame(frame, &tc, 1, 1U, 0x00U);
+    REQUIRE(sender.sendTo(frame, sizeof(frame),
+                          plat::Address::ipv4Loopback(touch.boundUdpPort())) == plat::kIoOk);
+
+    std::vector<bplist::Value> press_cmds;
+    REQUIRE(expectEventReports(phone, 3U, press_cmds));
+    CHECK_EQ(2ULL, bridge.knobReportsSent());
+    CHECK_EQ(1ULL, bridge.touchReportsSent());
+    CHECK(bridge.touchDown());
+
+    // 2. Focus loss produces exact zero knob report (2a2a2a2b) and exact touch-up report (2a2a2a2a).
+    bridge.setOwned(false);
+    std::vector<bplist::Value> rel_cmds;
+    REQUIRE(expectEventReports(phone, 2U, rel_cmds));
+    CHECK_EQ(3ULL, bridge.knobReportsSent());
+    CHECK_EQ(2ULL, bridge.touchReportsSent());
+    CHECK(!bridge.touchDown());
+
+    bool saw_knob_release = false;
+    bool saw_touch_release = false;
+    for (size_t i = 0; i < rel_cmds.size(); ++i) {
+        CHECK_EQ(std::string("hidSendReport"), strAt(rel_cmds[i], "type"));
+        const std::string uid = strAt(rel_cmds[i], "uuid");
+        const bplist::Value* rep = rel_cmds[i].find("hidReport");
+        REQUIRE(rep != NULL && rep->isData());
+        const Bytes& b = rep->asData();
+        if (uid == "2a2a2a2b") {
+            saw_knob_release = true;
+            REQUIRE(b.size() == 4U);
+            CHECK_EQ(static_cast<uint8_t>(0x00U), b[0]);
+            CHECK_EQ(static_cast<uint8_t>(0x00U), b[1]);
+            CHECK_EQ(static_cast<uint8_t>(0x00U), b[2]);
+            CHECK_EQ(static_cast<uint8_t>(0x00U), b[3]);
+        } else if (uid == "2a2a2a2a") {
+            saw_touch_release = true;
+            REQUIRE(b.size() == 12U);
+            CHECK_EQ(static_cast<uint8_t>(0x00U), b[0]);
+            CHECK_EQ(static_cast<uint8_t>(0x00U), b[1]);  // down = 0
+            CHECK_EQ(static_cast<uint8_t>(321U & 0xFFU), b[2]);
+            CHECK_EQ(static_cast<uint8_t>((321U >> 8) & 0xFFU), b[3]);
+            CHECK_EQ(static_cast<uint8_t>(222U & 0xFFU), b[4]);
+            CHECK_EQ(static_cast<uint8_t>((222U >> 8) & 0xFFU), b[5]);
+            CHECK_EQ(static_cast<uint8_t>(0x01U), b[6]);  // slot 1 id
+            for (size_t k = 7U; k < 12U; ++k) {
+                CHECK_EQ(static_cast<uint8_t>(0x00U), b[k]);
+            }
+        }
+    }
+    CHECK(saw_knob_release);
+    CHECK(saw_touch_release);
+
+    // 3. While not owned, further input + physical releases produce zero HID reports.
+    const uint8_t rot_step[7] = {0, 1, 1, 0x00U, 0x10U, 0x1EU, 0x00U};
+    const uint8_t rot_step2[7] = {0, 1, 2, 0x00U, 0x14U, 0x1EU, 0x00U};
+    const uint8_t menu_up[7] = {0, 0, 3, 0, 0, 0x00U, 0x00U};
+    const uint8_t push_up[7] = {0, 0, 4, 0, 0, 0x1EU, 0x00U};
+    REQUIRE(fake.inject(0xE5U, 0x01U, 0xC10U, 0xCU, rot_step, 7U));
+    REQUIRE(fake.inject(0xE5U, 0x01U, 0xC10U, 0xCU, rot_step2, 7U));
+    REQUIRE(fake.inject(0xE5U, 0x01U, 0xC20U, 0xCU, menu_up, 7U));
+    REQUIRE(fake.inject(0xE5U, 0x01U, 0xC20U, 0xCU, push_up, 7U));
+
+    tc.state = 2;
+    tc.x = 350;
+    tc.y = 230;
+    plat::buildTouchFrame(frame, &tc, 1, 2U, 0x0CU);
+    REQUIRE(sender.sendTo(frame, sizeof(frame),
+                          plat::Address::ipv4Loopback(touch.boundUdpPort())) == plat::kIoOk);
+    tc.state = 3;
+    plat::buildTouchFrame(frame, &tc, 1, 3U, 0x18U);
+    REQUIRE(sender.sendTo(frame, sizeof(frame),
+                          plat::Address::ipv4Loopback(touch.boundUdpPort())) == plat::kIoOk);
+
+    // Wait until EvoTouch worker finished processing frames 2 and 3.
+    const int64_t up_dl = plat::monotonicMillis() + 2000;
+    while ((touch.touchPdusReceived() < 3U || touch.activeCount() > 0) &&
+           plat::monotonicMillis() < up_dl) {
+        sleepMs(1);
+    }
+    REQUIRE(touch.touchPdusReceived() >= 3U);
+
+    // 4. Press started while NOT owned -> regain ownership -> move/release -> no spurious press, no lone release.
+    const uint8_t menu_dn2[7] = {0, 0, 5, 1, 0, 0x00U, 0x01U};
+    const uint8_t push_dn2[7] = {0, 0, 6, 1, 0, 0x1EU, 0x01U};
+    const uint8_t lvl_fence[5] = {0U, 0U, 25U, 0U, 64U};
+    REQUIRE(fake.inject(0xE5U, 0x01U, 0xC20U, 0xCU, menu_dn2, 7U));
+    REQUIRE(fake.inject(0xE5U, 0x01U, 0xC20U, 0xCU, push_dn2, 7U));
+    REQUIRE(fake.inject(0x20U, 0x00U, 0xC08U, 0xCU, lvl_fence, 5U));
+
+    const int64_t fence_dl = plat::monotonicMillis() + 2000;
+    while (ui_listener.vol_levels.empty() && plat::monotonicMillis() < fence_dl) {
+        reactor.runOnce(10);
+    }
+    REQUIRE(!ui_listener.vol_levels.empty());
+
+    tc.state = 1;
+    tc.x = 110;
+    tc.y = 140;
+    plat::buildTouchFrame(frame, &tc, 1, 4U, 0x24U);
+    REQUIRE(sender.sendTo(frame, sizeof(frame),
+                          plat::Address::ipv4Loopback(touch.boundUdpPort())) == plat::kIoOk);
+    const int64_t dn_dl = plat::monotonicMillis() + 2000;
+    while (touch.touchPdusReceived() < 4U && plat::monotonicMillis() < dn_dl) {
+        sleepMs(1);
+    }
+    REQUIRE(touch.touchPdusReceived() >= 4U);
+
+    bridge.setOwned(true);
+    const uint8_t menu_up2[7] = {0, 0, 7, 0, 0, 0x00U, 0x00U};
+    const uint8_t push_up2[7] = {0, 0, 8, 0, 0, 0x1EU, 0x00U};
+    REQUIRE(fake.inject(0xE5U, 0x01U, 0xC20U, 0xCU, menu_up2, 7U));
+    REQUIRE(fake.inject(0xE5U, 0x01U, 0xC20U, 0xCU, push_up2, 7U));
+
+    tc.state = 2;
+    tc.x = 130;
+    tc.y = 160;
+    plat::buildTouchFrame(frame, &tc, 1, 5U, 0x30U);
+    REQUIRE(sender.sendTo(frame, sizeof(frame),
+                          plat::Address::ipv4Loopback(touch.boundUdpPort())) == plat::kIoOk);
+    tc.state = 3;
+    plat::buildTouchFrame(frame, &tc, 1, 6U, 0x3CU);
+    REQUIRE(sender.sendTo(frame, sizeof(frame),
+                          plat::Address::ipv4Loopback(touch.boundUdpPort())) == plat::kIoOk);
+
+    // Send a sentinel fresh touch press after ownership regain; if ANY spurious press or lone release
+    // was generated beforehand, phone would receive it before this sentinel!
+    tc.state = 1;
+    tc.x = 500;
+    tc.y = 300;
+    plat::buildTouchFrame(frame, &tc, 1, 7U, 0x48U);
+    REQUIRE(sender.sendTo(frame, sizeof(frame),
+                          plat::Address::ipv4Loopback(touch.boundUdpPort())) == plat::kIoOk);
+
+    std::vector<bplist::Value> sentinel_cmds;
+    REQUIRE(expectEventReports(phone, 1U, sentinel_cmds));
+    CHECK_EQ(std::string("2a2a2a2a"), strAt(sentinel_cmds[0], "uuid"));
+    const bplist::Value* srep = sentinel_cmds[0].find("hidReport");
+    REQUIRE(srep != NULL && srep->isData());
+    const Bytes& sb = srep->asData();
+    REQUIRE(sb.size() == 12U);
+    CHECK_EQ(static_cast<uint8_t>(0x01U), sb[1]);
+    CHECK_EQ(static_cast<uint8_t>(500U & 0xFFU), sb[2]);
+    CHECK_EQ(static_cast<uint8_t>((500U >> 8) & 0xFFU), sb[3]);
+    CHECK_EQ(static_cast<uint8_t>(300U & 0xFFU), sb[4]);
+    CHECK_EQ(static_cast<uint8_t>((300U >> 8) & 0xFFU), sb[5]);
+
+    CHECK_EQ(3ULL, bridge.knobReportsSent());
+    CHECK_EQ(3ULL, bridge.touchReportsSent());
+
+    // 5. Synchronous bridge.handleTouch focus-loss + release path check.
+    touch.stop();
+    knob.stop();
+    bridge.detach();
+    bridge.setOwned(false);
+    // Step 4 left the sentinel finger pressed; setOwned(false) releases it cleanly.
+    std::vector<bplist::Value> sentinel_rel;
+    REQUIRE(expectEventReports(phone, 1U, sentinel_rel));
+    REQUIRE(bridge.touchReportsSent() == 4ULL);
+
+    // Press while !owned via direct handleTouch is ignored; setOwned(true) + release produces nothing.
+    plat::TouchEventOut sync_ev;
+    sync_ev.action = plat::TouchEventOut::kPress;
+    sync_ev.n = 1;
+    sync_ev.p[0].id = 0;
+    sync_ev.p[0].x = 400;
+    sync_ev.p[0].y = 200;
+    bridge.handleTouch(sync_ev);
+    bridge.setOwned(true);
+    sync_ev.action = plat::TouchEventOut::kRelease;
+    bridge.handleTouch(sync_ev);
+    CHECK_EQ(4ULL, bridge.touchReportsSent());
+
+    // Synchronous press while owned, then setOwned(false) sends exact 12-byte release.
+    sync_ev.action = plat::TouchEventOut::kPress;
+    sync_ev.p[0].x = 410;
+    sync_ev.p[0].y = 210;
+    bridge.handleTouch(sync_ev);
+    REQUIRE(bridge.touchDown());
+    bridge.setOwned(false);
+    CHECK(!bridge.touchDown());
+    CHECK_EQ(6ULL, bridge.touchReportsSent());
+    std::vector<bplist::Value> sync_cmds;
+    REQUIRE(expectEventReports(phone, 2U, sync_cmds));
+    CHECK_EQ(std::string("2a2a2a2a"), strAt(sync_cmds[1], "uuid"));
+    const bplist::Value* sr = sync_cmds[1].find("hidReport");
+    REQUIRE(sr != NULL && sr->isData());
+    const Bytes& srb = sr->asData();
+    REQUIRE(srb.size() == 12U);
+    CHECK_EQ(static_cast<uint8_t>(0x00U), srb[1]);
+    CHECK_EQ(static_cast<uint8_t>(410U & 0xFFU), srb[2]);
+    CHECK_EQ(static_cast<uint8_t>((410U >> 8) & 0xFFU), srb[3]);
+    CHECK_EQ(static_cast<uint8_t>(210U & 0xFFU), srb[4]);
+    CHECK_EQ(static_cast<uint8_t>((210U >> 8) & 0xFFU), srb[5]);
+
+    server.stop();
+    g_fake_vmost = NULL;
+}
+
+TEST_CASE(testEvoTouchConcurrentDisplaySizeAndScaleOffsetUnderWorker) {
+#ifdef _WIN32
+    return;
+#endif
+    TouchRecord rec;
+    plat::EvoTouch touch;
+    touch.setDisplaySize(2000U, 2000U);
+    touch.setScaleOffset(1.0, 1.0, 0.0, 0.0);
+    touch.setOwned(true);
+    REQUIRE(touch.startUdpForTest(0, plat::kInputForward, &TouchRecord::cb, &rec));
+    const uint16_t port = touch.boundUdpPort();
+    REQUIRE(port > 0U);
+
+    plat::UdpSocket sender;
+    REQUIRE(sender.open(plat::Address::ipv4Loopback(0)));
+
+    // Phase 1: concurrent setScaleOffset + activeCount while worker feeds press/release frames.
+    DisplayScaleWorkerArgs wargs;
+    wargs.touch = &touch;
+    wargs.mode = 0;
+    plat::Thread worker;
+    REQUIRE(worker.start(&DisplayScaleWorkerArgs::run, &wargs));
+    wargs.start.set();
+
+    uint8_t seq = 0U;
+    uint8_t counter = 1U;
+    for (int i = 0; i < 60; ++i) {
+        uint8_t frame[plat::touchpdu::kFrameBytes];
+        plat::RawTouchContact c;
+        c.id = 0;
+        c.state = 1;
+        c.x = 200;
+        c.y = 100;
+        plat::buildTouchFrame(frame, &c, 1, counter++, seq);
+        seq = static_cast<uint8_t>(seq + 12U);
+        REQUIRE(sender.sendTo(frame, sizeof(frame), plat::Address::ipv4Loopback(port)) == plat::kIoOk);
+
+        c.state = 3;
+        plat::buildTouchFrame(frame, &c, 1, counter++, seq);
+        seq = static_cast<uint8_t>(seq + 12U);
+        REQUIRE(sender.sendTo(frame, sizeof(frame), plat::Address::ipv4Loopback(port)) == plat::kIoOk);
+
+        REQUIRE(rec.waitCount(static_cast<size_t>((i + 1) * 2)) >= static_cast<size_t>((i + 1) * 2));
+    }
+
+    wargs.stop.set();
+    worker.join();
+
+    {
+        plat::LockGuard lock(rec.mutex);
+        REQUIRE(rec.events.size() == 120U);
+        for (size_t i = 0; i < rec.events.size(); ++i) {
+            const int x = rec.events[i].p[0].x;
+            const int y = rec.events[i].p[0].y;
+            const bool cfg_a = (x == 200 && y == 100);
+            const bool cfg_b = (x == 1400 && y == 1200);
+            CHECK(cfg_a || cfg_b);
+        }
+    }
+
+    // Phase 2: concurrent setDisplaySize + activeCount while worker feeds clamping frames.
+    {
+        plat::LockGuard lock(rec.mutex);
+        rec.events.clear();
+    }
+    touch.setScaleOffset(1.0, 1.0, 0.0, 0.0);
+    touch.setDisplaySize(800U, 480U);
+
+    wargs.start.reset();
+    wargs.stop.reset();
+    wargs.mode = 1;
+    REQUIRE(worker.start(&DisplayScaleWorkerArgs::run, &wargs));
+    wargs.start.set();
+
+    for (int i = 0; i < 60; ++i) {
+        uint8_t frame[plat::touchpdu::kFrameBytes];
+        plat::RawTouchContact c;
+        c.id = 0;
+        c.state = 1;
+        c.x = 1500;
+        c.y = 1500;
+        plat::buildTouchFrame(frame, &c, 1, counter++, seq);
+        seq = static_cast<uint8_t>(seq + 12U);
+        REQUIRE(sender.sendTo(frame, sizeof(frame), plat::Address::ipv4Loopback(port)) == plat::kIoOk);
+
+        c.state = 3;
+        plat::buildTouchFrame(frame, &c, 1, counter++, seq);
+        seq = static_cast<uint8_t>(seq + 12U);
+        REQUIRE(sender.sendTo(frame, sizeof(frame), plat::Address::ipv4Loopback(port)) == plat::kIoOk);
+
+        REQUIRE(rec.waitCount(static_cast<size_t>((i + 1) * 2)) >= static_cast<size_t>((i + 1) * 2));
+    }
+
+    wargs.stop.set();
+    worker.join();
+
+    {
+        plat::LockGuard lock(rec.mutex);
+        REQUIRE(rec.events.size() == 120U);
+        for (size_t i = 0; i < rec.events.size(); ++i) {
+            const int x = rec.events[i].p[0].x;
+            const int y = rec.events[i].p[0].y;
+            const bool sz_a = (x == 799 && y == 479);
+            const bool sz_b = (x == 1199 && y == 719);
+            CHECK(sz_a || sz_b);
+        }
+    }
+
+    touch.stop();
 }
 
 int main() {

@@ -16,6 +16,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include <vector>
+
 #include "carplay/platform/evo_touch_frame.hpp"
 #include "carplay/platform/net_compat.hpp"
 #include "carplay/platform/thread.hpp"
@@ -32,6 +34,179 @@ enum InputMode {
     kInputForward = 2
 };
 #endif
+
+#ifndef CARPLAY_PLATFORM_EVO_CALLBACK_SYNC_DEFINED
+#define CARPLAY_PLATFORM_EVO_CALLBACK_SYNC_DEFINED
+
+namespace detail {
+
+#ifdef _WIN32
+typedef unsigned long CallbackThreadId;
+CallbackThreadId currentCallbackThreadId();
+inline bool sameCallbackThread(CallbackThreadId a, CallbackThreadId b) { return a == b; }
+#else
+typedef pthread_t CallbackThreadId;
+inline CallbackThreadId currentCallbackThreadId() { return pthread_self(); }
+inline bool sameCallbackThread(CallbackThreadId a, CallbackThreadId b) {
+    return pthread_equal(a, b) != 0;
+}
+#endif
+
+class EvoStateSync {
+public:
+#ifdef _WIN32
+    EvoStateSync();
+    ~EvoStateSync();
+    void lock();
+    void unlock();
+    void wait();
+    void broadcast();
+#else
+    EvoStateSync() {
+        pthread_mutex_init(&mu_, NULL);
+        pthread_cond_init(&cv_, NULL);
+    }
+    ~EvoStateSync() {
+        pthread_cond_destroy(&cv_);
+        pthread_mutex_destroy(&mu_);
+    }
+    void lock() { pthread_mutex_lock(&mu_); }
+    void unlock() { pthread_mutex_unlock(&mu_); }
+    void wait() { pthread_cond_wait(&cv_, &mu_); }
+    void broadcast() { pthread_cond_broadcast(&cv_); }
+#endif
+
+private:
+    EvoStateSync(const EvoStateSync&) = delete;
+    EvoStateSync& operator=(const EvoStateSync&) = delete;
+#ifdef _WIN32
+    void* srw_;
+    void* cv_;
+#else
+    pthread_mutex_t mu_;
+    pthread_cond_t cv_;
+#endif
+};
+
+class EvoStateLock {
+public:
+    explicit EvoStateLock(EvoStateSync& s) : s_(s) { s_.lock(); }
+    ~EvoStateLock() { s_.unlock(); }
+
+private:
+    EvoStateLock(const EvoStateLock&) = delete;
+    EvoStateLock& operator=(const EvoStateLock&) = delete;
+    EvoStateSync& s_;
+};
+
+template <typename Fn>
+struct EvoCallbackSlot {
+    enum { kInlineActive = 16 };
+
+    struct ActiveCall {
+        CallbackThreadId tid;
+        uint64_t gen;
+
+        ActiveCall() : tid(), gen(0U) {}
+    };
+
+    Fn fn;
+    void* user;
+    uint64_t gen;
+    unsigned waiters;
+    unsigned inline_count;
+    ActiveCall inline_active[kInlineActive];
+    std::vector<ActiveCall> overflow_active;
+
+    EvoCallbackSlot()
+        : fn(NULL), user(NULL), gen(0U), waiters(0U), inline_count(0U) {}
+
+    bool tryEnterLocked(CallbackThreadId tid, Fn& fn_out, void*& user_out, uint64_t& gen_out) {
+        if (fn == NULL) {
+            return false;
+        }
+        fn_out = fn;
+        user_out = user;
+        gen_out = gen;
+        ActiveCall ac;
+        ac.tid = tid;
+        ac.gen = gen;
+        if (inline_count < static_cast<unsigned>(kInlineActive)) {
+            inline_active[inline_count++] = ac;
+        } else {
+            overflow_active.push_back(ac);
+        }
+        return true;
+    }
+
+    void exitLocked(CallbackThreadId tid, uint64_t call_gen, EvoStateSync& sync) {
+        bool removed = false;
+        for (size_t i = overflow_active.size(); i > 0U; --i) {
+            const ActiveCall& ac = overflow_active[i - 1U];
+            if (ac.gen == call_gen && sameCallbackThread(ac.tid, tid)) {
+                overflow_active[i - 1U] = overflow_active.back();
+                overflow_active.pop_back();
+                removed = true;
+                break;
+            }
+        }
+        if (!removed) {
+            for (unsigned i = inline_count; i > 0U; --i) {
+                const ActiveCall& ac = inline_active[i - 1U];
+                if (ac.gen == call_gen && sameCallbackThread(ac.tid, tid)) {
+                    inline_active[i - 1U] = inline_active[--inline_count];
+                    break;
+                }
+            }
+        }
+        if (waiters > 0U) {
+            sync.broadcast();
+        }
+    }
+
+    bool hasOtherInFlightUpTo(CallbackThreadId self_tid, uint64_t max_gen) const {
+        for (unsigned i = 0U; i < inline_count; ++i) {
+            if (inline_active[i].gen <= max_gen &&
+                !sameCallbackThread(inline_active[i].tid, self_tid)) {
+                return true;
+            }
+        }
+        for (size_t i = 0U; i < overflow_active.size(); ++i) {
+            if (overflow_active[i].gen <= max_gen &&
+                !sameCallbackThread(overflow_active[i].tid, self_tid)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    void setAndWaitLocked(Fn new_fn, void* new_user, CallbackThreadId self_tid, EvoStateSync& sync) {
+        if (new_fn == fn && new_user == user && new_fn != NULL) {
+            if (gen > 0U) {
+                const uint64_t prior_gen = gen - 1U;
+                while (hasOtherInFlightUpTo(self_tid, prior_gen)) {
+                    ++waiters;
+                    sync.wait();
+                    --waiters;
+                }
+            }
+            return;
+        }
+        const uint64_t wait_gen = gen;
+        fn = new_fn;
+        user = new_user;
+        ++gen;
+        while (hasOtherInFlightUpTo(self_tid, wait_gen)) {
+            ++waiters;
+            sync.wait();
+            --waiters;
+        }
+    }
+};
+
+}  // namespace detail
+
+#endif  // CARPLAY_PLATFORM_EVO_CALLBACK_SYNC_DEFINED
 
 static const uint16_t kTouchPort = 30567U;
 static const uint32_t kTouchTimeoutReleaseMs = 400U;
@@ -127,6 +302,8 @@ public:
     }
     void setScaleOffset(double sx, double sy, double ox, double oy);
 
+    /// Replaces the touch callback; waits until any in-flight invocation of a prior callback on
+    /// another thread has returned (re-entrant calls from inside the callback do not deadlock).
     void setCallback(Callback cb, void* user);
 
     /// Vehicle mode: AF_PACKET BPF tap on UDP 30567 + connected steal socket while owned.
@@ -153,9 +330,9 @@ public:
                        uint32_t now_ms = 0U);
     void checkTimeoutForTest(uint32_t now_ms);
 
-    int activeCount() const { return tracker_.activeCount(); }
+    int activeCount() const;
     unsigned tappedPackets() const { return tapped_; }
-    unsigned touchPdusReceived() const { return touch_pdus_; }
+    unsigned touchPdusReceived() const;
     unsigned stolenPackets() const { return stolen_; }
 
 private:
@@ -167,14 +344,21 @@ private:
     bool openTap();
     void updateSteal(bool want);
     int handle(const UdpView& u, uint32_t now_ms);
-    void emit(const TouchEventOut* ev, int n);
+    void dispatchEvents(const TouchEventOut* ev,
+                        int n,
+                        Callback cb,
+                        void* user,
+                        uint64_t gen,
+                        bool call_cb,
+                        bool require_owned,
+                        detail::CallbackThreadId tid);
     void releaseOnLostOwnership();
+    void releaseOnTimeout(uint32_t now_ms);
 
     InputMode mode_;
-    Callback cb_;
-    void* user_;
+    detail::EvoCallbackSlot<Callback> cb_slot_;
 
-    mutable Mutex state_mutex_;
+    mutable detail::EvoStateSync state_sync_;
     bool running_;
     bool owned_;
     bool picture_started_;
