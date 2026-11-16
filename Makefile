@@ -20,6 +20,7 @@
 CXX ?= g++
 CC  ?= gcc
 AR  ?= ar
+PYTHON3 ?= python3
 
 COMMON_WARN := -Wall -Wextra -Werror
 CXXFLAGS ?= -std=gnu++0x -O2 $(COMMON_WARN)
@@ -86,13 +87,16 @@ else
 HMI_PLUGIN_SO :=
 endif
 
+HMI_TEXTS_ZIP  := $(BUILD_DIR)/EntryCarPlay_ALL_Texts.zip
+HMI_IMAGES_ZIP := $(BUILD_DIR)/EntryCarPlay_ALL_Images.zip
+
 PUBLIC_HDRS := $(wildcard include/carplay/*.hpp) $(wildcard include/carplay/platform/*.hpp)
 TEST_HDRS   := $(wildcard tests/*.hpp)
 
 TEST_SRCS := $(sort $(wildcard tests/test_*.cpp))
 TEST_BINS := $(patsubst tests/%.cpp,$(BUILD_DIR)/%$(BIN_EXT),$(TEST_SRCS))
 
-.PHONY: all core platform daemon hmiapp install-layout tests test-host clean arm-core arm-platform arm-daemon arm-hmiapp
+.PHONY: all core platform daemon hmiapp hmiapp-res install-layout tests test-host clean arm-core arm-platform arm-daemon arm-hmiapp
 
 all: test-host
 
@@ -103,6 +107,8 @@ platform: $(PLATFORM_LIB) $(CORE_LIB)
 daemon: $(DAEMON_BIN)
 
 hmiapp: $(HMI_PLUGIN_SO)
+
+hmiapp-res: $(HMI_TEXTS_ZIP) $(HMI_IMAGES_ZIP)
 
 tests: $(TEST_BINS) $(DAEMON_BIN) $(HMI_PLUGIN_SO)
 
@@ -136,7 +142,13 @@ $(BUILD_DIR)/libEntryCarPlay.so: src/hmi/entry_carplay_app.cpp $(PLATFORM_LIB) $
 		-Wl,-soname,libEntryCarPlay.so -Wl,--exclude-libs,ALL \
 		$< $(PLATFORM_LIB) $(CORE_LIB) $(SYS_LIBS) -o $@
 
-install-layout: $(DAEMON_BIN) $(HMI_PLUGIN_SO) hmiapp/EntryCarPlay.manifest hmiapp/EntryCarPlay.xml
+$(HMI_TEXTS_ZIP): hmiapp/make_db.py hmiapp/EntryCarPlay.xml hmiapp/EntryCarPlay.manifest | $(BUILD_DIR)
+	$(PYTHON3) hmiapp/make_db.py --xml hmiapp/EntryCarPlay.xml --texts $@
+
+$(HMI_IMAGES_ZIP): hmiapp/make_db.py hmiapp/EntryCarPlay.xml hmiapp/EntryCarPlay.manifest | $(BUILD_DIR)
+	$(PYTHON3) hmiapp/make_db.py --xml hmiapp/EntryCarPlay.xml --images $@
+
+install-layout: $(DAEMON_BIN) $(HMI_PLUGIN_SO) hmiapp/EntryCarPlay.manifest hmiapp/EntryCarPlay.xml $(HMI_TEXTS_ZIP) $(HMI_IMAGES_ZIP)
 	mkdir -p $(STAGE_DIR)/opt/carplay
 	mkdir -p $(STAGE_DIR)/opt/hmi/data/ro/Plugins/EntryCarPlay
 	mkdir -p $(STAGE_DIR)/var/local/data/CarPlay
@@ -148,6 +160,8 @@ install-layout: $(DAEMON_BIN) $(HMI_PLUGIN_SO) hmiapp/EntryCarPlay.manifest hmia
 	fi
 	cp hmiapp/EntryCarPlay.manifest $(STAGE_DIR)/opt/hmi/data/ro/Plugins/EntryCarPlay/EntryCarPlay.manifest
 	cp hmiapp/EntryCarPlay.xml $(STAGE_DIR)/opt/hmi/data/ro/Plugins/EntryCarPlay/EntryCarPlay.xml
+	cp $(HMI_TEXTS_ZIP) $(STAGE_DIR)/opt/hmi/data/ro/Plugins/EntryCarPlay/EntryCarPlay_ALL_Texts.zip
+	cp $(HMI_IMAGES_ZIP) $(STAGE_DIR)/opt/hmi/data/ro/Plugins/EntryCarPlay/EntryCarPlay_ALL_Images.zip
 
 $(BUILD_DIR)/test_%$(BIN_EXT): tests/test_%.cpp $(PLATFORM_LIB) $(CORE_LIB) $(PUBLIC_HDRS) $(TEST_HDRS) | $(BUILD_DIR)
 	$(CXX) $(TEST_CPPFLAGS) $(CXXFLAGS) $< $(PLATFORM_LIB) $(CORE_LIB) $(SYS_LIBS) -o $@
