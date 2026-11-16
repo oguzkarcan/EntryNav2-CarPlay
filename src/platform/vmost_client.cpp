@@ -163,7 +163,11 @@ VmostClient::Load VmostClient::load() {
         return kNoDaemon;
     }
     const char* path = !g_test_library.empty() ? g_test_library.c_str() : kVmostLibrary;
-    lib_ = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+    // The handle is never dlclose'd (GLib static state), so a retry after a
+    // failed start must reuse it instead of taking another reference.
+    if (lib_ == NULL) {
+        lib_ = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+    }
     if (lib_ == NULL) {
         const char* why = dlerror();
         error_ = why != NULL ? why : "";

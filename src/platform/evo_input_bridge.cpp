@@ -149,22 +149,22 @@ void EvoInputBridge::releaseHeldInputs(bool send_hid) {
 }
 
 bool EvoInputBridge::enqueue(const QueuedItem& item) {
-    bool need_post = false;
-    {
-        LockGuard lock(queue_mutex_);
-        if (config_.max_queued_events > 0U && queue_.size() >= config_.max_queued_events) {
+    // The post happens under queue_mutex_ so a second producer can never see
+    // post_pending_ == true for a drain that then fails to get scheduled (its
+    // event would sit in queue_ until some later input). Reactor::post() only
+    // takes the reactor's own mutex and drainQueue() runs handlers unlocked,
+    // so there is no lock-order inversion.
+    LockGuard lock(queue_mutex_);
+    if (config_.max_queued_events > 0U && queue_.size() >= config_.max_queued_events) {
+        return false;
+    }
+    queue_.push_back(item);
+    if (!post_pending_) {
+        if (!reactor_.post(&EvoInputBridge::onPostedDrain, this)) {
+            queue_.pop_back();
             return false;
         }
-        queue_.push_back(item);
-        if (!post_pending_) {
-            post_pending_ = true;
-            need_post = true;
-        }
-    }
-    if (need_post && !reactor_.post(&EvoInputBridge::onPostedDrain, this)) {
-        LockGuard lock(queue_mutex_);
-        post_pending_ = false;
-        return false;
+        post_pending_ = true;
     }
     return true;
 }

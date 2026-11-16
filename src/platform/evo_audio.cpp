@@ -430,7 +430,8 @@ void applyGainQ15S16(int16_t* samples, size_t sample_count, int32_t gain_q15) {
         return;
     }
     for (size_t i = 0; i < sample_count; ++i) {
-        int32_t v = (static_cast<int32_t>(samples[i]) * gain_q15) / kUnityGainQ15;
+        // 64-bit product: INT16_MIN * gain overflows int32 once |gain| > 65536.
+        int64_t v = (static_cast<int64_t>(samples[i]) * gain_q15) / kUnityGainQ15;
         if (v > 32767) {
             v = 32767;
         } else if (v < -32768) {
@@ -939,7 +940,9 @@ void EvoAudioSink::onAudioPcm(const AudioStreamId& id,
         return;
     }
     Impl::StreamEntry* e = impl_->findActiveLocked(id);
-    if (e == NULL) {
+    // A format change without a fresh onAudioStarted must reopen the stream:
+    // pushFrames() sizes its copy from the entry's channel count, not `format`.
+    if (e == NULL || e->src_channels != format.channels || e->target_rate != format.sample_rate) {
         e = impl_->createStreamLocked(id, format);
         if (e == NULL) {
             return;

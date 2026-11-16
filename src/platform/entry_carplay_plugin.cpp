@@ -150,6 +150,11 @@ bool crashGuardAllowsInDir(const char* data_dir, long now_sec) {
     if (f) {
         fprintf(f, "%ld\n", now_sec);
         fflush(f);
+#ifndef _WIN32
+        // The attempt must be on stable storage before the risky load proceeds:
+        // a watchdog reset would otherwise lose it and the guard never trips.
+        fsync(fileno(f));
+#endif
         fclose(f);
     }
     return true;
@@ -189,15 +194,17 @@ bool bootGuardAllowsInDir(const char* data_dir, long now_sec) {
     if (n >= kBootGuardMax) {
         return false;
     }
-    f = fopen(path.c_str(), "w");
-    if (f) {
-        for (int i = 0; i < n; ++i) {
-            fprintf(f, "%ld\n", t[i]);
-        }
-        fprintf(f, "%ld\n", now_sec);
-        fflush(f);
-        fclose(f);
+    // Atomic replace (temp + fsync + rename): truncating in place would leave an
+    // empty guard, i.e. no boot-loop protection, if power drops mid-write.
+    std::string out;
+    char line[32];
+    for (int i = 0; i < n; ++i) {
+        snprintf(line, sizeof(line), "%ld\n", t[i]);
+        out += line;
     }
+    snprintf(line, sizeof(line), "%ld\n", now_sec);
+    out += line;
+    writeFileAtomic(path, reinterpret_cast<const uint8_t*>(out.data()), out.size());
     return true;
 }
 

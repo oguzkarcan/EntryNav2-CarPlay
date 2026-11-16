@@ -16,13 +16,10 @@
 
 namespace {
 
-carplay::platform::CarPlayDaemon* g_daemon = NULL;
+// Only async-signal-safe work in the handler: the daemon tick polls this flag.
+volatile sig_atomic_t g_stop_requested = 0;
 
-void onSignal(int /*sig*/) {
-    if (g_daemon != NULL) {
-        g_daemon->requestStop();
-    }
-}
+void onSignal(int /*sig*/) { g_stop_requested = 1; }
 
 bool parseUint(const char* s, unsigned long max_val, unsigned long& out) {
     if (!s || !*s || *s == '-') {
@@ -137,9 +134,10 @@ int main(int argc, char** argv) {
     signal(SIGINT, &onSignal);
     signal(SIGTERM, &onSignal);
 
+    cfg.stop_flag = &g_stop_requested;
+    if (cfg.tick_interval_ms <= 0) {
+        cfg.tick_interval_ms = 100;  // the tick is what observes stop_flag
+    }
     carplay::platform::CarPlayDaemon daemon(cfg);
-    g_daemon = &daemon;
-    const int rc = daemon.run();
-    g_daemon = NULL;
-    return rc;
+    return daemon.run();
 }

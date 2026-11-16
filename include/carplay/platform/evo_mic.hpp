@@ -60,6 +60,7 @@ public:
     /// Starts the idle capture worker thread delivering samples to `cb(samples, sample_count, user)`.
     bool start(PcmCallback cb, void* user);
     /// Starts the idle capture worker thread delivering samples to `engine.submitMicrophonePcm()`.
+    /// `engine` must outlive the worker: call stop() before destroying it.
     bool start(MediaEngine& engine);
     /// Stops any active capture and joins the worker thread.
     void stop();

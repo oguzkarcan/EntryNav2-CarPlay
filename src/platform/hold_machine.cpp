@@ -205,8 +205,14 @@ void HoldMachine::tellService(const ServiceState& service) {
         }
     }
     service_reachable_ = reachable;
-    strncpy(prev_state_, service.state, sizeof(prev_state_) - 1);
-    prev_state_[sizeof(prev_state_) - 1] = '\0';
+    // Bounded copy by hand: GCC 16 rejects the strncpy + explicit NUL idiom
+    // under -Werror=stringop-truncation.
+    size_t n = 0;
+    while (n < sizeof(prev_state_) - 1 && service.state[n] != '\0') {
+        prev_state_[n] = service.state[n];
+        ++n;
+    }
+    prev_state_[n] = '\0';
 }
 
 void HoldMachine::updatePopupPeek(bool covered, long now) {

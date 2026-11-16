@@ -49,7 +49,13 @@ bool runCommand(const std::string& executable,
 #else
     int fds[2];
     // Mark both ends FD_CLOEXEC so concurrent spawns in other threads never inherit them.
+    // pipe2 sets the flag atomically; pipe()+fcntl leaves a window where another
+    // thread's spawn inherits the write end and keeps our read side from seeing EOF.
+#ifdef __linux__
+    if (pipe2(fds, O_CLOEXEC) != 0) {
+#else
     if (pipe(fds) != 0) {
+#endif
         if (diagnostic != NULL) {
             diagnostic->spawn_error = errno;
         }

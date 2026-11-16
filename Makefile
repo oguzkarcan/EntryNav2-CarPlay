@@ -128,8 +128,13 @@ $(BUILD_DIR)/mono_%.o: third_party/monocypher/%.c | $(BUILD_DIR)
 $(DAEMON_BIN): src/daemon/main.cpp $(PLATFORM_LIB) $(CORE_LIB) $(PUBLIC_HDRS) | $(BUILD_DIR)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $< $(PLATFORM_LIB) $(CORE_LIB) $(SYS_LIBS) -o $@
 
+# The plugin is loaded into HmiMain3D: export only the entry points that carry an
+# explicit default-visibility attribute, never the statically linked core/platform/
+# monocypher symbols (they could interpose with the host or another plugin).
 $(BUILD_DIR)/libEntryCarPlay.so: src/hmi/entry_carplay_app.cpp $(PLATFORM_LIB) $(CORE_LIB) $(PUBLIC_HDRS) | $(BUILD_DIR)
-	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -fPIC -shared $< $(PLATFORM_LIB) $(CORE_LIB) $(SYS_LIBS) -o $@
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -fPIC -fvisibility=hidden -fvisibility-inlines-hidden -shared \
+		-Wl,-soname,libEntryCarPlay.so -Wl,--exclude-libs,ALL \
+		$< $(PLATFORM_LIB) $(CORE_LIB) $(SYS_LIBS) -o $@
 
 install-layout: $(DAEMON_BIN) $(HMI_PLUGIN_SO) hmiapp/EntryCarPlay.manifest hmiapp/EntryCarPlay.xml
 	mkdir -p $(STAGE_DIR)/opt/carplay

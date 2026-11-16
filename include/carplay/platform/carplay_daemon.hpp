@@ -13,6 +13,7 @@
 //   * EvoControl abstract Unix datagram socket (`\0entry-carplayd-control`) & atomic state file
 //   * PeekTiming (volume dim/peek, driving mode peek, iDrive popup step-aside) & MediaDoublePress recall
 
+#include <signal.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -53,6 +54,8 @@ struct CarPlayDaemonConfig {
     std::string day_night_file;
     std::string media_recall_file;
     std::string stop_file;
+    /// Optional flag set by a signal handler; polled on every tick (NULL = unused).
+    const volatile sig_atomic_t* stop_flag;
 
     bool enable_video;
     bool enable_audio;
@@ -92,6 +95,7 @@ struct CarPlayDaemonConfig {
           day_night_file(contract::kDayNightFile),
           media_recall_file(contract::kMediaRecallFile),
           stop_file(contract::kServiceStop),
+          stop_flag(NULL),
           enable_video(true),
           enable_audio(true),
           enable_input(true),
@@ -127,9 +131,11 @@ public:
     /// Stops all workers, closes active sessions, and removes the runtime state file.
     void stop();
 
-    /// Runs the Reactor loop until `requestStop()` or `"quit"` control command or `stop_file`.
+    /// Runs the Reactor loop until `requestStop()`, the `"quit"` control command, `stop_file`
+    /// or `stop_flag`.
     int run();
-    /// Thread-safe stop request (safe from signal handlers or other threads via Reactor::stop()).
+    /// Thread-safe stop request. NOT async-signal-safe (Reactor::stop() takes a mutex):
+    /// signal handlers must set `CarPlayDaemonConfig::stop_flag` instead.
     void requestStop();
 
     bool isStarted() const { return started_; }

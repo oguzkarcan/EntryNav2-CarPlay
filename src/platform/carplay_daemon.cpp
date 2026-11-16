@@ -246,6 +246,9 @@ void CarPlayDaemon::stop() {
         reactor_.cancelTimer(tick_timer_);
         tick_timer_ = Reactor::kNoTimer;
     }
+    // Join the control thread first: it posts onPostedCommands(this), and
+    // Reactor::cancelPosted requires posting threads to have stopped.
+    control_.stop();
     reactor_.cancelPosted(&CarPlayDaemon::onPostedCommands, this);
     {
         LockGuard lock(cmd_mu_);
@@ -265,20 +268,21 @@ void CarPlayDaemon::stop() {
         input_bridge_ = NULL;
     }
 
-    control_.stop();
-
     if (server_ != NULL) {
         server_->stop();
         delete server_;
         server_ = NULL;
     }
 
+    // Join the capture thread before the engine goes away: the worker calls
+    // MediaEngine::submitMicrophonePcm() outside its own lock.
+    mic_.stop();
+
     if (media_engine_ != NULL) {
         delete media_engine_;
         media_engine_ = NULL;
     }
 
-    mic_.stop();
     audio_sink_.stop();
     video_.stop();
     video_running_ = false;
@@ -317,7 +321,8 @@ bool CarPlayDaemon::hasActiveSession() const {
 }
 
 void CarPlayDaemon::stepVisibility() {
-    if (!config_.stop_file.empty() && pathExists(config_.stop_file)) {
+    if ((config_.stop_flag != NULL && *config_.stop_flag != 0) ||
+        (!config_.stop_file.empty() && pathExists(config_.stop_file))) {
         requestStop();
         return;
     }

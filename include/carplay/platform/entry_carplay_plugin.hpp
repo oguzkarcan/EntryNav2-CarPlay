@@ -112,4 +112,12 @@ struct EntryPluginAppInfo {
 
 }  // extern "C"
 
+// HmiMain3D reads this as a 0x18-byte ILP32 record with create at +0x10 and
+// destroy at +0x14; fail the ARM build if the layout ever drifts.
+#if defined(__SIZEOF_POINTER__) && __SIZEOF_POINTER__ == 4
+static_assert(sizeof(EntryPluginAppInfo) == 0x18, "pluginAppInfo must be 0x18 bytes");
+static_assert(__builtin_offsetof(EntryPluginAppInfo, create) == 0x10, "create must be at +0x10");
+static_assert(__builtin_offsetof(EntryPluginAppInfo, destroy) == 0x14, "destroy must be at +0x14");
+#endif
+
 #endif  // CARPLAY_PLATFORM_ENTRY_CARPLAY_PLUGIN_HPP

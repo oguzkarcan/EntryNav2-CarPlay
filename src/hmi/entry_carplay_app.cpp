@@ -184,8 +184,45 @@ void addCdsProperty(void* app,
     }
 }
 
+#ifndef _WIN32
+// The daemon is our child: without a waitpid() it stays a zombie after it exits,
+// and kill(pid, 0) on a zombie still succeeds, so the menu would keep showing a
+// dead service as running until HmiMain3D restarts.
+void* reapDaemonChild(void* arg) {
+    const pid_t pid = static_cast<pid_t>(reinterpret_cast<long>(arg));
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+    }
+    return NULL;
+}
+
+void startDaemonReaper(pid_t pid) {
+    pthread_attr_t attr;
+    if (pthread_attr_init(&attr) != 0) {
+        return;
+    }
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    pthread_t tid;
+    const int rc = pthread_create(&tid, &attr, &reapDaemonChild,
+                                  reinterpret_cast<void*>(static_cast<long>(pid)));
+    pthread_attr_destroy(&attr);
+    if (rc != 0) {
+        appLog("launch: reaper thread for pid %d failed: %s", static_cast<int>(pid), strerror(rc));
+    }
+}
+
+long g_last_launch = -1;
+const long kLaunchDebounceSec = 3;
+#endif
+
 void launchDaemonProcess() {
 #ifndef _WIN32
+    // The state file appears only once the daemon is up; a second Start press
+    // inside that window must not spawn a second instance.
+    const long launch_now = monoSeconds();
+    if (g_last_launch >= 0 && launch_now - g_last_launch < kLaunchDebounceSec) {
+        return;
+    }
     const char* bin = contract::kSupervisor;
     struct stat st;
     if (stat(bin, &st) != 0) {
@@ -230,7 +267,9 @@ void launchDaemonProcess() {
             &pid, bin, &fa, &at, argv, const_cast<char* const*>(kEnv));
         posix_spawnattr_destroy(&at);
         if (rc == 0) {
+            g_last_launch = launch_now;
             appLog("launch: spawned %s pid %d", bin, static_cast<int>(pid));
+            startDaemonReaper(pid);
         } else {
             appLog("launch: posix_spawn(%s) failed: %s", bin, strerror(rc));
         }
@@ -457,10 +496,14 @@ void statusRun(void*) {
     if (g_run_app == NULL) {
         return;
     }
+    // Uptime checks run on the monotonic clock: the wall clock jumps when the
+    // head unit syncs time, which would clear the guards early or stall autostart.
+    // Only the persisted boot-guard timestamps need wall-clock seconds.
     const long now_sec = static_cast<long>(time(NULL));
-    resetGuardsWhenStableInDir(g_data_dir.c_str(), g_init_time, now_sec, g_stable_marked);
+    const long up_sec = monoSeconds();
+    resetGuardsWhenStableInDir(g_data_dir.c_str(), g_init_time, up_sec, g_stable_marked);
 
-    if (!g_autostart_done && g_init_time > 0 && now_sec - g_init_time >= 30) {
+    if (!g_autostart_done && g_init_time > 0 && up_sec - g_init_time >= 30) {
         g_autostart_done = true;
         if (pathExists(g_data_dir + "/autostart")) {
             const ServiceState d0 = readServiceStateFile(g_state_file.c_str(), g_control_name.c_str());
@@ -537,7 +580,10 @@ bool appOnInit(void* self) {
         d.stub = &onCarPlayVisible;
         g_fw.add_state_handler(self, rhmi::kCarPlayState, rhmi::kHandlerVisible, d);
     }
-    g_init_time = static_cast<long>(time(NULL));
+    g_init_time = monoSeconds();
+    if (g_init_time <= 0) {
+        g_init_time = 1;  // 0 means "not initialised" to the guard reset
+    }
     const bool ok = (g_fw.on_init != NULL) ? g_fw.on_init(self) : true;
     g_run_app = self;
     makeRunnable(g_sub_runnable, &subscribeRun);
@@ -566,10 +612,11 @@ void* createApp(void* dispatcher, const char* name, const void* params, const vo
 #ifndef _WIN32
     mkdir(g_data_dir.c_str(), 0755);
 #endif
-    if (isAppDisabledInDir(g_data_dir.c_str()) ||
-        !crashGuardAllowsInDir(g_data_dir.c_str(), static_cast<long>(time(NULL)))) {
+    if (isAppDisabledInDir(g_data_dir.c_str())) {
         return NULL;
     }
+    // Refusals that cannot crash the host come before the crash guard, so they
+    // do not burn guard attempts and disable the plugin for good.
     if (g_app != NULL) {
         return NULL;
     }
@@ -577,8 +624,15 @@ void* createApp(void* dispatcher, const char* name, const void* params, const vo
         appLog("createApp: BMW framework symbols unavailable in process");
         return NULL;
     }
+    if (!crashGuardAllowsInDir(g_data_dir.c_str(), static_cast<long>(time(NULL)))) {
+        return NULL;
+    }
 
-    void* mem = ::operator new(kPluginAppStorage);
+    // Never let std::bad_alloc unwind into HmiMain3D.
+    void* mem = ::operator new(kPluginAppStorage, std::nothrow);
+    if (mem == NULL) {
+        return NULL;
+    }
     memset(mem, 0, kPluginAppStorage);
 
     BmwBasicStringChar app_name;

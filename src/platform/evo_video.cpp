@@ -744,18 +744,37 @@ bool EvoVideo::reconfigureStream(uint32_t new_width, uint32_t new_height) {
     if (new_width == cfg_.width && new_height == cfg_.height) {
         return true;
     }
+    // The cached SPS/PPS describes the old resolution; never prepend it to an
+    // IDR of the new one. onVideoConfig() re-posts the new parameter sets.
+#ifdef _WIN32
+    {
+        LockGuard lock(mu_);
+        codec_cfg_.clear();
+        config_sent_ = false;
+    }
+#else
+    pthread_mutex_lock(&mu_);
+    codec_cfg_.clear();
+    config_sent_ = false;
+    pthread_mutex_unlock(&mu_);
+#endif
+    // Keyframes above 720p need the 2 MiB buffers; a pool sized for the old
+    // resolution has to be reallocated, which the in-place path cannot do.
+    const bool grow_pool =
+        (new_width > 1280U || new_height > 720U) && cfg_.pool_buf_size < (2U << 20);
     if (!isStarted()) {
         cfg_.width = new_width;
         cfg_.height = new_height;
-        if ((new_width > 1280U || new_height > 720U) && cfg_.pool_buf_size < (2U << 20)) {
+        if (grow_pool) {
             cfg_.pool_buf_size = (2U << 20);
+            pool_.destroy();  // start() re-creates it at the new size
         }
         return true;
     }
 
     CARPLAY_LOG_INFO("video", "reconfiguring stream resolution %ux%u -> %ux%u",
                      cfg_.width, cfg_.height, new_width, new_height);
-    if (h_ != NULL &&
+    if (!grow_pool && h_ != NULL &&
         xsvCommand("xsv_configure_stream",
                    xsv_.xsv_configure_stream(h_, new_width, new_height, cfg_.fps)) &&
         xsvCommand("xsv_set_output_dimension",

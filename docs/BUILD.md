@@ -96,8 +96,8 @@ Thanks to the dlopen policy, the sysroot is **not needed to build**. It is only 
 
 4. Deployable targets and vehicle install layout (`F3-P7`):
    ```sh
-   make carplayd                               # builds <BUILD_DIR>/carplayd
-   make hmi-plugin                             # builds <BUILD_DIR>/libEntryCarPlay.so
+   make daemon                                 # builds <BUILD_DIR>/carplayd
+   make hmiapp                                 # builds <BUILD_DIR>/libEntryCarPlay.so
    make install-layout                         # stages the full head-unit rootfs tree under <BUILD_DIR>/install-root:
    #   /opt/carplay/carplayd
    #   /opt/hmi/data/ro/Plugins/EntryCarPlay/EntryCarPlay
