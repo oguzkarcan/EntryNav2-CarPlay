@@ -14,6 +14,11 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#else
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
 #endif
 
 #include "carplay/platform/log.hpp"
@@ -24,6 +29,43 @@
 
 namespace carplay {
 namespace platform {
+
+#ifdef _WIN32
+namespace detail {
+
+CallbackThreadId currentCallbackThreadId() {
+    return GetCurrentThreadId();
+}
+
+EvoStateSync::EvoStateSync() : srw_(NULL), cv_(NULL) {
+    InitializeSRWLock(reinterpret_cast<PSRWLOCK>(&srw_));
+    InitializeConditionVariable(reinterpret_cast<PCONDITION_VARIABLE>(&cv_));
+}
+
+EvoStateSync::~EvoStateSync() {}
+
+void EvoStateSync::lock() {
+    AcquireSRWLockExclusive(reinterpret_cast<PSRWLOCK>(&srw_));
+}
+
+void EvoStateSync::unlock() {
+    ReleaseSRWLockExclusive(reinterpret_cast<PSRWLOCK>(&srw_));
+}
+
+void EvoStateSync::wait() {
+    SleepConditionVariableSRW(
+        reinterpret_cast<PCONDITION_VARIABLE>(&cv_),
+        reinterpret_cast<PSRWLOCK>(&srw_),
+        INFINITE,
+        0);
+}
+
+void EvoStateSync::broadcast() {
+    WakeAllConditionVariable(reinterpret_cast<PCONDITION_VARIABLE>(&cv_));
+}
+
+}  // namespace detail
+#endif
 
 namespace {
 
@@ -279,8 +321,6 @@ int TouchTracker::feed(const uint8_t* buf, size_t n, TouchEventOut* evs, int max
 
 EvoTouch::EvoTouch()
     : mode_(kInputOff),
-      cb_(NULL),
-      user_(NULL),
       running_(false),
       owned_(false),
       picture_started_(true),
@@ -308,30 +348,47 @@ EvoTouch::~EvoTouch() {
 }
 
 void EvoTouch::setDisplaySize(uint32_t width_pixels, uint32_t height_pixels) {
+    detail::EvoStateLock lock(state_sync_);
     tracker_.setDisplaySize(width_pixels, height_pixels);
 }
 
 void EvoTouch::setScaleOffset(double sx, double sy, double ox, double oy) {
+    detail::EvoStateLock lock(state_sync_);
     tracker_.setScaleOffset(sx, sy, ox, oy);
 }
 
+int EvoTouch::activeCount() const {
+    detail::EvoStateLock lock(state_sync_);
+    return tracker_.activeCount();
+}
+
+unsigned EvoTouch::touchPdusReceived() const {
+    detail::EvoStateLock lock(state_sync_);
+    return touch_pdus_;
+}
+
 void EvoTouch::setOwned(bool owned) {
-    LockGuard lock(state_mutex_);
+    detail::EvoStateLock lock(state_sync_);
+    if (!owned_ && owned && tracker_.activeCount() > 0) {
+        TouchEventOut dummy[TouchTracker::NS];
+        tracker_.releaseAll(dummy, TouchTracker::NS);
+        finger_sent_ = false;
+    }
     owned_ = owned;
 }
 
 bool EvoTouch::owned() const {
-    LockGuard lock(state_mutex_);
+    detail::EvoStateLock lock(state_sync_);
     return owned_;
 }
 
 void EvoTouch::setPictureStarted(bool started) {
-    LockGuard lock(state_mutex_);
+    detail::EvoStateLock lock(state_sync_);
     picture_started_ = started;
 }
 
 bool EvoTouch::pictureStarted() const {
-    LockGuard lock(state_mutex_);
+    detail::EvoStateLock lock(state_sync_);
     return picture_started_;
 }
 
@@ -340,17 +397,15 @@ uint16_t EvoTouch::boundUdpPort() const {
 }
 
 void EvoTouch::setCallback(Callback cb, void* user) {
-    LockGuard lock(state_mutex_);
-    cb_ = cb;
-    user_ = user;
+    detail::EvoStateLock lock(state_sync_);
+    cb_slot_.setAndWaitLocked(cb, user, detail::currentCallbackThreadId(), state_sync_);
 }
 
 void EvoTouch::attachForTest(InputMode mode, Callback cb, void* user) {
-    LockGuard lock(state_mutex_);
+    detail::EvoStateLock lock(state_sync_);
     mode_ = mode;
     if (cb != NULL) {
-        cb_ = cb;
-        user_ = user;
+        cb_slot_.setAndWaitLocked(cb, user, detail::currentCallbackThreadId(), state_sync_);
     }
 }
 
@@ -445,22 +500,23 @@ bool EvoTouch::start(InputMode mode, Callback cb, void* user) {
     if (started_ || mode == kInputOff) {
         return mode == kInputOff;
     }
-    mode_ = mode;
-    if (cb != NULL) {
-        LockGuard lock(state_mutex_);
-        cb_ = cb;
-        user_ = user;
+    {
+        detail::EvoStateLock lock(state_sync_);
+        mode_ = mode;
+        if (cb != NULL) {
+            cb_slot_.setAndWaitLocked(cb, user, detail::currentCallbackThreadId(), state_sync_);
+        }
     }
     udp_test_mode_ = false;
     if (!openTap()) {
         return false;
     }
     {
-        LockGuard lock(state_mutex_);
+        detail::EvoStateLock lock(state_sync_);
         running_ = true;
     }
     if (!thread_.start(&EvoTouch::threadEntry, this)) {
-        LockGuard lock(state_mutex_);
+        detail::EvoStateLock lock(state_sync_);
         running_ = false;
 #ifndef _WIN32
         if (tap_ >= 0) {
@@ -481,19 +537,20 @@ bool EvoTouch::startUdpForTest(uint16_t bind_udp_port, InputMode mode, Callback 
     if (!udp_sock_.open(Address::ipv4Loopback(bind_udp_port))) {
         return false;
     }
-    mode_ = mode;
-    if (cb != NULL) {
-        LockGuard lock(state_mutex_);
-        cb_ = cb;
-        user_ = user;
+    {
+        detail::EvoStateLock lock(state_sync_);
+        mode_ = mode;
+        if (cb != NULL) {
+            cb_slot_.setAndWaitLocked(cb, user, detail::currentCallbackThreadId(), state_sync_);
+        }
     }
     udp_test_mode_ = true;
     {
-        LockGuard lock(state_mutex_);
+        detail::EvoStateLock lock(state_sync_);
         running_ = true;
     }
     if (!thread_.start(&EvoTouch::threadEntry, this)) {
-        LockGuard lock(state_mutex_);
+        detail::EvoStateLock lock(state_sync_);
         running_ = false;
         udp_sock_.close();
         udp_test_mode_ = false;
@@ -508,7 +565,7 @@ void EvoTouch::stop() {
         return;
     }
     {
-        LockGuard lock(state_mutex_);
+        detail::EvoStateLock lock(state_sync_);
         running_ = false;
     }
     thread_.join();
@@ -531,48 +588,82 @@ void EvoTouch::threadEntry(void* self) {
     static_cast<EvoTouch*>(self)->run();
 }
 
-void EvoTouch::emit(const TouchEventOut* ev, int n) {
-    Callback cb = NULL;
-    void* user = NULL;
-    bool is_owned = false;
-    {
-        LockGuard lock(state_mutex_);
-        cb = cb_;
-        user = user_;
-        is_owned = owned_;
-    }
-    const bool send = (mode_ == kInputForward && is_owned && cb != NULL);
+void EvoTouch::dispatchEvents(const TouchEventOut* ev,
+                              int n,
+                              Callback cb,
+                              void* user,
+                              uint64_t gen,
+                              bool call_cb,
+                              bool require_owned,
+                              detail::CallbackThreadId tid) {
     for (int i = 0; i < n; ++i) {
         ++events_;
-        if (send) {
+        if (call_cb) {
             cb(ev[i], user);
             ++sent_;
+            if (i + 1 < n) {
+                detail::EvoStateLock lock(state_sync_);
+                cb_slot_.exitLocked(tid, gen, state_sync_);
+                call_cb = (mode_ == kInputForward && (!require_owned || owned_)) &&
+                          cb_slot_.tryEnterLocked(tid, cb, user, gen);
+            }
         }
     }
-    if (send) {
-        finger_sent_ = (tracker_.activeCount() > 0);
+    if (call_cb) {
+        detail::EvoStateLock lock(state_sync_);
+        cb_slot_.exitLocked(tid, gen, state_sync_);
     }
 }
 
 void EvoTouch::releaseOnLostOwnership() {
-    if (mode_ == kInputForward && !owned() && tracker_.activeCount() > 0) {
-        Callback cb = NULL;
-        void* user = NULL;
-        {
-            LockGuard lock(state_mutex_);
-            cb = cb_;
-            user = user_;
+    TouchEventOut ev[TouchTracker::NS];
+    int n = 0;
+    Callback cb = NULL;
+    void* user = NULL;
+    uint64_t gen = 0U;
+    const detail::CallbackThreadId tid = detail::currentCallbackThreadId();
+    bool call_cb = false;
+    {
+        detail::EvoStateLock lock(state_sync_);
+        if (mode_ != kInputForward) {
+            return;
         }
-        TouchEventOut ev[TouchTracker::NS];
-        const int n = tracker_.releaseAll(ev, TouchTracker::NS);
-        for (int i = 0; i < n; ++i) {
-            ++events_;
-            if (finger_sent_ && cb != NULL) {
-                cb(ev[i], user);
-                ++sent_;
+        if (!owned_ && tracker_.activeCount() > 0) {
+            n = tracker_.releaseAll(ev, TouchTracker::NS);
+            if (n > 0 && finger_sent_) {
+                call_cb = cb_slot_.tryEnterLocked(tid, cb, user, gen);
+            }
+            finger_sent_ = false;
+        }
+    }
+    if (n > 0) {
+        dispatchEvents(ev, n, cb, user, gen, call_cb, false, tid);
+    }
+}
+
+void EvoTouch::releaseOnTimeout(uint32_t now_ms) {
+    TouchEventOut ev[TouchTracker::NS];
+    int n = 0;
+    Callback cb = NULL;
+    void* user = NULL;
+    uint64_t gen = 0U;
+    const detail::CallbackThreadId tid = detail::currentCallbackThreadId();
+    bool call_cb = false;
+    {
+        detail::EvoStateLock lock(state_sync_);
+        if (tracker_.activeCount() > 0 &&
+            static_cast<uint32_t>(now_ms - last_frame_ms_) >= kTouchTimeoutReleaseMs) {
+            n = tracker_.releaseAll(ev, TouchTracker::NS);
+            if (n > 0 && mode_ == kInputForward && owned_) {
+                call_cb = cb_slot_.tryEnterLocked(tid, cb, user, gen);
+                if (call_cb) {
+                    finger_sent_ = (tracker_.activeCount() > 0);
+                }
             }
         }
-        finger_sent_ = false;
+    }
+    if (n > 0) {
+        dispatchEvents(ev, n, cb, user, gen, call_cb, true, tid);
     }
 }
 
@@ -592,13 +683,28 @@ int EvoTouch::handle(const UdpView& u, uint32_t now_ms) {
         ++other_pdus_;
         return 0;
     }
-    ++touch_pdus_;
-    last_frame_ms_ = now_ms;
     TouchEventOut ev[16];
-    tracker_.setPictureStarted(pictureStarted());
-    const int n = tracker_.feed(u.data, u.len, ev, 16);
+    int n = 0;
+    Callback cb = NULL;
+    void* user = NULL;
+    uint64_t gen = 0U;
+    const detail::CallbackThreadId tid = detail::currentCallbackThreadId();
+    bool call_cb = false;
+    {
+        detail::EvoStateLock lock(state_sync_);
+        ++touch_pdus_;
+        last_frame_ms_ = now_ms;
+        tracker_.setPictureStarted(picture_started_);
+        n = tracker_.feed(u.data, u.len, ev, 16);
+        if (n > 0 && mode_ == kInputForward && owned_) {
+            call_cb = cb_slot_.tryEnterLocked(tid, cb, user, gen);
+            if (call_cb) {
+                finger_sent_ = (tracker_.activeCount() > 0);
+            }
+        }
+    }
     if (n > 0) {
-        emit(ev, n);
+        dispatchEvents(ev, n, cb, user, gen, call_cb, true, tid);
     }
     return n;
 }
@@ -619,12 +725,7 @@ int EvoTouch::feedUdpPayload(const uint8_t* payload,
 
 void EvoTouch::checkTimeoutForTest(uint32_t now_ms) {
     releaseOnLostOwnership();
-    if (tracker_.activeCount() > 0 &&
-        static_cast<uint32_t>(now_ms - last_frame_ms_) >= kTouchTimeoutReleaseMs) {
-        TouchEventOut ev[TouchTracker::NS];
-        const int n = tracker_.releaseAll(ev, TouchTracker::NS);
-        emit(ev, n);
-    }
+    releaseOnTimeout(now_ms);
 }
 
 void EvoTouch::run() {
@@ -633,14 +734,17 @@ void EvoTouch::run() {
     poll_set.reserve(3U);
 
     for (;;) {
+        InputMode mode_snap = kInputOff;
+        bool own = false;
         {
-            LockGuard lock(state_mutex_);
+            detail::EvoStateLock lock(state_sync_);
             if (!running_) {
                 break;
             }
+            mode_snap = mode_;
+            own = owned_;
         }
-        const bool own = owned();
-        if (!udp_test_mode_ && mode_ == kInputForward) {
+        if (!udp_test_mode_ && mode_snap == kInputForward) {
             updateSteal(own && have_peer_);
         }
         releaseOnLostOwnership();
@@ -750,12 +854,7 @@ void EvoTouch::run() {
         }
 #endif
 
-        if (tracker_.activeCount() > 0 &&
-            static_cast<uint32_t>(now - last_frame_ms_) >= kTouchTimeoutReleaseMs) {
-            TouchEventOut ev[TouchTracker::NS];
-            const int n = tracker_.releaseAll(ev, TouchTracker::NS);
-            emit(ev, n);
-        }
+        releaseOnTimeout(now);
     }
 }
 

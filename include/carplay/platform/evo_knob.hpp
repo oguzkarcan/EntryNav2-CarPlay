@@ -15,6 +15,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include <vector>
+
 #include "carplay/airplay_hid.hpp"
 #include "carplay/platform/evo_ccs.hpp"
 #include "carplay/platform/thread.hpp"
@@ -31,6 +33,179 @@ enum InputMode {
     kInputForward = 2
 };
 #endif
+
+#ifndef CARPLAY_PLATFORM_EVO_CALLBACK_SYNC_DEFINED
+#define CARPLAY_PLATFORM_EVO_CALLBACK_SYNC_DEFINED
+
+namespace detail {
+
+#ifdef _WIN32
+typedef unsigned long CallbackThreadId;
+CallbackThreadId currentCallbackThreadId();
+inline bool sameCallbackThread(CallbackThreadId a, CallbackThreadId b) { return a == b; }
+#else
+typedef pthread_t CallbackThreadId;
+inline CallbackThreadId currentCallbackThreadId() { return pthread_self(); }
+inline bool sameCallbackThread(CallbackThreadId a, CallbackThreadId b) {
+    return pthread_equal(a, b) != 0;
+}
+#endif
+
+class EvoStateSync {
+public:
+#ifdef _WIN32
+    EvoStateSync();
+    ~EvoStateSync();
+    void lock();
+    void unlock();
+    void wait();
+    void broadcast();
+#else
+    EvoStateSync() {
+        pthread_mutex_init(&mu_, NULL);
+        pthread_cond_init(&cv_, NULL);
+    }
+    ~EvoStateSync() {
+        pthread_cond_destroy(&cv_);
+        pthread_mutex_destroy(&mu_);
+    }
+    void lock() { pthread_mutex_lock(&mu_); }
+    void unlock() { pthread_mutex_unlock(&mu_); }
+    void wait() { pthread_cond_wait(&cv_, &mu_); }
+    void broadcast() { pthread_cond_broadcast(&cv_); }
+#endif
+
+private:
+    EvoStateSync(const EvoStateSync&) = delete;
+    EvoStateSync& operator=(const EvoStateSync&) = delete;
+#ifdef _WIN32
+    void* srw_;
+    void* cv_;
+#else
+    pthread_mutex_t mu_;
+    pthread_cond_t cv_;
+#endif
+};
+
+class EvoStateLock {
+public:
+    explicit EvoStateLock(EvoStateSync& s) : s_(s) { s_.lock(); }
+    ~EvoStateLock() { s_.unlock(); }
+
+private:
+    EvoStateLock(const EvoStateLock&) = delete;
+    EvoStateLock& operator=(const EvoStateLock&) = delete;
+    EvoStateSync& s_;
+};
+
+template <typename Fn>
+struct EvoCallbackSlot {
+    enum { kInlineActive = 16 };
+
+    struct ActiveCall {
+        CallbackThreadId tid;
+        uint64_t gen;
+
+        ActiveCall() : tid(), gen(0U) {}
+    };
+
+    Fn fn;
+    void* user;
+    uint64_t gen;
+    unsigned waiters;
+    unsigned inline_count;
+    ActiveCall inline_active[kInlineActive];
+    std::vector<ActiveCall> overflow_active;
+
+    EvoCallbackSlot()
+        : fn(NULL), user(NULL), gen(0U), waiters(0U), inline_count(0U) {}
+
+    bool tryEnterLocked(CallbackThreadId tid, Fn& fn_out, void*& user_out, uint64_t& gen_out) {
+        if (fn == NULL) {
+            return false;
+        }
+        fn_out = fn;
+        user_out = user;
+        gen_out = gen;
+        ActiveCall ac;
+        ac.tid = tid;
+        ac.gen = gen;
+        if (inline_count < static_cast<unsigned>(kInlineActive)) {
+            inline_active[inline_count++] = ac;
+        } else {
+            overflow_active.push_back(ac);
+        }
+        return true;
+    }
+
+    void exitLocked(CallbackThreadId tid, uint64_t call_gen, EvoStateSync& sync) {
+        bool removed = false;
+        for (size_t i = overflow_active.size(); i > 0U; --i) {
+            const ActiveCall& ac = overflow_active[i - 1U];
+            if (ac.gen == call_gen && sameCallbackThread(ac.tid, tid)) {
+                overflow_active[i - 1U] = overflow_active.back();
+                overflow_active.pop_back();
+                removed = true;
+                break;
+            }
+        }
+        if (!removed) {
+            for (unsigned i = inline_count; i > 0U; --i) {
+                const ActiveCall& ac = inline_active[i - 1U];
+                if (ac.gen == call_gen && sameCallbackThread(ac.tid, tid)) {
+                    inline_active[i - 1U] = inline_active[--inline_count];
+                    break;
+                }
+            }
+        }
+        if (waiters > 0U) {
+            sync.broadcast();
+        }
+    }
+
+    bool hasOtherInFlightUpTo(CallbackThreadId self_tid, uint64_t max_gen) const {
+        for (unsigned i = 0U; i < inline_count; ++i) {
+            if (inline_active[i].gen <= max_gen &&
+                !sameCallbackThread(inline_active[i].tid, self_tid)) {
+                return true;
+            }
+        }
+        for (size_t i = 0U; i < overflow_active.size(); ++i) {
+            if (overflow_active[i].gen <= max_gen &&
+                !sameCallbackThread(overflow_active[i].tid, self_tid)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    void setAndWaitLocked(Fn new_fn, void* new_user, CallbackThreadId self_tid, EvoStateSync& sync) {
+        if (new_fn == fn && new_user == user && new_fn != NULL) {
+            if (gen > 0U) {
+                const uint64_t prior_gen = gen - 1U;
+                while (hasOtherInFlightUpTo(self_tid, prior_gen)) {
+                    ++waiters;
+                    sync.wait();
+                    --waiters;
+                }
+            }
+            return;
+        }
+        const uint64_t wait_gen = gen;
+        fn = new_fn;
+        user = new_user;
+        ++gen;
+        while (hasOtherInFlightUpTo(self_tid, wait_gen)) {
+            ++waiters;
+            sync.wait();
+            --waiters;
+        }
+    }
+};
+
+}  // namespace detail
+
+#endif  // CARPLAY_PLATFORM_EVO_CALLBACK_SYNC_DEFINED
 
 static const uint8_t kControllerFblock = 0xE5U;
 static const uint8_t kVolumeFblock = 0x15U;
@@ -95,6 +270,7 @@ public:
     EvoKnob();
     ~EvoKnob();
 
+    void setEventCallback(EventCallback cb, void* user);
     void setZbe3Callback(Zbe3Callback cb, void* user);
     void setMflTelephoneCallback(MflButtonCallback cb, void* user);
     void setMflPttCallback(MflButtonCallback cb, void* user);
@@ -144,22 +320,15 @@ private:
     InputMode mode_;
     bool query_older_immediately_;
 
-    EventCallback event_cb_;
-    void* event_user_;
-    Zbe3Callback zbe3_cb_;
-    void* zbe3_user_;
-    MflButtonCallback mfl_tel_cb_;
-    void* mfl_tel_user_;
-    MflButtonCallback mfl_ptt_cb_;
-    void* mfl_ptt_user_;
-    HardKeyCallback hard_key_cb_;
-    void* hard_key_user_;
-    VolumeCallback vol_cb_;
-    void* vol_user_;
-    VolumeLevelCallback level_cb_;
-    void* level_user_;
+    detail::EvoCallbackSlot<EventCallback> event_slot_;
+    detail::EvoCallbackSlot<Zbe3Callback> zbe3_slot_;
+    detail::EvoCallbackSlot<MflButtonCallback> mfl_tel_slot_;
+    detail::EvoCallbackSlot<MflButtonCallback> mfl_ptt_slot_;
+    detail::EvoCallbackSlot<HardKeyCallback> hard_key_slot_;
+    detail::EvoCallbackSlot<VolumeCallback> vol_slot_;
+    detail::EvoCallbackSlot<VolumeLevelCallback> level_slot_;
 
-    mutable Mutex state_mutex_;
+    mutable detail::EvoStateSync state_sync_;
     bool running_;
     bool owned_;
     bool phone_to_idrive_;
@@ -187,6 +356,7 @@ private:
 
     bool sent_push_;
     uint8_t sent_buttons_;
+    uint8_t hard_key_down_;
 
     unsigned gets_;
     unsigned messages_;

@@ -10,10 +10,11 @@
 //     threads; they enqueue under a Mutex and wake the Reactor via Reactor::post().
 //   * handle*(), setOwned(), setPictureStarted(), setPhoneToIdrive(), setDisplaySize(),
 //     onSessionEnded(), attach(), detach(), and the destructor run on the Reactor thread.
-//   * Lifetime: EvoKnob::stop() and EvoTouch::stop() must have returned before detach() or
-//     the destructor. The workers invoke the callbacks outside their own lock, so clearing
-//     the callback pointers is not a barrier against a call already in flight, and
-//     Reactor::cancelPosted() requires that nothing posts for this bridge any more.
+//   * Lifetime: detach() clears every EvoKnob and EvoTouch callback through their quiescent
+//     barriers, so when detach() returns no worker thread is inside or can enter any submit*()
+//     of this bridge even if EvoKnob / EvoTouch workers are still running. ~EvoInputBridge()
+//     calls detach() before reactor_.cancelPosted() so no queued task or late post can
+//     outlive the bridge.
 
 #include <stddef.h>
 #include <stdint.h>
