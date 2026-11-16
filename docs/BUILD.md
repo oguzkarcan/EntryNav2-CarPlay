@@ -98,14 +98,20 @@ Thanks to the dlopen policy, the sysroot is **not needed to build**. It is only 
    ```sh
    make daemon                                 # builds <BUILD_DIR>/carplayd
    make hmiapp                                 # builds <BUILD_DIR>/libEntryCarPlay.so
+   make hmiapp-res                             # builds EntryCarPlay_ALL_{Texts,Images}.zip (requires python3)
    make install-layout                         # stages the full head-unit rootfs tree under <BUILD_DIR>/install-root:
    #   /opt/carplay/carplayd
    #   /opt/hmi/data/ro/Plugins/EntryCarPlay/EntryCarPlay
    #   /opt/hmi/data/ro/Plugins/EntryCarPlay/libEntryCarPlay.so
    #   /opt/hmi/data/ro/Plugins/EntryCarPlay/EntryCarPlay.manifest
    #   /opt/hmi/data/ro/Plugins/EntryCarPlay/EntryCarPlay.xml
+   #   /opt/hmi/data/ro/Plugins/EntryCarPlay/EntryCarPlay_ALL_Texts.zip
+   #   /opt/hmi/data/ro/Plugins/EntryCarPlay/EntryCarPlay_ALL_Images.zip
    #   /var/local/data/CarPlay/
    ```
+   `hmiapp/make_db.py` uses only the Python 3 standard library, enumerates every `textId` and `imageId` from `hmiapp/EntryCarPlay.xml` (failing if any ID is missing or an image size disagrees), and writes deterministic archives with fixed timestamps. `make` / `make tests` / `scripts/ci/build_and_test.sh` do not invoke `python3`, so the Debian 7 `wheezy` ARM CI container does not need it.
+
+   **Coexistence note (`entryButtonFocusID="32752"`):** `hmiapp/EntryCarPlay.xml` keeps `entryButtonFocusID="32752"` (`0x7FF0`, a 16-bit focus ID inside `HmiMain3D`'s Media state `insertStateID="20"`), matching `EntryAad.xml` from the `EntryNav2-Android-Auto` reference. Neither the reference nor its docs establish which other `entryButtonFocusID` values `HmiMain3D` accepts without colliding with native Media or `PluginsCoded` entries, so an arbitrary ID must not be guessed. As a result, `EntryCarPlay` and `EntryAad` cannot be installed side-by-side in `/opt/hmi/data/ro/Plugins/` unless one plugin's `entryButtonFocusID` is verified and adjusted on target. XML comments are intentionally omitted from `EntryCarPlay.xml` to avoid any risk to `HmiMain3D`'s XML parser.
 
 ## 6. Hard rule: the sysroot never leaves the PC
 
