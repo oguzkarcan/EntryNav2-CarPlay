@@ -15,10 +15,27 @@
 //       - stream.type == 101                                       -> "carplay_alt" (1ch mono)
 //       - audio_type == "telephony" or "speechrecognition"         -> "tel_out1" (1ch mono)
 //       - otherwise (100/102 "media", "default", "alert", ...)     -> "entertainment" (2ch stereo)
+//   * Device-level exclusivity & ownership:
+//       - Target dshare PCMs fail a second concurrent open with -EBUSY, so EvoAudioSink enforces
+//         at most one open (or opening) ALSA handle per device name, always closing the previous
+//         handle before opening the next.
+//       - When a stream starts on a device that already has an owner, the most recently started
+//         stream becomes the owner and the previous owner is parked (its ALSA handle is closed,
+//         queued PCM is cleared, incoming PCM is discarded and counted in
+//         Stats::parked_frames_discarded, and the stream is neither destroyed nor marked failed).
+//       - Ownership changes happen only on stream start (including the first implicit start of an
+//         unknown AudioStreamId via onAudioPcm) and stream stop/failure events, never because PCM
+//         arrived for an already-known parked stream.
+//       - When the owner stops (onAudioStopped), is replaced by a format change of the same ID, or
+//         fails, the most recently started parked stream on that device (if any) resumes as owner
+//         and reopens with its own format and fresh audio (stale queued PCM is not replayed).
+//       - Software mixing of multiple streams into a single ALSA handle is out of scope and is
+//         not implemented.
 //   * Stereo -> mono downmix ((L + R) / 2) and mono -> stereo upmix are applied automatically when
 //     a stream's source channel count differs from the target ALSA channel count.
-//   * Ducking attenuates main media ("entertainment") streams while leaving "carplay_alt" and
-//     "tel_out1" at full unity volume.
+//   * Ducking attenuates main media ("entertainment") streams with a configurable linear per-frame
+//     Q15 gain ramp while leaving "carplay_alt" and "tel_out1" at full unity volume. A parked
+//     "carplay_alt" stream is inaudible and does not count as active for duck_on_alt_stream.
 
 #include <stddef.h>
 #include <stdint.h>
@@ -118,7 +135,8 @@ struct EvoAudioConfig {
     int soft_resample;                // default 1
     uint32_t max_queue_ms;            // default 500 ms bounded queue per stream
     int32_t duck_gain_q15;            // default 8192 (~0.25, -12 dB; 32768 = unity)
-    bool duck_on_alt_stream;          // default false: auto-duck media when alt stream is open
+    bool duck_on_alt_stream;          // default false: auto-duck media when alt stream is active owner
+    uint32_t duck_ramp_ms;            // default 15 ms linear per-frame Q15 ramp on duck change (0 = instant)
     bool conceal_packet_loss;         // default false: queue 20 ms silence on onAudioPacketLost
 
     EvoAudioConfig();
@@ -156,7 +174,9 @@ public:
         uint64_t underrun_recoveries;
         uint64_t write_errors;
         uint64_t packet_loss_events;
+        uint64_t parked_frames_discarded;
         size_t active_streams;
+        size_t parked_streams;
 
         Stats()
             : streams_opened(0),
@@ -167,7 +187,9 @@ public:
               underrun_recoveries(0),
               write_errors(0),
               packet_loss_events(0),
-              active_streams(0) {}
+              parked_frames_discarded(0),
+              active_streams(0),
+              parked_streams(0) {}
     };
 
     explicit EvoAudioSink(const EvoAudioConfig& config = EvoAudioConfig());
