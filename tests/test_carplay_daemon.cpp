@@ -33,7 +33,9 @@
 
 #ifndef _WIN32
 #include <dlfcn.h>
+#include <signal.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 #endif
@@ -48,6 +50,8 @@ using namespace carplay;
 namespace plat = carplay::platform;
 typedef std::vector<uint8_t> Bytes;
 typedef std::vector<tlv8::Item> Items;
+
+std::string g_argv0_exe;
 
 void sleepMs(int ms) {
     if (ms <= 0) return;
@@ -81,6 +85,156 @@ void removeTempDir(const std::string& dir) {
     (void)rc;
 #endif
 }
+
+#ifndef _WIN32
+std::string selfExePath() {
+    char buf[512] = "";
+    const ssize_t rlen = readlink("/proc/self/exe", buf, sizeof(buf) - 1U);
+    if (rlen > 0) {
+        buf[rlen] = '\0';
+        const std::string exe(buf);
+        const size_t slash = exe.find_last_of('/');
+        const std::string base = (slash != std::string::npos) ? exe.substr(slash + 1U) : exe;
+        if (base.compare(0U, 5U, "qemu-") != 0) {
+            return exe;
+        }
+    }
+    if (!g_argv0_exe.empty()) {
+        char resolved[512] = "";
+        if (realpath(g_argv0_exe.c_str(), resolved) != NULL) {
+            return std::string(resolved);
+        }
+        return g_argv0_exe;
+    }
+    return "build/host/test_carplay_daemon";
+}
+
+std::string siblingBinaryPath(const char* name) {
+    const std::string self = selfExePath();
+    const size_t slash = self.find_last_of('/');
+    if (slash != std::string::npos) {
+        return self.substr(0, slash + 1U) + name;
+    }
+    return std::string("build/host/") + name;
+}
+
+std::string readTextFile(const std::string& path) {
+    std::vector<uint8_t> data;
+    if (plat::readFileBounded(path, 262144U, data) != plat::kFileReadOk || data.empty()) {
+        return std::string();
+    }
+    return std::string(reinterpret_cast<const char*>(&data[0]), data.size());
+}
+
+size_t countNonEmptyLines(const std::string& text) {
+    size_t lines = 0U;
+    size_t pos = 0U;
+    while (pos < text.size()) {
+        const size_t nl = text.find('\n', pos);
+        const size_t end = (nl == std::string::npos) ? text.size() : nl;
+        if (end > pos) {
+            ++lines;
+        }
+        if (nl == std::string::npos) {
+            break;
+        }
+        pos = nl + 1U;
+    }
+    return lines;
+}
+
+bool testIsZombiePid(pid_t pid) {
+    char stat_path[64];
+    snprintf(stat_path, sizeof(stat_path), "/proc/%d/stat", static_cast<int>(pid));
+    FILE* f = fopen(stat_path, "r");
+    if (!f) {
+        return false;
+    }
+    char buf[256];
+    const size_t n = fread(buf, 1, sizeof(buf) - 1U, f);
+    fclose(f);
+    buf[n] = '\0';
+    const char* rparen = strrchr(buf, ')');
+    return (rparen != NULL && rparen[1] == ' ' && rparen[2] == 'Z');
+}
+
+bool testPidAliveNotZombie(pid_t pid) {
+    if (pid <= 1) {
+        return false;
+    }
+    if (kill(pid, 0) != 0 && errno != EPERM) {
+        return false;
+    }
+    return !testIsZombiePid(pid);
+}
+
+pid_t waitForMockPidInLog(const std::string& log_path, pid_t after_pid, int timeout_ms) {
+    const int64_t dl = plat::monotonicMillis() + timeout_ms;
+    while (plat::monotonicMillis() < dl) {
+        const std::string txt = readTextFile(log_path);
+        const char* tag = "MOCK_SERVICE_PID=";
+        const size_t pos = txt.rfind(tag);
+        if (pos != std::string::npos) {
+            const pid_t pid = static_cast<pid_t>(atoi(txt.c_str() + pos + strlen(tag)));
+            if (pid > 1 && pid != after_pid && testPidAliveNotZombie(pid)) {
+                return pid;
+            }
+        }
+        sleepMs(10);
+    }
+    return 0;
+}
+
+bool waitForLogSubstring(const std::string& log_path, const char* needle, int timeout_ms) {
+    const int64_t dl = plat::monotonicMillis() + timeout_ms;
+    while (plat::monotonicMillis() < dl) {
+        if (readTextFile(log_path).find(needle) != std::string::npos) {
+            return true;
+        }
+        sleepMs(10);
+    }
+    return false;
+}
+
+bool waitForPidReaped(pid_t pid, const std::string& app_log, int timeout_ms) {
+    char ended_tag[64];
+    snprintf(ended_tag, sizeof(ended_tag), "child pid %d ended", static_cast<int>(pid));
+    const int64_t dl = plat::monotonicMillis() + timeout_ms;
+    while (plat::monotonicMillis() < dl) {
+        if (!testPidAliveNotZombie(pid) &&
+            readTextFile(app_log).find(ended_tag) != std::string::npos) {
+            // Give the detached reaper thread a brief moment to return out of library code.
+            sleepMs(20);
+            return true;
+        }
+        sleepMs(10);
+    }
+    return false;
+}
+
+struct ControlCapture {
+    plat::Mutex mu;
+    std::vector<std::string> verbs;
+
+    static void onCmd(const plat::ControlCommand& cmd, void* user) {
+        ControlCapture* self = static_cast<ControlCapture*>(user);
+        if (self != NULL) {
+            plat::LockGuard lock(self->mu);
+            self->verbs.push_back(cmd.verb);
+        }
+    }
+
+    bool hasVerb(const char* verb) {
+        plat::LockGuard lock(mu);
+        for (size_t i = 0; i < verbs.size(); ++i) {
+            if (verbs[i] == verb) {
+                return true;
+            }
+        }
+        return false;
+    }
+};
+#endif
 
 // =================================================================================================
 // 1. Service Contract & Control Command Parser
@@ -505,8 +659,13 @@ struct MockBmwEnv {
     void* fake_vtable_alloc[38];
     void* fake_runnable_vtbl[5];
     unsigned last_action_id;
+    unsigned action_ids[16];
     plat::BmwActionDelegate actions[16];
     size_t action_count;
+    unsigned state_ids[8];
+    unsigned state_kinds[8];
+    plat::BmwActionDelegate state_handlers[8];
+    size_t state_count;
     plat::BmwCdsDelegate cds[8];
     size_t cds_count;
     std::vector<unsigned> triggered_events;
@@ -519,12 +678,47 @@ struct MockBmwEnv {
     MockBmwEnv()
         : last_action_id(0U),
           action_count(0U),
+          state_count(0U),
           cds_count(0U),
           base_on_init_called(false),
           base_on_finalize_called(false),
           dtor_called(false) {
         memset(fake_vtable_alloc, 0, sizeof(fake_vtable_alloc));
         memset(fake_runnable_vtbl, 0, sizeof(fake_runnable_vtbl));
+        memset(action_ids, 0, sizeof(action_ids));
+        memset(actions, 0, sizeof(actions));
+        memset(state_ids, 0, sizeof(state_ids));
+        memset(state_kinds, 0, sizeof(state_kinds));
+        memset(state_handlers, 0, sizeof(state_handlers));
+        memset(cds, 0, sizeof(cds));
+    }
+
+    const plat::BmwActionDelegate* findAction(unsigned action_id) const {
+        for (size_t i = 0U; i < action_count; ++i) {
+            if (action_ids[i] == action_id) {
+                return &actions[i];
+            }
+        }
+        return NULL;
+    }
+
+    const plat::BmwActionDelegate* findState(unsigned state_id, unsigned kind) const {
+        for (size_t i = 0U; i < state_count; ++i) {
+            if (state_ids[i] == state_id && state_kinds[i] == kind) {
+                return &state_handlers[i];
+            }
+        }
+        return NULL;
+    }
+
+    bool invokeAction(unsigned action_id) const {
+        const plat::BmwActionDelegate* d = findAction(action_id);
+        if (d == NULL || d->stub == NULL) {
+            return false;
+        }
+        plat::BmwParcelStorage p;
+        memset(&p, 0, sizeof(p));
+        return d->stub(d->object, p);
     }
 };
 
@@ -574,10 +768,19 @@ void mockPluginAppCtor(void* self,
 void mockAddAction(void*, unsigned action_id, const plat::BmwActionDelegate& d) {
     if (g_mock_bmw != NULL && g_mock_bmw->action_count < 16U) {
         g_mock_bmw->last_action_id = action_id;
-        g_mock_bmw->actions[g_mock_bmw->action_count++] = d;
+        g_mock_bmw->action_ids[g_mock_bmw->action_count] = action_id;
+        g_mock_bmw->actions[g_mock_bmw->action_count] = d;
+        ++g_mock_bmw->action_count;
     }
 }
-void mockAddState(void*, unsigned, unsigned, const plat::BmwActionDelegate&) {}
+void mockAddState(void*, unsigned state_id, unsigned kind, const plat::BmwActionDelegate& d) {
+    if (g_mock_bmw != NULL && g_mock_bmw->state_count < 8U) {
+        g_mock_bmw->state_ids[g_mock_bmw->state_count] = state_id;
+        g_mock_bmw->state_kinds[g_mock_bmw->state_count] = kind;
+        g_mock_bmw->state_handlers[g_mock_bmw->state_count] = d;
+        ++g_mock_bmw->state_count;
+    }
+}
 void mockTriggerEvent(void*, unsigned ev) {
     if (g_mock_bmw != NULL) {
         g_mock_bmw->triggered_events.push_back(ev);
@@ -618,6 +821,61 @@ void mockOnFinalize(void*) {
     }
 }
 
+void initMockFrameworkApi(plat::BmwFrameworkApi& api, MockBmwEnv& env) {
+    api.parcel_ctor_bool = &mockParcelCtorBool;
+    api.parcel_dtor = &mockParcelDtor;
+    api.parcel_read_bool = &mockParcelReadBool;
+    api.bstr_ctor_cstr = &mockBstrCtor;
+    api.bstr_dtor = &mockBstrDtor;
+    api.text_id_ctor = &mockTextIdCtor;
+    api.image_id_ctor = &mockImageIdCtor;
+    api.plugin_app_ctor = &mockPluginAppCtor;
+    api.add_action_handler = &mockAddAction;
+    api.add_state_handler = &mockAddState;
+    api.trigger_event = &mockTriggerEvent;
+    api.trigger_event_parcel = &mockTriggerEventParcel;
+    api.post_runnable = &mockPostRunnable;
+    api.update_model_text = &mockUpdateText;
+    api.update_model_image = &mockUpdateImage;
+    api.update_model_bool = &mockUpdateBool;
+    api.set_property = &mockSetProperty;
+    api.cds_add_handler = &mockCdsAdd;
+    api.on_init = &mockOnInit;
+    api.on_finalize = &mockOnFinalize;
+    api.runnable_vtable = env.fake_runnable_vtbl;
+}
+
+typedef void (*SetApiFn)(const plat::BmwFrameworkApi*,
+                         const char*,
+                         const char*,
+                         const char*,
+                         const plat::EntryCarPlayTestOptions*);
+
+void invokeRunnableObj(void* runnable) {
+    void** vptr = *reinterpret_cast<void***>(runnable);
+    void (*run_fn)(void*) = NULL;
+    memcpy(&run_fn, &vptr[2], sizeof(run_fn));
+    run_fn(runnable);
+}
+
+#ifndef _WIN32
+struct ChildWaitGuard {
+    pid_t pid;
+    bool wait_locally;
+
+    ChildWaitGuard() : pid(0), wait_locally(true) {}
+    ~ChildWaitGuard() {
+        if (pid > 1) {
+            kill(pid, SIGKILL);
+            if (wait_locally) {
+                int st = 0;
+                waitpid(pid, &st, 0);
+            }
+        }
+    }
+};
+#endif
+
 TEST_CASE(testHmiPluginAbiAndMockFramework) {
     // 1. Crash guard & boot guard tests
     const std::string dir = makeTempDir("cp_hmi_guards");
@@ -651,19 +909,7 @@ TEST_CASE(testHmiPluginAbiAndMockFramework) {
         CHECK_EQ(static_cast<size_t>(0x14U), offsetof(EntryPluginAppInfo, destroy));
     }
 
-    // Locate libEntryCarPlay.so in the same build directory as the running test binary
-    char self_path[512] = "";
-    const ssize_t rlen = readlink("/proc/self/exe", self_path, sizeof(self_path) - 1);
-    std::string so_path = "build/host/libEntryCarPlay.so";
-    if (rlen > 0) {
-        self_path[rlen] = '\0';
-        std::string exe(self_path);
-        const size_t slash = exe.find_last_of('/');
-        if (slash != std::string::npos) {
-            so_path = exe.substr(0, slash + 1) + "libEntryCarPlay.so";
-        }
-    }
-
+    const std::string so_path = siblingBinaryPath("libEntryCarPlay.so");
     void* handle = dlopen(so_path.c_str(), RTLD_NOW | RTLD_LOCAL);
     REQUIRE(handle != NULL);
 
@@ -678,7 +924,6 @@ TEST_CASE(testHmiPluginAbiAndMockFramework) {
     REQUIRE(info->create != NULL);
     REQUIRE(info->destroy != NULL);
 
-    typedef void (*SetApiFn)(const plat::BmwFrameworkApi*, const char*, const char*, const char*);
     SetApiFn set_api = NULL;
     void* set_api_sym = dlsym(handle, "entryCarPlaySetFrameworkApiForTest");
     REQUIRE(set_api_sym != NULL);
@@ -688,31 +933,11 @@ TEST_CASE(testHmiPluginAbiAndMockFramework) {
     g_mock_bmw = &mock_env;
 
     plat::BmwFrameworkApi api;
-    api.parcel_ctor_bool = &mockParcelCtorBool;
-    api.parcel_dtor = &mockParcelDtor;
-    api.parcel_read_bool = &mockParcelReadBool;
-    api.bstr_ctor_cstr = &mockBstrCtor;
-    api.bstr_dtor = &mockBstrDtor;
-    api.text_id_ctor = &mockTextIdCtor;
-    api.image_id_ctor = &mockImageIdCtor;
-    api.plugin_app_ctor = &mockPluginAppCtor;
-    api.add_action_handler = &mockAddAction;
-    api.add_state_handler = &mockAddState;
-    api.trigger_event = &mockTriggerEvent;
-    api.trigger_event_parcel = &mockTriggerEventParcel;
-    api.post_runnable = &mockPostRunnable;
-    api.update_model_text = &mockUpdateText;
-    api.update_model_image = &mockUpdateImage;
-    api.update_model_bool = &mockUpdateBool;
-    api.set_property = &mockSetProperty;
-    api.cds_add_handler = &mockCdsAdd;
-    api.on_init = &mockOnInit;
-    api.on_finalize = &mockOnFinalize;
-    api.runnable_vtable = mock_env.fake_runnable_vtbl;
+    initMockFrameworkApi(api, mock_env);
     CHECK(api.isComplete());
 
     const std::string state_file = dir + "/state";
-    set_api(&api, dir.c_str(), "cp-test-hmi-ctrl", state_file.c_str());
+    set_api(&api, dir.c_str(), "cp-test-hmi-ctrl", state_file.c_str(), NULL);
 
     int dummy_disp = 0;
     int dummy_params = 0;
@@ -729,20 +954,17 @@ TEST_CASE(testHmiPluginAbiAndMockFramework) {
     CHECK(on_init_hook(app));
     CHECK(mock_env.base_on_init_called);
     CHECK_EQ(static_cast<size_t>(5U), mock_env.action_count);
+    CHECK_EQ(static_cast<size_t>(4U), mock_env.state_count);
+    CHECK(mock_env.findAction(plat::rhmi::kActStart) != NULL);
+    CHECK(mock_env.findAction(plat::rhmi::kActStop) != NULL);
+    CHECK(mock_env.findState(plat::rhmi::kMenuState, plat::rhmi::kHandlerFocus) != NULL);
+    CHECK(mock_env.findState(plat::rhmi::kCarPlayState, plat::rhmi::kHandlerVisible) != NULL);
     REQUIRE(mock_env.posted_runnables.size() == 2U);
 
-    // Invoke posted subscribeRun runnable (slot 2 of runnable vptr)
-    void** sub_vptr = *reinterpret_cast<void***>(mock_env.posted_runnables[0]);
-    void (*sub_run)(void*) = NULL;
-    memcpy(&sub_run, &sub_vptr[2], sizeof(sub_run));
-    sub_run(mock_env.posted_runnables[0]);
+    // Invoke posted subscribeRun runnable and statusRun runnable
+    invokeRunnableObj(mock_env.posted_runnables[0]);
     CHECK_EQ(static_cast<size_t>(6U), mock_env.cds_count);
-
-    // Invoke posted statusRun runnable
-    void** st_vptr = *reinterpret_cast<void***>(mock_env.posted_runnables[1]);
-    void (*st_run)(void*) = NULL;
-    memcpy(&st_run, &st_vptr[2], sizeof(st_run));
-    st_run(mock_env.posted_runnables[1]);
+    invokeRunnableObj(mock_env.posted_runnables[1]);
 
     // Invoke vtable slot 23 (onFinalize) and destroy
     void (*on_fin_hook)(void*) = NULL;
@@ -754,11 +976,386 @@ TEST_CASE(testHmiPluginAbiAndMockFramework) {
     info->destroy(app);
     CHECK(mock_env.dtor_called);
 
-    set_api(NULL, NULL, NULL, NULL);
+    set_api(NULL, NULL, NULL, NULL, NULL);
     g_mock_bmw = NULL;
     dlclose(handle);
 #endif
     removeTempDir(dir);
+}
+
+TEST_CASE(testHmiPluginErrorGuardsAndEdgeCases) {
+#ifdef _WIN32
+    return;
+#else
+    const std::string dir = makeTempDir("cp_hmi_errguards");
+    const std::string state_file = dir + "/state";
+    const std::string guard_file = dir + "/app-guard";
+    const std::string disable_file = dir + "/app.disable";
+    const std::string so_path = siblingBinaryPath("libEntryCarPlay.so");
+
+    void* handle = dlopen(so_path.c_str(), RTLD_NOW | RTLD_LOCAL);
+    REQUIRE(handle != NULL);
+
+    const EntryPluginAppInfo* info =
+        reinterpret_cast<const EntryPluginAppInfo*>(dlsym(handle, "pluginAppInfo"));
+    REQUIRE(info != NULL);
+    SetApiFn set_api = NULL;
+    void* set_api_sym = dlsym(handle, "entryCarPlaySetFrameworkApiForTest");
+    REQUIRE(set_api_sym != NULL);
+    memcpy(&set_api, &set_api_sym, sizeof(set_api));
+
+    MockBmwEnv mock_env;
+    g_mock_bmw = &mock_env;
+    plat::BmwFrameworkApi api;
+    initMockFrameworkApi(api, mock_env);
+
+    int dummy_disp = 0;
+    int dummy_params = 0;
+    int dummy_cfg = 0;
+
+    // 1. app.disable prevents createApp and does not create app-guard
+    const uint8_t one[2] = {'1', '\n'};
+    REQUIRE(plat::writeFileAtomic(disable_file, one, sizeof(one)));
+    set_api(&api, dir.c_str(), "cp-test-err-ctrl", state_file.c_str(), NULL);
+    CHECK(info->create(&dummy_disp, "EntryCarPlay", &dummy_params, &dummy_cfg) == NULL);
+    CHECK(!plat::pathExists(guard_file));
+    plat::removeFile(disable_file);
+
+    // 2. app-guard with 3 entries blocks createApp
+    static const char kThreeGuards[] = "100\n110\n120\n";
+    REQUIRE(plat::writeFileAtomic(
+        guard_file, reinterpret_cast<const uint8_t*>(kThreeGuards), sizeof(kThreeGuards) - 1U));
+    CHECK(info->create(&dummy_disp, "EntryCarPlay", &dummy_params, &dummy_cfg) == NULL);
+    CHECK_EQ(static_cast<size_t>(3U), countNonEmptyLines(readTextFile(guard_file)));
+    plat::removeFile(guard_file);
+
+    // 3. Missing framework API returns NULL and does NOT consume an app-guard entry
+    static const char kOneGuard[] = "100\n";
+    REQUIRE(plat::writeFileAtomic(
+        guard_file, reinterpret_cast<const uint8_t*>(kOneGuard), sizeof(kOneGuard) - 1U));
+    set_api(NULL, dir.c_str(), "cp-test-err-ctrl", state_file.c_str(), NULL);
+    CHECK(info->create(&dummy_disp, "EntryCarPlay", &dummy_params, &dummy_cfg) == NULL);
+    CHECK_EQ(static_cast<size_t>(1U), countNonEmptyLines(readTextFile(guard_file)));
+
+    // 4. Successful createApp + duplicate createApp does NOT consume extra guard entry
+    set_api(&api, dir.c_str(), "cp-test-err-ctrl", state_file.c_str(), NULL);
+    void* app = info->create(&dummy_disp, "EntryCarPlay", &dummy_params, &dummy_cfg);
+    REQUIRE(app != NULL);
+    CHECK_EQ(static_cast<size_t>(2U), countNonEmptyLines(readTextFile(guard_file)));
+    CHECK(info->create(&dummy_disp, "EntryCarPlay", &dummy_params, &dummy_cfg) == NULL);
+    CHECK_EQ(static_cast<size_t>(2U), countNonEmptyLines(readTextFile(guard_file)));
+
+    // 5. appOnError (vtable slot 21) handles non-NULL and NULL message cleanly
+    void** vtbl = *reinterpret_cast<void***>(app);
+    REQUIRE(vtbl != NULL);
+    void (*on_error_hook)(void*, unsigned, const plat::BmwBasicStringChar&) = NULL;
+    memcpy(&on_error_hook, &vtbl[21], sizeof(on_error_hook));
+    REQUIRE(on_error_hook != NULL);
+
+    plat::BmwBasicStringChar msg_ok;
+    msg_ok.data = const_cast<char*>("rhmi test warning");
+    on_error_hook(app, 42U, msg_ok);
+    plat::BmwBasicStringChar msg_null;
+    msg_null.data = NULL;
+    on_error_hook(app, 43U, msg_null);
+
+    const std::string app_log = readTextFile(dir + "/app.log");
+    CHECK(app_log.find("onError 42: rhmi test warning") != std::string::npos);
+    CHECK(app_log.find("onError 43: (null)") != std::string::npos);
+
+    // 6. destroyApp(NULL) is a safe no-op, followed by normal destroy
+    info->destroy(NULL);
+    info->destroy(app);
+    CHECK(mock_env.dtor_called);
+
+    set_api(NULL, NULL, NULL, NULL, NULL);
+    g_mock_bmw = NULL;
+    dlclose(handle);
+    removeTempDir(dir);
+#endif
+}
+
+TEST_CASE(testHmiPluginStopEscalationAndPidGuard) {
+#ifdef _WIN32
+    return;
+#else
+    const std::string dir = makeTempDir("cp_hmi_stop");
+    const std::string state_file = dir + "/state";
+    const std::string stop_file = dir + "/stop/STOP";
+    const std::string service_log = dir + "/service.log";
+    const std::string app_log = dir + "/app.log";
+    const std::string self_exe = selfExePath();
+    const std::string carplayd_bin = siblingBinaryPath("carplayd");
+    const std::string so_path = siblingBinaryPath("libEntryCarPlay.so");
+
+    char ctrl_name[64];
+    snprintf(ctrl_name, sizeof(ctrl_name), "cp-test-stop-%d", static_cast<int>(getpid()));
+
+    void* handle = dlopen(so_path.c_str(), RTLD_NOW | RTLD_LOCAL);
+    REQUIRE(handle != NULL);
+    const EntryPluginAppInfo* info =
+        reinterpret_cast<const EntryPluginAppInfo*>(dlsym(handle, "pluginAppInfo"));
+    REQUIRE(info != NULL);
+    SetApiFn set_api = NULL;
+    void* set_api_sym = dlsym(handle, "entryCarPlaySetFrameworkApiForTest");
+    REQUIRE(set_api_sym != NULL);
+    memcpy(&set_api, &set_api_sym, sizeof(set_api));
+
+    MockBmwEnv mock_env;
+    g_mock_bmw = &mock_env;
+    plat::BmwFrameworkApi api;
+    initMockFrameworkApi(api, mock_env);
+
+    plat::EntryCarPlayTestOptions opts;
+    opts.stop_file = stop_file.c_str();
+    opts.service_bin = self_exe.c_str();
+    opts.service_log = service_log.c_str();
+    opts.stop_term_ms = 40L;
+    opts.stop_kill_ms = 120L;
+    opts.stop_giveup_ms = 500L;
+    opts.launch_debounce_ms = 0L;
+
+    // A0. onStopRow creates STOP file & sends "quit" over a bound EvoControl channel
+    {
+        ControlCapture cap;
+        plat::EvoControl ctrl;
+        REQUIRE(ctrl.start(ctrl_name, state_file.c_str(), &ControlCapture::onCmd, &cap));
+
+        set_api(&api, dir.c_str(), ctrl_name, state_file.c_str(), &opts);
+        int dummy = 0;
+        void* app = info->create(&dummy, "EntryCarPlay", &dummy, &dummy);
+        REQUIRE(app != NULL);
+        void** vtbl = *reinterpret_cast<void***>(app);
+        bool (*on_init_hook)(void*) = NULL;
+        memcpy(&on_init_hook, &vtbl[22], sizeof(on_init_hook));
+        REQUIRE(on_init_hook(app));
+
+        CHECK(mock_env.invokeAction(plat::rhmi::kActStop));
+        CHECK(plat::pathExists(stop_file));
+        const int64_t q_dl = plat::monotonicMillis() + 1000;
+        while (plat::monotonicMillis() < q_dl && !cap.hasVerb("quit")) {
+            sleepMs(10);
+        }
+        CHECK(cap.hasVerb("quit"));
+
+        info->destroy(app);
+        ctrl.stop();
+        plat::removeFile(state_file);
+        plat::removeFile(stop_file);
+    }
+
+    // A. Direct child (`kService` ignoring SIGTERM) spawned via onStartRow escalates SIGTERM -> SIGKILL
+    // B. Start after Stop unlinks STOP file and cancels pending escalation
+    {
+        plat::removeFile(dir + "/app-guard");
+        mock_env = MockBmwEnv();
+        set_api(&api, dir.c_str(), ctrl_name, state_file.c_str(), &opts);
+        int dummy = 0;
+        void* app = info->create(&dummy, "EntryCarPlay", &dummy, &dummy);
+        REQUIRE(app != NULL);
+        void** vtbl = *reinterpret_cast<void***>(app);
+        bool (*on_init_hook)(void*) = NULL;
+        memcpy(&on_init_hook, &vtbl[22], sizeof(on_init_hook));
+        REQUIRE(on_init_hook(app));
+        REQUIRE(mock_env.posted_runnables.size() == 2U);
+        void* status_runnable = mock_env.posted_runnables[1];
+
+        // Spawn mock hung service (--service ignores SIGTERM)
+        CHECK(mock_env.invokeAction(plat::rhmi::kActStart));
+        const pid_t svc_pid = waitForMockPidInLog(service_log, 0, 2000);
+        REQUIRE(svc_pid > 1);
+        CHECK(testPidAliveNotZombie(svc_pid));
+
+        CHECK(mock_env.invokeAction(plat::rhmi::kActStop));
+        CHECK(plat::pathExists(stop_file));
+
+        // Past stop_term_ms (40 ms), before stop_kill_ms (120 ms): SIGTERM sent, process ignores it
+        sleepMs(55);
+        invokeRunnableObj(status_runnable);
+        CHECK(waitForLogSubstring(app_log, "-> SIGTERM", 500));
+        CHECK(testPidAliveNotZombie(svc_pid));
+
+        // Past stop_kill_ms (120 ms): SIGKILL sent and child reaped
+        sleepMs(85);
+        invokeRunnableObj(status_runnable);
+        CHECK(waitForLogSubstring(app_log, "-> SIGKILL", 500));
+        CHECK(waitForPidReaped(svc_pid, app_log, 2000));
+
+        // B. Start after Stop unlinks STOP file and cancels pending escalation
+        CHECK(mock_env.invokeAction(plat::rhmi::kActStop));
+        CHECK(plat::pathExists(stop_file));
+        CHECK(mock_env.invokeAction(plat::rhmi::kActStart));
+        CHECK(!plat::pathExists(stop_file));
+        const pid_t svc_pid2 = waitForMockPidInLog(service_log, svc_pid, 2000);
+        REQUIRE(svc_pid2 > 1);
+        sleepMs(150);  // Well past stop_kill_ms: must NOT kill newly started child!
+        invokeRunnableObj(status_runnable);
+        CHECK(testPidAliveNotZombie(svc_pid2));
+
+        // Clean up svc_pid2 before resetting session
+        kill(svc_pid2, SIGKILL);
+        CHECK(waitForPidReaped(svc_pid2, app_log, 2000));
+
+        info->destroy(app);
+        plat::removeFile(state_file);
+        plat::removeFile(stop_file);
+    }
+
+    // C. kSupervisor + frozen real carplayd: only verified carplayd receives SIGTERM -> SIGKILL
+    {
+        plat::removeFile(dir + "/app-guard");
+        plat::removeFile(service_log);
+        mock_env = MockBmwEnv();
+        plat::EntryCarPlayTestOptions sup_opts = opts;
+        sup_opts.supervisor_bin = self_exe.c_str();
+        sup_opts.service_bin = NULL;  // expected basename stays "carplayd"
+
+        const std::string daemon_data = dir + "/daemon_data";
+        mkdir(daemon_data.c_str(), 0700);
+        set_api(&api, dir.c_str(), ctrl_name, state_file.c_str(), &sup_opts);
+
+        int dummy = 0;
+        void* app = info->create(&dummy, "EntryCarPlay", &dummy, &dummy);
+        REQUIRE(app != NULL);
+        void** vtbl = *reinterpret_cast<void***>(app);
+        bool (*on_init_hook)(void*) = NULL;
+        memcpy(&on_init_hook, &vtbl[22], sizeof(on_init_hook));
+        REQUIRE(on_init_hook(app));
+        REQUIRE(mock_env.posted_runnables.size() == 2U);
+        void* status_runnable = mock_env.posted_runnables[1];
+
+        // Spawn mock supervisor through launchDaemonProcess
+        CHECK(mock_env.invokeAction(plat::rhmi::kActStart));
+        const pid_t sup_pid = waitForMockPidInLog(service_log, 0, 2000);
+        REQUIRE(sup_pid > 1);
+
+        // Spawn real carplayd as a direct child of the test so we can waitpid() and SIGSTOP it
+        ChildWaitGuard carplayd_guard;
+        const pid_t dpid = fork();
+        REQUIRE(dpid >= 0);
+        if (dpid == 0) {
+            const char* dargv[] = {
+                carplayd_bin.c_str(),
+                "--no-ilm-size",
+                "--no-video",
+                "--no-audio",
+                "--no-input",
+                "--port", "0",
+                "--data-dir", daemon_data.c_str(),
+                "--control-name", ctrl_name,
+                "--state-file", state_file.c_str(),
+                NULL
+            };
+            execv(carplayd_bin.c_str(), const_cast<char* const*>(dargv));
+            _exit(127);
+        }
+        carplayd_guard.pid = dpid;
+
+        // Wait until carplayd writes its state file with its own PID
+        const int64_t st_dl = plat::monotonicMillis() + 3000;
+        bool state_ready = false;
+        while (plat::monotonicMillis() < st_dl) {
+            const plat::ServiceState st = plat::readServiceStateFile(state_file.c_str(), NULL);
+            if (st.pid == static_cast<int>(dpid)) {
+                state_ready = true;
+                break;
+            }
+            sleepMs(20);
+        }
+        REQUIRE(state_ready);
+
+        // Freeze carplayd so it cannot respond to STOP or "quit" or SIGTERM until SIGKILL
+        REQUIRE(kill(dpid, SIGSTOP) == 0);
+
+        CHECK(mock_env.invokeAction(plat::rhmi::kActStop));
+        CHECK(plat::pathExists(stop_file));
+
+        sleepMs(55);
+        invokeRunnableObj(status_runnable);
+        CHECK(waitForLogSubstring(app_log, "verified daemon pid", 500));
+        CHECK(testPidAliveNotZombie(sup_pid));
+
+        sleepMs(85);
+        invokeRunnableObj(status_runnable);
+
+        const int64_t kill_dl = plat::monotonicMillis() + 2000;
+        int dstatus = 0;
+        pid_t wr = 0;
+        while (plat::monotonicMillis() < kill_dl) {
+            wr = waitpid(dpid, &dstatus, WNOHANG);
+            if (wr == dpid) {
+                break;
+            }
+            sleepMs(10);
+        }
+        CHECK_EQ(dpid, wr);
+        CHECK(WIFSIGNALED(dstatus) && WTERMSIG(dstatus) == SIGKILL);
+        carplayd_guard.pid = 0;  // already reaped
+        CHECK(testPidAliveNotZombie(sup_pid));  // supervisor was never signalled!
+
+        // Stop mock supervisor cleanly and wait for plugin reaper before next sub-case
+        kill(sup_pid, SIGKILL);
+        CHECK(waitForPidReaped(sup_pid, app_log, 2000));
+
+        info->destroy(app);
+        plat::removeFile(state_file);
+        plat::removeFile(stop_file);
+    }
+
+    // D. Negative PID-verification test: unrelated process in state_file must NOT be signalled
+    {
+        plat::removeFile(dir + "/app-guard");
+        mock_env = MockBmwEnv();
+        plat::EntryCarPlayTestOptions neg_opts = opts;
+        neg_opts.service_bin = NULL;  // expects "carplayd", whereas child is "test_carplay_daemon"
+
+        ChildWaitGuard unrelated_guard;
+        const pid_t other_pid = fork();
+        REQUIRE(other_pid >= 0);
+        if (other_pid == 0) {
+            const char* uargv[] = {self_exe.c_str(), "--mock-hang", NULL};
+            execv(self_exe.c_str(), const_cast<char* const*>(uargv));
+            _exit(127);
+        }
+        unrelated_guard.pid = other_pid;
+        sleepMs(40);
+        REQUIRE(testPidAliveNotZombie(other_pid));
+
+        char fake_state[64];
+        snprintf(fake_state, sizeof(fake_state), "connected %d 0\n", static_cast<int>(other_pid));
+        REQUIRE(plat::writeFileAtomic(
+            state_file, reinterpret_cast<const uint8_t*>(fake_state), strlen(fake_state)));
+
+        set_api(&api, dir.c_str(), ctrl_name, state_file.c_str(), &neg_opts);
+        int dummy = 0;
+        void* app = info->create(&dummy, "EntryCarPlay", &dummy, &dummy);
+        REQUIRE(app != NULL);
+        void** vtbl = *reinterpret_cast<void***>(app);
+        bool (*on_init_hook)(void*) = NULL;
+        memcpy(&on_init_hook, &vtbl[22], sizeof(on_init_hook));
+        REQUIRE(on_init_hook(app));
+        REQUIRE(mock_env.posted_runnables.size() == 2U);
+        void* status_runnable = mock_env.posted_runnables[1];
+
+        CHECK(mock_env.invokeAction(plat::rhmi::kActStop));
+        sleepMs(55);
+        invokeRunnableObj(status_runnable);
+        sleepMs(85);
+        invokeRunnableObj(status_runnable);
+        sleepMs(50);
+
+        // Unrelated process must STILL be alive (SIGTERM/SIGKILL refused)
+        CHECK(testPidAliveNotZombie(other_pid));
+
+        info->destroy(app);
+        // unrelated_guard kills & reaps other_pid cleanly here
+    }
+
+    set_api(NULL, NULL, NULL, NULL, NULL);
+    g_mock_bmw = NULL;
+    dlclose(handle);
+    removeTempDir(dir);
+#endif
 }
 
 // =================================================================================================
@@ -1666,17 +2263,7 @@ TEST_CASE(testCarPlayDaemonCliBinary) {
 #ifdef _WIN32
     return;
 #else
-    char self_path[512] = "";
-    const ssize_t rlen = readlink("/proc/self/exe", self_path, sizeof(self_path) - 1);
-    std::string daemon_bin = "build/host/carplayd";
-    if (rlen > 0) {
-        self_path[rlen] = '\0';
-        std::string exe(self_path);
-        const size_t slash = exe.find_last_of('/');
-        if (slash != std::string::npos) {
-            daemon_bin = exe.substr(0, slash + 1) + "carplayd";
-        }
-    }
+    const std::string daemon_bin = siblingBinaryPath("carplayd");
 
     std::vector<std::string> help_args;
     help_args.push_back("--help");
@@ -1700,6 +2287,29 @@ TEST_CASE(testCarPlayDaemonCliBinary) {
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc > 0 && argv != NULL && argv[0] != NULL) {
+        g_argv0_exe = argv[0];
+    }
+#ifndef _WIN32
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "--service") == 0) {
+            // Mock hung service / supervisor spawned by launchDaemonProcess(): ignores SIGTERM.
+            signal(SIGTERM, SIG_IGN);
+            printf("MOCK_SERVICE_PID=%d\n", static_cast<int>(getpid()));
+            fflush(stdout);
+            for (int tick = 0; tick < 300; ++tick) {
+                sleepMs(100);
+            }
+            return 0;
+        }
+        if (strcmp(argv[i], "--mock-hang") == 0) {
+            for (int tick = 0; tick < 300; ++tick) {
+                sleepMs(100);
+            }
+            return 0;
+        }
+    }
+#endif
     return test_support::runAll("test_carplay_daemon");
 }

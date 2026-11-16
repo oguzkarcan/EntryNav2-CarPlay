@@ -95,6 +95,36 @@ bool crashGuardAllowsInDir(const char* data_dir, long now_sec);
 void resetGuardsWhenStableInDir(const char* data_dir, long init_sec, long now_sec, bool& stable_marked);
 bool bootGuardAllowsInDir(const char* data_dir, long now_sec);
 
+/// Optional overrides passed via `entryCarPlaySetFrameworkApiForTest` in unit tests.
+/// Non-NULL pointers override defaults; stop timings <= 0 and `launch_debounce_ms < 0`
+/// keep production defaults.
+struct EntryCarPlayTestOptions {
+    const char* stop_file;
+    const char* service_bin;
+    const char* supervisor_bin;
+    const char* service_log;
+    const char* app_key_file;
+    const char* day_night_file;
+    const char* media_recall_file;
+    long stop_term_ms;
+    long stop_kill_ms;
+    long stop_giveup_ms;
+    long launch_debounce_ms;
+
+    EntryCarPlayTestOptions()
+        : stop_file(NULL),
+          service_bin(NULL),
+          supervisor_bin(NULL),
+          service_log(NULL),
+          app_key_file(NULL),
+          day_night_file(NULL),
+          media_recall_file(NULL),
+          stop_term_ms(0L),
+          stop_kill_ms(0L),
+          stop_giveup_ms(0L),
+          launch_debounce_ms(-1L) {}
+};
+
 }  // namespace platform
 }  // namespace carplay
 
