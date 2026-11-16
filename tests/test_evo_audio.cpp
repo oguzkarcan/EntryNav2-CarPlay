@@ -57,6 +57,7 @@ void sleepMillis(int ms) {
 
 struct MockHandle {
     std::string name;
+    size_t index;
     int stream;
     int mode;
     bool params_set;
@@ -75,7 +76,8 @@ struct MockHandle {
     int last_recover_err;
 
     MockHandle()
-        : stream(0),
+        : index(0),
+          stream(0),
           mode(0),
           params_set(false),
           format(0),
@@ -92,12 +94,20 @@ struct MockHandle {
           last_recover_err(0) {}
 };
 
+struct HandleEvent {
+    bool is_open;
+    std::string device;
+    size_t handle_index;
+};
+
 struct MockAlsaState {
     plat::Mutex mu;
     std::vector<MockHandle*> handles;
+    std::vector<HandleEvent> event_log;
     size_t open_count;
     size_t close_count;
     size_t active_open_count;
+    size_t busy_open_rejections;
     int fail_open_err;
     int fail_set_params_err;
     std::string fail_open_device;
@@ -106,6 +116,8 @@ struct MockAlsaState {
     int next_write_err;          // if < 0, injected once then cleared
     bool fail_recover;           // if true, snd_pcm_recover returns kMockErrFatal
     int write_delay_ms;          // artificial delay inside snd_pcm_writei
+    bool block_writei;           // deterministic gate for tests
+    size_t writei_blocked_count; // incremented when mockWritei enters gate
 
     // Capture data & error injection.
     std::vector<int16_t> capture_pattern;
@@ -117,11 +129,14 @@ struct MockAlsaState {
         : open_count(0),
           close_count(0),
           active_open_count(0),
+          busy_open_rejections(0),
           fail_open_err(0),
           fail_set_params_err(0),
           next_write_err(0),
           fail_recover(false),
           write_delay_ms(0),
+          block_writei(false),
+          writei_blocked_count(0),
           capture_cursor(0),
           next_read_err(0),
           persistent_read_err(false) {}
@@ -134,15 +149,19 @@ struct MockAlsaState {
             delete handles[i];
         }
         handles.clear();
+        event_log.clear();
         open_count = 0;
         close_count = 0;
         active_open_count = 0;
+        busy_open_rejections = 0;
         fail_open_err = 0;
         fail_set_params_err = 0;
         fail_open_device.clear();
         next_write_err = 0;
         fail_recover = false;
         write_delay_ms = 0;
+        block_writei = false;
+        writei_blocked_count = 0;
         capture_pattern.clear();
         capture_cursor = 0;
         next_read_err = 0;
@@ -169,6 +188,41 @@ struct MockAlsaState {
             }
         }
         return NULL;
+    }
+
+    size_t countByName(const std::string& name) {
+        plat::LockGuard lock(mu);
+        size_t count = 0;
+        for (size_t i = 0; i < handles.size(); ++i) {
+            if (handles[i]->name == name) {
+                ++count;
+            }
+        }
+        return count;
+    }
+
+    bool verifyCloseBeforeOpen(const std::string& name) {
+        plat::LockGuard lock(mu);
+        bool currently_open = false;
+        size_t open_idx = 0;
+        for (size_t i = 0; i < event_log.size(); ++i) {
+            if (event_log[i].device != name) {
+                continue;
+            }
+            if (event_log[i].is_open) {
+                if (currently_open) {
+                    return false;
+                }
+                currently_open = true;
+                open_idx = event_log[i].handle_index;
+            } else {
+                if (!currently_open || event_log[i].handle_index != open_idx) {
+                    return false;
+                }
+                currently_open = false;
+            }
+        }
+        return true;
     }
 
     size_t totalWrittenSamples(const std::string& name) {
@@ -213,11 +267,25 @@ int mockOpen(void** pcm, const char* name, int stream, int mode) {
         *pcm = NULL;
         return st.fail_open_err;
     }
+    // Enforce per-device exclusivity like real dshare PCMs on EntryNav2.
+    for (size_t i = 0; i < st.handles.size(); ++i) {
+        if (!st.handles[i]->closed && st.handles[i]->name == name) {
+            st.busy_open_rejections += 1;
+            *pcm = NULL;
+            return -EBUSY;
+        }
+    }
     MockHandle* h = new MockHandle();
     h->name = name;
+    h->index = st.handles.size();
     h->stream = stream;
     h->mode = mode;
     st.handles.push_back(h);
+    HandleEvent ev;
+    ev.is_open = true;
+    ev.device = h->name;
+    ev.handle_index = h->index;
+    st.event_log.push_back(ev);
     st.open_count += 1;
     st.active_open_count += 1;
     *pcm = h;
@@ -251,16 +319,29 @@ int mockSetParams(void* pcm,
 }
 
 long mockWritei(void* pcm, const void* buffer, unsigned long size) {
+    MockAlsaState& st = mockState();
+    bool signaled_block = false;
+    for (;;) {
+        {
+            plat::LockGuard lock(st.mu);
+            if (!st.block_writei) {
+                break;
+            }
+            if (!signaled_block) {
+                st.writei_blocked_count += 1;
+                signaled_block = true;
+            }
+        }
+        sleepMillis(1);
+    }
     int delay_ms = 0;
     {
-        MockAlsaState& st = mockState();
         plat::LockGuard lock(st.mu);
         delay_ms = st.write_delay_ms;
     }
     if (delay_ms > 0) {
         sleepMillis(delay_ms);
     }
-    MockAlsaState& st = mockState();
     plat::LockGuard lock(st.mu);
     MockHandle* h = static_cast<MockHandle*>(pcm);
     if (h == NULL || buffer == NULL || !h->params_set || h->channels == 0) {
@@ -349,6 +430,11 @@ int mockClose(void* pcm) {
     MockHandle* h = static_cast<MockHandle*>(pcm);
     if (h != NULL && !h->closed) {
         h->closed = true;
+        HandleEvent ev;
+        ev.is_open = false;
+        ev.device = h->name;
+        ev.handle_index = h->index;
+        st.event_log.push_back(ev);
         st.close_count += 1;
         if (st.active_open_count > 0) {
             st.active_open_count -= 1;
@@ -422,6 +508,29 @@ bool hasOpenFailureAtLeast(void* ctx) {
 bool hasWriteErrorAtLeast(void* ctx) {
     const plat::EvoAudioSink* sink = static_cast<const plat::EvoAudioSink*>(ctx);
     return sink->stats().write_errors >= 1U;
+}
+
+bool hasWriteiBlockedAtLeast(void* ctx) {
+    const size_t target = *static_cast<const size_t*>(ctx);
+    MockAlsaState& st = mockState();
+    plat::LockGuard lock(st.mu);
+    return st.writei_blocked_count >= target;
+}
+
+struct DeviceOccurrenceCtx {
+    std::string device;
+    size_t occurrence;
+    size_t min_samples;
+};
+
+bool hasDeviceOccurrenceWritten(void* ctx) {
+    const DeviceOccurrenceCtx* c = static_cast<const DeviceOccurrenceCtx*>(ctx);
+    return mockState().copyWritten(c->device, c->occurrence).size() >= c->min_samples;
+}
+
+bool hasDeviceOccurrenceOpened(void* ctx) {
+    const DeviceOccurrenceCtx* c = static_cast<const DeviceOccurrenceCtx*>(ctx);
+    return mockState().countByName(c->device) >= c->occurrence;
 }
 
 // =================================================================================================
@@ -729,6 +838,7 @@ TEST_CASE(concurrentPlaybackDownmixAndDucking) {
     mockState().reset();
     plat::EvoAudioConfig cfg;
     cfg.duck_gain_q15 = 8192;  // 0.25 (-12 dB)
+    cfg.duck_ramp_ms = 0U;     // instant-switch test
     plat::EvoAudioSink sink(makeMockApi(), cfg);
     REQUIRE(sink.start());
     CHECK(sink.running());
@@ -867,6 +977,7 @@ TEST_CASE(autoDuckOnAltStreamAndLossConcealment) {
     cfg.duck_on_alt_stream = true;
     cfg.conceal_packet_loss = true;
     cfg.duck_gain_q15 = 8192;
+    cfg.duck_ramp_ms = 0U;  // instant-switch test
 
     plat::EvoAudioSink sink(makeMockApi(), cfg);
     REQUIRE(sink.start());
@@ -1254,6 +1365,673 @@ TEST_CASE(evoMicToMediaEngineUdpLoopbackAndCompositeSink) {
     mic.stop();
     audio_sink.stop();
     sess.close();
+    CHECK(hasActiveOpensZero(NULL));
+}
+
+TEST_CASE(applyGainQ15Boundaries) {
+    const int16_t kMin16 = static_cast<int16_t>(-32768);
+    const int16_t kMax16 = static_cast<int16_t>(32767);
+
+    // Gain 0 zeroes every sample including extremes.
+    int16_t zero_buf[5] = {kMin16, -100, 0, 100, kMax16};
+    plat::applyGainQ15S16(zero_buf, 5U, 0);
+    for (size_t i = 0; i < 5U; ++i) {
+        CHECK_EQ(static_cast<int16_t>(0), zero_buf[i]);
+    }
+
+    // Gain 32767 scales just below unity without overflow.
+    int16_t near_unity[2] = {kMin16, kMax16};
+    plat::applyGainQ15S16(near_unity, 2U, 32767);
+    CHECK_EQ(static_cast<int16_t>(-32767), near_unity[0]);
+    CHECK_EQ(static_cast<int16_t>(32766), near_unity[1]);
+
+    // Gain 32768 is bit-exact pass-through for all int16 values.
+    const int16_t orig[7] = {kMin16, -12345, -1, 0, 1, 12345, kMax16};
+    int16_t unity_buf[7];
+    memcpy(unity_buf, orig, sizeof(orig));
+    plat::applyGainQ15S16(unity_buf, 7U, 32768);
+    for (size_t i = 0; i < 7U; ++i) {
+        CHECK_EQ(orig[i], unity_buf[i]);
+    }
+
+    // Gain > 65536 with INT16_MIN / INT16_MAX must saturate, never int32-overflow.
+    int16_t high_gain_buf[4] = {kMin16, -20000, 20000, kMax16};
+    plat::applyGainQ15S16(high_gain_buf, 4U, 100000);
+    CHECK_EQ(kMin16, high_gain_buf[0]);
+    CHECK_EQ(kMin16, high_gain_buf[1]);
+    CHECK_EQ(kMax16, high_gain_buf[2]);
+    CHECK_EQ(kMax16, high_gain_buf[3]);
+}
+
+TEST_CASE(formatChangeOnOpenStreamClosesBeforeReopen) {
+    mockState().reset();
+    plat::EvoAudioConfig cfg;
+    cfg.media_channels = 0U;  // follow stream format channels to test 1ch <-> 2ch transitions
+    cfg.duck_ramp_ms = 0U;
+    plat::EvoAudioSink sink(makeMockApi(), cfg);
+    REQUIRE(sink.start());
+
+    const plat::AudioStreamId media_id(100, "media");
+
+    // 1. Open at 44100 Hz stereo.
+    audio::AudioFormat fmt44_2ch;
+    fmt44_2ch.codec = audio::kCodecLpcm;
+    fmt44_2ch.sample_rate = 44100U;
+    fmt44_2ch.channels = 2U;
+    sink.onAudioStarted(media_id, fmt44_2ch, 0U);
+    const int16_t pcm1[4] = {100, -100, 200, -200};
+    sink.onAudioPcm(media_id, fmt44_2ch, pcm1, 4U, 1U, 0U);
+    DeviceOccurrenceCtx w0 = {"entertainment", 0U, 4U};
+    REQUIRE(waitForCondition(&hasDeviceOccurrenceWritten, &w0));
+
+    // 2. Reconfigure via second onAudioStarted with 16000 Hz mono.
+    audio::AudioFormat fmt16_1ch;
+    fmt16_1ch.codec = audio::kCodecLpcm;
+    fmt16_1ch.sample_rate = 16000U;
+    fmt16_1ch.channels = 1U;
+    sink.onAudioStarted(media_id, fmt16_1ch, 0U);
+    const int16_t pcm2[3] = {1000, -2000, 3000};
+    sink.onAudioPcm(media_id, fmt16_1ch, pcm2, 3U, 2U, 10U);
+    DeviceOccurrenceCtx w1 = {"entertainment", 1U, 3U};
+    REQUIRE(waitForCondition(&hasDeviceOccurrenceWritten, &w1));
+
+    // 3. Reconfigure via onAudioPcm directly to 48000 Hz stereo (no onAudioStarted).
+    audio::AudioFormat fmt48_2ch;
+    fmt48_2ch.codec = audio::kCodecLpcm;
+    fmt48_2ch.sample_rate = 48000U;
+    fmt48_2ch.channels = 2U;
+    const int16_t pcm3[4] = {500, -500, 600, -600};
+    sink.onAudioPcm(media_id, fmt48_2ch, pcm3, 4U, 3U, 20U);
+    DeviceOccurrenceCtx w2 = {"entertainment", 2U, 4U};
+    REQUIRE(waitForCondition(&hasDeviceOccurrenceWritten, &w2));
+
+    sink.stop();
+    CHECK(hasActiveOpensZero(NULL));
+    CHECK(mockState().verifyCloseBeforeOpen("entertainment"));
+    {
+        plat::LockGuard lock(mockState().mu);
+        CHECK_EQ(static_cast<size_t>(0), mockState().busy_open_rejections);
+    }
+
+    MockHandle* h0 = mockState().findByName("entertainment", 0U);
+    MockHandle* h1 = mockState().findByName("entertainment", 1U);
+    MockHandle* h2 = mockState().findByName("entertainment", 2U);
+    REQUIRE(h0 != NULL && h1 != NULL && h2 != NULL);
+    {
+        plat::LockGuard lock(mockState().mu);
+        CHECK_EQ(44100U, h0->rate);
+        CHECK_EQ(2U, h0->channels);
+        CHECK_EQ(16000U, h1->rate);
+        CHECK_EQ(1U, h1->channels);
+        CHECK_EQ(48000U, h2->rate);
+        CHECK_EQ(2U, h2->channels);
+    }
+    const std::vector<int16_t> w_h1 = mockState().copyWritten("entertainment", 1U);
+    REQUIRE(w_h1.size() == 3U);
+    CHECK_EQ(static_cast<int16_t>(1000), w_h1[0]);
+    CHECK_EQ(static_cast<int16_t>(3000), w_h1[2]);
+    const std::vector<int16_t> w_h2 = mockState().copyWritten("entertainment", 2U);
+    REQUIRE(w_h2.size() == 4U);
+    CHECK_EQ(static_cast<int16_t>(500), w_h2[0]);
+    CHECK_EQ(static_cast<int16_t>(-600), w_h2[3]);
+}
+
+TEST_CASE(evoMicRestartWithoutStopClosesBeforeReopen) {
+    mockState().reset();
+    {
+        plat::LockGuard lock(mockState().mu);
+        for (int i = 0; i < 32; ++i) {
+            mockState().capture_pattern.push_back(static_cast<int16_t>(200 + i));
+        }
+    }
+
+    plat::EvoMic mic(makeMockApi());
+    MicCaptureRecorder rec;
+    REQUIRE(mic.start(&MicCaptureRecorder::onSamples, &rec));
+
+    audio::MicStreamParams p16;
+    p16.supported = true;
+    p16.format.codec = audio::kCodecLpcm;
+    p16.format.sample_rate = 16000U;
+    p16.format.channels = 1U;
+    REQUIRE(mic.startCapture(p16));
+
+    MicTargetCtx target1 = {&rec, 320U};
+    REQUIRE(waitForCondition(&hasCapturedSamples, &target1));
+
+    // Restart at 24 kHz WITHOUT an intervening stopCapture().
+    {
+        plat::LockGuard lock(rec.mu);
+        rec.samples.clear();
+        rec.chunk_sizes.clear();
+    }
+    audio::MicStreamParams p24 = p16;
+    p24.format.sample_rate = 24000U;
+    REQUIRE(mic.startCapture(p24));
+
+    std::pair<plat::EvoMic*, uint64_t> wait2(&mic, 2ULL);
+    REQUIRE(waitForCondition(&micHasStartedCount, &wait2));
+    MicTargetCtx target2 = {&rec, 480U};
+    REQUIRE(waitForCondition(&hasCapturedSamples, &target2));
+
+    mic.stop();
+    CHECK(hasActiveOpensZero(NULL));
+    CHECK(mockState().verifyCloseBeforeOpen("mic1"));
+
+    MockHandle* h0 = mockState().findByName("mic1", 0U);
+    MockHandle* h1 = mockState().findByName("mic1", 1U);
+    REQUIRE(h0 != NULL && h1 != NULL);
+    {
+        plat::LockGuard lock(mockState().mu);
+        CHECK_EQ(static_cast<size_t>(0), mockState().busy_open_rejections);
+        CHECK(h0->closed);
+        CHECK_EQ(16000U, h0->rate);
+        CHECK_EQ(24000U, h1->rate);
+    }
+}
+
+TEST_CASE(sameDeviceOwnershipParkingAntiPingPongAndResume) {
+    mockState().reset();
+    plat::EvoAudioSink sink(makeMockApi());
+    REQUIRE(sink.start());
+
+    const plat::AudioStreamId tel_id(100, "telephony");
+    const plat::AudioStreamId siri_id(100, "speechRecognition");
+
+    audio::AudioFormat tel_fmt;
+    tel_fmt.codec = audio::kCodecLpcm;
+    tel_fmt.sample_rate = 16000U;
+    tel_fmt.channels = 1U;
+
+    audio::AudioFormat siri_fmt;
+    siri_fmt.codec = audio::kCodecLpcm;
+    siri_fmt.sample_rate = 24000U;
+    siri_fmt.channels = 1U;
+
+    // 1. Telephony owns tel_out1.
+    sink.onAudioStarted(tel_id, tel_fmt, 0U);
+    const int16_t tel_pcm1[2] = {111, 222};
+    sink.onAudioPcm(tel_id, tel_fmt, tel_pcm1, 2U, 1U, 0U);
+    DeviceOccurrenceCtx w0 = {"tel_out1", 0U, 2U};
+    REQUIRE(waitForCondition(&hasDeviceOccurrenceWritten, &w0));
+
+    // 2. speechRecognition starts on tel_out1 -> closes tel_id handle first, opens siri_id.
+    sink.onAudioStarted(siri_id, siri_fmt, 0U);
+    const int16_t siri_pcm1[2] = {333, 444};
+    sink.onAudioPcm(siri_id, siri_fmt, siri_pcm1, 2U, 1U, 0U);
+    DeviceOccurrenceCtx w1 = {"tel_out1", 1U, 2U};
+    REQUIRE(waitForCondition(&hasDeviceOccurrenceWritten, &w1));
+
+    CHECK_EQ(static_cast<size_t>(1), sink.stats().parked_streams);
+    CHECK_EQ(static_cast<uint64_t>(0), sink.stats().open_failures);
+
+    // 3. Anti-ping-pong: send 50 PCM packets on parked tel_id (including a format variation).
+    size_t opens_before = 0;
+    size_t closes_before = 0;
+    {
+        plat::LockGuard lock(mockState().mu);
+        opens_before = mockState().open_count;
+        closes_before = mockState().close_count;
+    }
+    const int16_t parked_sentinel[4] = {-9999, -9999, -9999, -9999};
+    audio::AudioFormat alt_parked_fmt = tel_fmt;
+    alt_parked_fmt.sample_rate = 48000U;
+    alt_parked_fmt.channels = 2U;
+    for (int i = 0; i < 50; ++i) {
+        const audio::AudioFormat& f = (i % 5 == 0) ? alt_parked_fmt : tel_fmt;
+        const size_t n = 4U;
+        sink.onAudioPcm(tel_id, f, parked_sentinel, n, static_cast<uint16_t>(i + 2), 0U);
+    }
+    // Pump another siri packet through the worker to verify no reopen/close happened.
+    const int16_t siri_pcm2[2] = {555, 666};
+    sink.onAudioPcm(siri_id, siri_fmt, siri_pcm2, 2U, 2U, 2U);
+    DeviceOccurrenceCtx w1_more = {"tel_out1", 1U, 4U};
+    REQUIRE(waitForCondition(&hasDeviceOccurrenceWritten, &w1_more));
+
+    {
+        plat::LockGuard lock(mockState().mu);
+        CHECK_EQ(opens_before, mockState().open_count);
+        CHECK_EQ(closes_before, mockState().close_count);
+        CHECK_EQ(static_cast<size_t>(0), mockState().busy_open_rejections);
+    }
+    CHECK(sink.stats().parked_frames_discarded >= 100U);
+    const std::vector<int16_t> siri_samples = mockState().copyWritten("tel_out1", 1U);
+    for (size_t i = 0; i < siri_samples.size(); ++i) {
+        CHECK(siri_samples[i] != -9999);
+    }
+
+    // 4. Stop speechRecognition -> parked tel_id resumes with its own format and fresh audio.
+    sink.onAudioStopped(siri_id);
+    DeviceOccurrenceCtx o2 = {"tel_out1", 3U, 0U};
+    REQUIRE(waitForCondition(&hasDeviceOccurrenceOpened, &o2));
+    CHECK_EQ(static_cast<size_t>(0), sink.stats().parked_streams);
+
+    MockHandle* h2 = mockState().findByName("tel_out1", 2U);
+    REQUIRE(h2 != NULL);
+    {
+        plat::LockGuard lock(mockState().mu);
+        CHECK_EQ(16000U, h2->rate);
+        CHECK(h2->written_samples.empty());  // no stale parked PCM replayed
+    }
+
+    const int16_t tel_pcm2[2] = {777, 888};
+    sink.onAudioPcm(tel_id, tel_fmt, tel_pcm2, 2U, 100U, 0U);
+    DeviceOccurrenceCtx w2 = {"tel_out1", 2U, 2U};
+    REQUIRE(waitForCondition(&hasDeviceOccurrenceWritten, &w2));
+    const std::vector<int16_t> resumed_samples = mockState().copyWritten("tel_out1", 2U);
+    REQUIRE(resumed_samples.size() == 2U);
+    CHECK_EQ(static_cast<int16_t>(777), resumed_samples[0]);
+    CHECK_EQ(static_cast<int16_t>(888), resumed_samples[1]);
+
+    sink.stop();
+    CHECK(hasActiveOpensZero(NULL));
+    CHECK(mockState().verifyCloseBeforeOpen("tel_out1"));
+    {
+        plat::LockGuard lock(mockState().mu);
+        CHECK_EQ(static_cast<size_t>(0), mockState().busy_open_rejections);
+    }
+}
+
+TEST_CASE(threeStreamsOnOneDeviceResumeInMostRecentOrderAndConcurrentDevices) {
+    mockState().reset();
+    plat::EvoAudioConfig cfg;
+    cfg.duck_ramp_ms = 0U;
+    plat::EvoAudioSink sink(makeMockApi(), cfg);
+    REQUIRE(sink.start());
+
+    const plat::AudioStreamId s1(100, "media");
+    const plat::AudioStreamId s2(100, "default");
+    const plat::AudioStreamId s3(100, "alert");
+    const plat::AudioStreamId alt_id(101, "default");
+    const plat::AudioStreamId tel_id(100, "telephony");
+
+    audio::AudioFormat f1;
+    f1.codec = audio::kCodecLpcm;
+    f1.sample_rate = 44100U;
+    f1.channels = 2U;
+    audio::AudioFormat f2 = f1;
+    f2.sample_rate = 48000U;
+    audio::AudioFormat f3 = f1;
+    f3.sample_rate = 16000U;
+
+    // Concurrent streams on other devices stay unaffected.
+    audio::AudioFormat mono16 = f3;
+    mono16.channels = 1U;
+    sink.onAudioStarted(alt_id, mono16, 0U);
+    sink.onAudioStarted(tel_id, mono16, 0U);
+
+    sink.onAudioStarted(s1, f1, 0U);
+    const int16_t p1[2] = {10, 10};
+    sink.onAudioPcm(s1, f1, p1, 2U, 1U, 0U);
+    DeviceOccurrenceCtx ent_w0 = {"entertainment", 0U, 2U};
+    REQUIRE(waitForCondition(&hasDeviceOccurrenceWritten, &ent_w0));
+
+    sink.onAudioStarted(s2, f2, 0U);
+    const int16_t p2[2] = {20, 20};
+    sink.onAudioPcm(s2, f2, p2, 2U, 1U, 0U);
+    DeviceOccurrenceCtx ent_w1 = {"entertainment", 1U, 2U};
+    REQUIRE(waitForCondition(&hasDeviceOccurrenceWritten, &ent_w1));
+
+    sink.onAudioStarted(s3, f3, 0U);
+    const int16_t p3[2] = {30, 30};
+    sink.onAudioPcm(s3, f3, p3, 2U, 1U, 0U);
+    DeviceOccurrenceCtx ent_w2 = {"entertainment", 2U, 2U};
+    REQUIRE(waitForCondition(&hasDeviceOccurrenceWritten, &ent_w2));
+
+    CHECK_EQ(static_cast<size_t>(2), sink.stats().parked_streams);
+
+    // Concurrent devices continue playing without interference.
+    const int16_t p_other[1] = {555};
+    sink.onAudioPcm(alt_id, mono16, p_other, 1U, 1U, 0U);
+    sink.onAudioPcm(tel_id, mono16, p_other, 1U, 1U, 0U);
+    WrittenCountCtx w_alt = {"carplay_alt", 1U};
+    WrittenCountCtx w_tel = {"tel_out1", 1U};
+    REQUIRE(waitForCondition(&hasWrittenSamples, &w_alt));
+    REQUIRE(waitForCondition(&hasWrittenSamples, &w_tel));
+
+    // Stop S3 -> S2 (most recently started parked stream) resumes.
+    sink.onAudioStopped(s3);
+    DeviceOccurrenceCtx ent_o3 = {"entertainment", 4U, 0U};
+    REQUIRE(waitForCondition(&hasDeviceOccurrenceOpened, &ent_o3));
+    MockHandle* h3 = mockState().findByName("entertainment", 3U);
+    REQUIRE(h3 != NULL);
+    {
+        plat::LockGuard lock(mockState().mu);
+        CHECK_EQ(48000U, h3->rate);
+    }
+    const int16_t p2b[2] = {21, 21};
+    sink.onAudioPcm(s2, f2, p2b, 2U, 2U, 0U);
+    DeviceOccurrenceCtx ent_w3 = {"entertainment", 3U, 2U};
+    REQUIRE(waitForCondition(&hasDeviceOccurrenceWritten, &ent_w3));
+
+    // Stop S2 -> S1 resumes.
+    sink.onAudioStopped(s2);
+    DeviceOccurrenceCtx ent_o4 = {"entertainment", 5U, 0U};
+    REQUIRE(waitForCondition(&hasDeviceOccurrenceOpened, &ent_o4));
+    MockHandle* h4 = mockState().findByName("entertainment", 4U);
+    REQUIRE(h4 != NULL);
+    {
+        plat::LockGuard lock(mockState().mu);
+        CHECK_EQ(44100U, h4->rate);
+    }
+    const int16_t p1b[2] = {12, 12};
+    sink.onAudioPcm(s1, f1, p1b, 2U, 2U, 0U);
+    DeviceOccurrenceCtx ent_w4 = {"entertainment", 4U, 2U};
+    REQUIRE(waitForCondition(&hasDeviceOccurrenceWritten, &ent_w4));
+
+    sink.stop();
+    CHECK(hasActiveOpensZero(NULL));
+    CHECK(mockState().verifyCloseBeforeOpen("entertainment"));
+    CHECK(mockState().verifyCloseBeforeOpen("carplay_alt"));
+    CHECK(mockState().verifyCloseBeforeOpen("tel_out1"));
+    {
+        plat::LockGuard lock(mockState().mu);
+        CHECK_EQ(static_cast<size_t>(0), mockState().busy_open_rejections);
+    }
+}
+
+TEST_CASE(implicitStartParkedStopOwnerFailAndParkedAltDucking) {
+    mockState().reset();
+    plat::EvoAudioConfig cfg;
+    cfg.duck_on_alt_stream = true;
+    // Share a device between alt and telephony to verify a parked alt stream does not duck.
+    cfg.alt_device = "shared_dev";
+    cfg.telephony_device = "shared_dev";
+    cfg.duck_ramp_ms = 0U;
+
+    plat::EvoAudioSink sink(makeMockApi(), cfg);
+    REQUIRE(sink.start());
+
+    const plat::AudioStreamId alt_id(101, "default");
+    const plat::AudioStreamId tel_id(100, "telephony");
+    const plat::AudioStreamId tel_implicit(100, "speechRecognition");
+
+    audio::AudioFormat mono16;
+    mono16.codec = audio::kCodecLpcm;
+    mono16.sample_rate = 16000U;
+    mono16.channels = 1U;
+
+    // 1. Alt owns shared_dev -> media is auto-ducked.
+    sink.onAudioStarted(alt_id, mono16, 0U);
+    CHECK(sink.isDucked());
+    const int16_t s1[1] = {101};
+    sink.onAudioPcm(alt_id, mono16, s1, 1U, 1U, 0U);
+    DeviceOccurrenceCtx sh_w0 = {"shared_dev", 0U, 1U};
+    REQUIRE(waitForCondition(&hasDeviceOccurrenceWritten, &sh_w0));
+
+    // 2. Implicit start of speechRecognition via onAudioPcm -> takes ownership, parks alt_id!
+    const int16_t s2[1] = {202};
+    sink.onAudioPcm(tel_implicit, mono16, s2, 1U, 1U, 0U);
+    DeviceOccurrenceCtx sh_w1 = {"shared_dev", 1U, 1U};
+    REQUIRE(waitForCondition(&hasDeviceOccurrenceWritten, &sh_w1));
+    // Parked alt stream is inaudible, so it must NOT duck media.
+    CHECK(!sink.isDucked());
+
+    // 3. Explicit start of telephony parks tel_implicit; subsequent onAudioPcm on parked
+    //    tel_implicit must NOT reclaim ownership (implicit start counts once only).
+    sink.onAudioStarted(tel_id, mono16, 0U);
+    const int16_t s3[1] = {303};
+    sink.onAudioPcm(tel_id, mono16, s3, 1U, 1U, 0U);
+    DeviceOccurrenceCtx sh_w2 = {"shared_dev", 2U, 1U};
+    REQUIRE(waitForCondition(&hasDeviceOccurrenceWritten, &sh_w2));
+
+    const int16_t ignored_implicit[1] = {-777};
+    sink.onAudioPcm(tel_implicit, mono16, ignored_implicit, 1U, 2U, 1U);
+    CHECK_EQ(static_cast<size_t>(2), sink.stats().parked_streams);
+
+    // Stopping a parked stream does not disturb the owner.
+    sink.onAudioStopped(tel_implicit);
+    CHECK_EQ(static_cast<size_t>(1), sink.stats().parked_streams);
+
+    // 4. Fatal write error on owner (tel_id) promotes parked alt_id back to owner!
+    {
+        plat::LockGuard lock(mockState().mu);
+        mockState().fail_recover = true;
+        mockState().next_write_err = kMockErrFatal;
+    }
+    const int16_t s4[1] = {404};
+    sink.onAudioPcm(tel_id, mono16, s4, 1U, 2U, 1U);
+    REQUIRE(waitForCondition(&hasWriteErrorAtLeast, &sink));
+    DeviceOccurrenceCtx sh_o3 = {"shared_dev", 4U, 0U};
+    REQUIRE(waitForCondition(&hasDeviceOccurrenceOpened, &sh_o3));
+    CHECK(sink.isDucked());
+
+    sink.stop();
+    CHECK(hasActiveOpensZero(NULL));
+    CHECK(mockState().verifyCloseBeforeOpen("shared_dev"));
+}
+
+TEST_CASE(duckingRampMonotonicityChunksReversalAndZeroInstant) {
+    // Default config must have a 10..20 ms ramp.
+    const plat::EvoAudioConfig default_cfg;
+    CHECK(default_cfg.duck_ramp_ms >= 10U && default_cfg.duck_ramp_ms <= 20U);
+
+    // 1. Linear ramp: 10 ms at 10000 Hz = 100 frames.
+    mockState().reset();
+    plat::EvoAudioConfig cfg;
+    cfg.duck_gain_q15 = 8192;  // 0.25x -> 32000 becomes 8000
+    cfg.duck_ramp_ms = 10U;
+    plat::EvoAudioSink sink(makeMockApi(), cfg);
+    REQUIRE(sink.start());
+
+    const plat::AudioStreamId media_id(100, "media");
+    audio::AudioFormat fmt;
+    fmt.codec = audio::kCodecLpcm;
+    fmt.sample_rate = 10000U;
+    fmt.channels = 2U;
+    sink.onAudioStarted(media_id, fmt, 0U);
+
+    // Steady unity pass-through must be bit-exact (including extremes).
+    const int16_t bit_exact[4] = {32767, -32768, 12345, -1};
+    sink.onAudioPcm(media_id, fmt, bit_exact, 4U, 1U, 0U);
+    WrittenCountCtx w_exact = {"entertainment", 4U};
+    REQUIRE(waitForCondition(&hasWrittenSamples, &w_exact));
+    {
+        const std::vector<int16_t> out = mockState().copyWritten("entertainment");
+        REQUIRE(out.size() == 4U);
+        for (size_t i = 0; i < 4U; ++i) {
+            CHECK_EQ(bit_exact[i], out[i]);
+        }
+    }
+
+    // Ramp down across chunk boundary: 40 frames + 80 frames = 120 frames (ramp length 100).
+    sink.onAudioDuck(true);
+    std::vector<int16_t> chunk40(40U * 2U);
+    for (size_t f = 0; f < 40U; ++f) {
+        chunk40[f * 2U] = 32000;
+        chunk40[f * 2U + 1U] = -32000;
+    }
+    sink.onAudioPcm(media_id, fmt, &chunk40[0], chunk40.size(), 2U, 0U);
+    WrittenCountCtx w_c1 = {"entertainment", 4U + 80U};
+    REQUIRE(waitForCondition(&hasWrittenSamples, &w_c1));
+
+    std::vector<int16_t> chunk80(80U * 2U);
+    for (size_t f = 0; f < 80U; ++f) {
+        chunk80[f * 2U] = 32000;
+        chunk80[f * 2U + 1U] = -32000;
+    }
+    sink.onAudioPcm(media_id, fmt, &chunk80[0], chunk80.size(), 3U, 40U);
+    WrittenCountCtx w_c2 = {"entertainment", 4U + 240U};
+    REQUIRE(waitForCondition(&hasWrittenSamples, &w_c2));
+
+    {
+        const std::vector<int16_t> out = mockState().copyWritten("entertainment");
+        REQUIRE(out.size() == 244U);
+        const size_t base = 4U;
+        // Same gain on L and R, monotonically non-increasing from < 32000 down to 8000 at frame 99.
+        CHECK(out[base] < 32000);
+        CHECK(out[base + 39U * 2U] > 8000);  // still mid-ramp at end of chunk 1
+        for (size_t f = 0; f < 100U; ++f) {
+            const int16_t l = out[base + f * 2U];
+            const int16_t r = out[base + f * 2U + 1U];
+            CHECK_EQ(l, static_cast<int16_t>(-r));
+            CHECK(l >= 8000 && l <= 32000);
+            if (f > 0U) {
+                CHECK(l <= out[base + (f - 1U) * 2U]);
+            }
+        }
+        CHECK_EQ(static_cast<int16_t>(8000), out[base + 99U * 2U]);
+        for (size_t f = 100U; f < 120U; ++f) {
+            CHECK_EQ(static_cast<int16_t>(8000), out[base + f * 2U]);
+        }
+    }
+
+    // Ramp up back to unity over 100 frames.
+    sink.onAudioDuck(false);
+    std::vector<int16_t> chunk120(120U * 2U);
+    for (size_t f = 0; f < 120U; ++f) {
+        chunk120[f * 2U] = 32000;
+        chunk120[f * 2U + 1U] = -32000;
+    }
+    sink.onAudioPcm(media_id, fmt, &chunk120[0], chunk120.size(), 4U, 120U);
+    WrittenCountCtx w_up = {"entertainment", 4U + 240U + 240U};
+    REQUIRE(waitForCondition(&hasWrittenSamples, &w_up));
+
+    {
+        const std::vector<int16_t> out = mockState().copyWritten("entertainment");
+        REQUIRE(out.size() == 484U);
+        const size_t base = 244U;
+        CHECK(out[base] > 8000 && out[base] < 32000);
+        for (size_t f = 0; f < 100U; ++f) {
+            const int16_t l = out[base + f * 2U];
+            CHECK(l >= 8000 && l <= 32000);
+            if (f > 0U) {
+                CHECK(l >= out[base + (f - 1U) * 2U]);
+            }
+        }
+        CHECK_EQ(static_cast<int16_t>(32000), out[base + 99U * 2U]);
+        for (size_t f = 100U; f < 120U; ++f) {
+            CHECK_EQ(static_cast<int16_t>(32000), out[base + f * 2U]);
+        }
+    }
+
+    // Mid-ramp reversal: duck ON for 50 frames, then flip OFF mid-ramp and send 120 frames.
+    sink.onAudioDuck(true);
+    std::vector<int16_t> chunk50(50U * 2U);
+    for (size_t f = 0; f < 50U; ++f) {
+        chunk50[f * 2U] = 32000;
+        chunk50[f * 2U + 1U] = -32000;
+    }
+    sink.onAudioPcm(media_id, fmt, &chunk50[0], chunk50.size(), 5U, 240U);
+    WrittenCountCtx w_mid = {"entertainment", 484U + 100U};
+    REQUIRE(waitForCondition(&hasWrittenSamples, &w_mid));
+
+    sink.onAudioDuck(false);
+    sink.onAudioPcm(media_id, fmt, &chunk120[0], chunk120.size(), 6U, 290U);
+    WrittenCountCtx w_rev = {"entertainment", 584U + 240U};
+    REQUIRE(waitForCondition(&hasWrittenSamples, &w_rev));
+
+    {
+        const std::vector<int16_t> out = mockState().copyWritten("entertainment");
+        REQUIRE(out.size() == 824U);
+        const int16_t mid_val = out[584U - 2U];
+        CHECK(mid_val > 8000 && mid_val < 32000);
+        const size_t base = 584U;
+        CHECK(out[base] >= mid_val && out[base] < 32000);
+        for (size_t f = 1; f < 100U; ++f) {
+            CHECK(out[base + f * 2U] >= out[base + (f - 1U) * 2U]);
+            CHECK(out[base + f * 2U] <= 32000);
+        }
+        CHECK_EQ(static_cast<int16_t>(32000), out[base + 99U * 2U]);
+    }
+    sink.stop();
+
+    // 2. Ramp length 0 reproduces instant switch.
+    mockState().reset();
+    cfg.duck_ramp_ms = 0U;
+    plat::EvoAudioSink instant_sink(makeMockApi(), cfg);
+    REQUIRE(instant_sink.start());
+    instant_sink.onAudioStarted(media_id, fmt, 0U);
+    instant_sink.onAudioDuck(true);
+    const int16_t one_frame[2] = {32000, -32000};
+    instant_sink.onAudioPcm(media_id, fmt, one_frame, 2U, 1U, 0U);
+    WrittenCountCtx w_i1 = {"entertainment", 2U};
+    REQUIRE(waitForCondition(&hasWrittenSamples, &w_i1));
+    instant_sink.onAudioDuck(false);
+    instant_sink.onAudioPcm(media_id, fmt, one_frame, 2U, 2U, 1U);
+    WrittenCountCtx w_i2 = {"entertainment", 4U};
+    REQUIRE(waitForCondition(&hasWrittenSamples, &w_i2));
+    {
+        const std::vector<int16_t> out = mockState().copyWritten("entertainment");
+        REQUIRE(out.size() == 4U);
+        CHECK_EQ(static_cast<int16_t>(8000), out[0]);
+        CHECK_EQ(static_cast<int16_t>(-8000), out[1]);
+        CHECK_EQ(static_cast<int16_t>(32000), out[2]);
+        CHECK_EQ(static_cast<int16_t>(-32000), out[3]);
+    }
+    instant_sink.stop();
+}
+
+TEST_CASE(deterministicRingBufferWrapAround) {
+    mockState().reset();
+    {
+        plat::LockGuard lock(mockState().mu);
+        mockState().block_writei = true;
+    }
+
+    plat::EvoAudioConfig cfg;
+    cfg.max_queue_ms = 20U;  // 20 ms at 10000 Hz = 200 frames (400 stereo samples)
+    cfg.duck_ramp_ms = 0U;
+    plat::EvoAudioSink sink(makeMockApi(), cfg);
+    REQUIRE(sink.start());
+
+    const plat::AudioStreamId media_id(100, "media");
+    audio::AudioFormat fmt;
+    fmt.codec = audio::kCodecLpcm;
+    fmt.sample_rate = 10000U;
+    fmt.channels = 2U;
+
+    sink.onAudioStarted(media_id, fmt, 0U);
+    // Sentinel frame causes worker to enter mockWritei and pause deterministically on the gate.
+    const int16_t sentinel[2] = {999, -999};
+    sink.onAudioPcm(media_id, fmt, sentinel, 2U, 0U, 0U);
+    const size_t gate_target = 1U;
+    REQUIRE(waitForCondition(&hasWriteiBlockedAtLeast, const_cast<size_t*>(&gate_target)));
+
+    // Push 120 + 120 + 60 = 300 frames into 200-frame ring capacity while worker is paused.
+    // This wraps tail across the end of the buffer and advances head across the end as well.
+    std::vector<int16_t> b1(120U * 2U);
+    for (size_t i = 0; i < 120U; ++i) {
+        b1[i * 2U] = static_cast<int16_t>(1 + i);
+        b1[i * 2U + 1U] = static_cast<int16_t>(-(1 + static_cast<int>(i)));
+    }
+    sink.onAudioPcm(media_id, fmt, &b1[0], b1.size(), 1U, 1U);
+
+    std::vector<int16_t> b2(120U * 2U);
+    for (size_t i = 0; i < 120U; ++i) {
+        b2[i * 2U] = static_cast<int16_t>(121 + i);
+        b2[i * 2U + 1U] = static_cast<int16_t>(-(121 + static_cast<int>(i)));
+    }
+    sink.onAudioPcm(media_id, fmt, &b2[0], b2.size(), 2U, 121U);
+
+    std::vector<int16_t> b3(60U * 2U);
+    for (size_t i = 0; i < 60U; ++i) {
+        b3[i * 2U] = static_cast<int16_t>(241 + i);
+        b3[i * 2U + 1U] = static_cast<int16_t>(-(241 + static_cast<int>(i)));
+    }
+    sink.onAudioPcm(media_id, fmt, &b3[0], b3.size(), 3U, 241U);
+
+    CHECK_EQ(static_cast<uint64_t>(100), sink.stats().overrun_frames);
+
+    // Release gate and wait for all 200 surviving frames + sentinel (201 frames = 402 samples).
+    {
+        plat::LockGuard lock(mockState().mu);
+        mockState().block_writei = false;
+    }
+    WrittenCountCtx w_all = {"entertainment", 402U};
+    REQUIRE(waitForCondition(&hasWrittenSamples, &w_all));
+
+    const std::vector<int16_t> ent = mockState().copyWritten("entertainment");
+    REQUIRE(ent.size() == 402U);
+    CHECK_EQ(static_cast<int16_t>(999), ent[0]);
+    CHECK_EQ(static_cast<int16_t>(-999), ent[1]);
+    for (size_t i = 0; i < 200U; ++i) {
+        const int16_t expected = static_cast<int16_t>(101U + i);
+        CHECK_EQ(expected, ent[2U + i * 2U]);
+        CHECK_EQ(static_cast<int16_t>(-expected), ent[2U + i * 2U + 1U]);
+    }
+
+    sink.stop();
     CHECK(hasActiveOpensZero(NULL));
 }
 

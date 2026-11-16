@@ -221,9 +221,11 @@ void writeFixtureScene(const std::string& dir, uint32_t w, uint32_t h, const std
 
 struct MockBo {
     std::vector<uint8_t> data;
+    uint32_t requested_size;
     int fd;
+    bool dmabuf_exported;
     bool freed;
-    MockBo() : fd(-1), freed(false) {}
+    MockBo() : requested_size(0), fd(-1), dmabuf_exported(false), freed(false) {}
 };
 
 struct MockDrmState {
@@ -256,6 +258,28 @@ struct MockDrmState {
         dev_del_count = 0;
         bo_new_count = 0;
         bo_del_count = 0;
+    }
+
+    bool allBosFreed() const {
+        for (size_t i = 0; i < bos.size(); ++i) {
+            if (!bos[i]->freed) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool allExportedFdsClosed() const {
+#ifndef _WIN32
+        for (size_t i = 0; i < bos.size(); ++i) {
+            if (bos[i]->dmabuf_exported && bos[i]->fd >= 0) {
+                if (fcntl(bos[i]->fd, F_GETFD) != -1 || errno != EBADF) {
+                    return false;
+                }
+            }
+        }
+#endif
+        return true;
     }
 
     MockDrmState() { reset(); }
@@ -300,15 +324,8 @@ struct omap_bo* mockOmapBoNew(struct omap_device* dev, uint32_t size, uint32_t f
         return NULL;
     }
     MockBo* bo = new MockBo();
+    bo->requested_size = size;
     bo->data.resize(size, 0);
-#ifndef _WIN32
-    bo->fd = open("/dev/null", O_RDONLY);
-    if (bo->fd < 0) {
-        bo->fd = 200 + idx;
-    }
-#else
-    bo->fd = 200 + idx;
-#endif
     g_drm.bos.push_back(bo);
     return reinterpret_cast<struct omap_bo*>(bo);
 }
@@ -331,6 +348,17 @@ int mockOmapBoDmabuf(struct omap_bo* raw) {
             if (g_drm.fail_dmabuf_at == static_cast<int>(i)) {
                 return -1;
             }
+            if (bo->fd < 0) {
+#ifndef _WIN32
+                bo->fd = open("/dev/null", O_RDONLY);
+                if (bo->fd < 0) {
+                    bo->fd = 200 + static_cast<int>(i);
+                }
+#else
+                bo->fd = 200 + static_cast<int>(i);
+#endif
+            }
+            bo->dmabuf_exported = true;
             return bo->fd;
         }
     }
@@ -510,7 +538,8 @@ int mockXsvDecodeVideoFrame(carplay::platform::xsv_handle h, int dmabuf_fd, uint
     }
     g_xsv.submitted_fds.push_back(dmabuf_fd);
     for (size_t i = 0; i < g_drm.bos.size(); ++i) {
-        if (g_drm.bos[i]->fd == dmabuf_fd && length <= g_drm.bos[i]->data.size()) {
+        if (!g_drm.bos[i]->freed && g_drm.bos[i]->dmabuf_exported &&
+            g_drm.bos[i]->fd == dmabuf_fd && length <= g_drm.bos[i]->data.size()) {
             std::vector<uint8_t> copy(g_drm.bos[i]->data.begin(),
                                       g_drm.bos[i]->data.begin() + length);
             g_xsv.submitted_frames.push_back(copy);
@@ -1337,6 +1366,500 @@ TEST_CASE(realDlopenMockSharedLibraryRoundTrip) {
     unlink((scene_dir + "/layer.txt").c_str());
     unlink((scene_dir + "/surfaces.txt").c_str());
     rmdir(scene_dir.c_str());
+#endif
+}
+
+#ifndef _WIN32
+namespace {
+
+struct ScopedVideoTestEnv {
+    std::string log_path;
+    std::string conf_flip;
+    std::string scene_dir;
+    bool ok;
+
+    ScopedVideoTestEnv() : ok(false) {
+        log_path = makeTempFile("carplay-vtest-log");
+        conf_flip = makeTempFile("carplay-vtest-conf");
+        if (log_path.empty() || conf_flip.empty()) {
+            return;
+        }
+        scene_dir = "/tmp/carplay-vtest-scene-" +
+                    std::string(log_path.substr(log_path.size() - 6U));
+        std::vector<std::string> mkdir_args;
+        mkdir_args.push_back("-p");
+        mkdir_args.push_back(scene_dir);
+        std::string unused;
+        if (!runCommand("/bin/mkdir", mkdir_args, unused)) {
+            return;
+        }
+        writeFileText(conf_flip.c_str(), "genivi-flip-renderorder = 1\n");
+        writeFixtureScene(scene_dir, 800U, 480U, "1 Surface(s):\r\n- Surface 0 (0x0)\r\n");
+        setenv("CARPLAY_TEST_LM_LOG", log_path.c_str(), 1);
+        setenv("CARPLAY_TEST_SCENE_DIR", scene_dir.c_str(), 1);
+        g_drm.reset();
+        g_xsv.reset();
+        ok = true;
+    }
+
+    ~ScopedVideoTestEnv() {
+        unsetenv("CARPLAY_TEST_LM_LOG");
+        unsetenv("CARPLAY_TEST_SCENE_DIR");
+        if (!log_path.empty()) {
+            unlink((log_path + ".order").c_str());
+            unlink(log_path.c_str());
+        }
+        if (!conf_flip.empty()) {
+            unlink(conf_flip.c_str());
+        }
+        if (!scene_dir.empty()) {
+            unlink((scene_dir + "/screen.txt").c_str());
+            unlink((scene_dir + "/layer.txt").c_str());
+            unlink((scene_dir + "/surfaces.txt").c_str());
+            rmdir(scene_dir.c_str());
+        }
+        g_drm.reset();
+        g_xsv.reset();
+    }
+};
+
+}  // namespace
+#endif
+
+TEST_CASE(dmaBufPoolFailDmabufAndNoFdLeaks) {
+#ifndef _WIN32
+    REQUIRE(!g_self_exe.empty());
+
+    // 1. Direct DmaBufPool fail_dmabuf_at at index 2 (after 2 exported BOs) and index 0.
+    g_drm.reset();
+    DmaBufPool pool;
+    pool.setApiForTest(makeMockDrmApi());
+
+    g_drm.fail_dmabuf_at = 2;
+    CHECK(!pool.init(4U, 65536U));
+    CHECK_EQ(static_cast<size_t>(0), pool.size());
+    CHECK_EQ(3, g_drm.bo_new_count);
+    CHECK_EQ(3, g_drm.bo_del_count);
+    CHECK_EQ(1, g_drm.dev_new_count);
+    CHECK_EQ(1, g_drm.dev_del_count);
+    CHECK_EQ(1, g_drm.open_count);
+    CHECK_EQ(1, g_drm.close_count);
+    CHECK(g_drm.allBosFreed());
+    CHECK(g_drm.allExportedFdsClosed());
+    g_drm.reset();
+
+    g_drm.fail_dmabuf_at = 0;
+    CHECK(!pool.init(4U, 65536U));
+    CHECK_EQ(static_cast<size_t>(0), pool.size());
+    CHECK_EQ(1, g_drm.bo_new_count);
+    CHECK_EQ(1, g_drm.bo_del_count);
+    CHECK_EQ(1, g_drm.dev_del_count);
+    CHECK_EQ(1, g_drm.close_count);
+    CHECK(g_drm.allBosFreed());
+    CHECK(g_drm.allExportedFdsClosed());
+    g_drm.reset();
+
+    // 2. Also verify fail_map_at closes exported fds before deleting BOs.
+    g_drm.fail_map_at = 1;
+    CHECK(!pool.init(4U, 65536U));
+    CHECK_EQ(2, g_drm.bo_del_count);
+    CHECK_EQ(1, g_drm.dev_del_count);
+    CHECK_EQ(1, g_drm.close_count);
+    CHECK(g_drm.allBosFreed());
+    CHECK(g_drm.allExportedFdsClosed());
+    g_drm.reset();
+
+    // 3. Through EvoVideo::init(), fail_dmabuf_at cleans up and allows recovery.
+    ScopedVideoTestEnv env;
+    REQUIRE(env.ok);
+    EvoVideo video;
+    video.setDrmOmapApiForTest(makeMockDrmApi());
+    video.setXsvApiForTest(makeMockXsvApi());
+
+    EvoVideoConfig cfg;
+    cfg.width = 800U;
+    cfg.height = 480U;
+    cfg.display_width = 800U;
+    cfg.display_height = 480U;
+    cfg.pool_count = 3U;
+    cfg.pool_buf_size = 65536U;
+    cfg.ilm_ctl_path = g_self_exe;
+    cfg.compositor_conf_path = env.conf_flip;
+
+    g_drm.fail_dmabuf_at = 1;
+    CHECK(!video.init(cfg));
+    CHECK_EQ(2, g_drm.bo_new_count);
+    CHECK_EQ(2, g_drm.bo_del_count);
+    CHECK_EQ(1, g_drm.dev_del_count);
+    CHECK_EQ(1, g_drm.close_count);
+    CHECK(g_drm.allBosFreed());
+    CHECK(g_drm.allExportedFdsClosed());
+    CHECK(!video.start());
+
+    g_drm.fail_dmabuf_at = -1;
+    REQUIRE(video.init(cfg));
+    REQUIRE(video.start());
+    const uint8_t idr[] = {0x00, 0x00, 0x00, 0x01, 0x65, 0x88};
+    CHECK(video.postVideoFrame(idr, sizeof(idr), 0U));
+    CHECK(waitUntilFirstFrame(video, 500));
+    video.stop();
+    CHECK(g_drm.allBosFreed());
+    CHECK(g_drm.allExportedFdsClosed());
+    CHECK_EQ(g_drm.bo_new_count, g_drm.bo_del_count);
+    CHECK_EQ(g_drm.dev_new_count, g_drm.dev_del_count);
+    CHECK_EQ(g_drm.open_count, g_drm.close_count);
+#endif
+}
+
+TEST_CASE(evoVideoOpenAndConfigureFailuresCleanupAndRestart) {
+#ifndef _WIN32
+    REQUIRE(!g_self_exe.empty());
+    ScopedVideoTestEnv env;
+    REQUIRE(env.ok);
+
+    EvoVideo video;
+    video.setDrmOmapApiForTest(makeMockDrmApi());
+    video.setXsvApiForTest(makeMockXsvApi());
+
+    EvoVideoConfig cfg;
+    cfg.width = 800U;
+    cfg.height = 480U;
+    cfg.display_width = 800U;
+    cfg.display_height = 480U;
+    cfg.pool_count = 2U;
+    cfg.pool_buf_size = 65536U;
+    cfg.ilm_ctl_path = g_self_exe;
+    cfg.compositor_conf_path = env.conf_flip;
+
+    const uint8_t idr[] = {0x00, 0x00, 0x00, 0x01, 0x65, 0x88};
+
+    // 1. xsv_open failure: start() fails, stop() cleans up pool, retry start() recreates pool.
+    REQUIRE(video.init(cfg));
+    {
+        LockGuard lock(g_xsv.mu);
+        g_xsv.open_fails = true;
+    }
+    CHECK(!video.start());
+    CHECK(!video.isStarted());
+    CHECK(!video.isReady());
+    CHECK(!video.postVideoFrame(idr, sizeof(idr), 1U));
+    {
+        LockGuard lock(g_xsv.mu);
+        CHECK_EQ(1, g_xsv.open_calls);
+        CHECK_EQ(0, g_xsv.close_calls);
+        CHECK_EQ(0, g_xsv.configure_calls);
+        g_xsv.open_fails = false;
+    }
+    // stop() destroys the pool allocated during init().
+    video.stop();
+    CHECK_EQ(2, g_drm.bo_del_count);
+    CHECK_EQ(1, g_drm.dev_del_count);
+    CHECK_EQ(1, g_drm.close_count);
+    CHECK(g_drm.allBosFreed());
+    CHECK(g_drm.allExportedFdsClosed());
+
+    // Restart after open_fails without re-calling init() succeeds and allocates fresh pool.
+    REQUIRE(video.start());
+    CHECK(video.isStarted());
+    CHECK(video.isReady());
+    CHECK(video.postVideoFrame(idr, sizeof(idr), 2U));
+    CHECK(waitUntilFirstFrame(video, 500));
+    video.stop();
+    CHECK_EQ(4, g_drm.bo_new_count);
+    CHECK_EQ(4, g_drm.bo_del_count);
+    CHECK_EQ(2, g_drm.dev_del_count);
+    CHECK_EQ(2, g_drm.close_count);
+    CHECK(g_drm.allBosFreed());
+    CHECK(g_drm.allExportedFdsClosed());
+    {
+        LockGuard lock(g_xsv.mu);
+        CHECK_EQ(2, g_xsv.open_calls);
+        CHECK_EQ(1, g_xsv.close_calls);
+        CHECK_EQ(1, g_xsv.stop_calls);
+    }
+
+    // 2. xsv_configure_stream failure: open succeeds then fails configure -> xsv_close called immediately.
+    REQUIRE(video.init(cfg));
+    {
+        LockGuard lock(g_xsv.mu);
+        g_xsv.configure_fails = true;
+    }
+    CHECK(!video.start());
+    CHECK(!video.isStarted());
+    CHECK(!video.isReady());
+    CHECK(!video.postVideoFrame(idr, sizeof(idr), 3U));
+    {
+        LockGuard lock(g_xsv.mu);
+        CHECK_EQ(3, g_xsv.open_calls);
+        CHECK_EQ(2, g_xsv.close_calls);
+        CHECK_EQ(2, g_xsv.configure_calls);
+        CHECK_EQ(1, g_xsv.start_calls);
+        g_xsv.configure_fails = false;
+    }
+
+    // Direct retry of start() reuses pool cleanly, and stop() frees all resources.
+    REQUIRE(video.start());
+    CHECK(video.isStarted());
+    CHECK(video.isReady());
+    CHECK(video.postVideoFrame(idr, sizeof(idr), 4U));
+    CHECK(waitUntilFirstFrame(video, 500));
+    video.stop();
+    CHECK_EQ(g_drm.bo_new_count, g_drm.bo_del_count);
+    CHECK_EQ(g_drm.dev_new_count, g_drm.dev_del_count);
+    CHECK_EQ(g_drm.open_count, g_drm.close_count);
+    CHECK(g_drm.allBosFreed());
+    CHECK(g_drm.allExportedFdsClosed());
+    {
+        LockGuard lock(g_xsv.mu);
+        CHECK_EQ(4, g_xsv.open_calls);
+        CHECK_EQ(3, g_xsv.close_calls);
+    }
+#endif
+}
+
+TEST_CASE(evoVideoReconfigureOver720pAndSpsPpsCache) {
+#ifndef _WIN32
+    REQUIRE(!g_self_exe.empty());
+    ScopedVideoTestEnv env;
+    REQUIRE(env.ok);
+
+    EvoVideo video;
+    video.setDrmOmapApiForTest(makeMockDrmApi());
+    video.setXsvApiForTest(makeMockXsvApi());
+
+    const uint8_t old_sps_pps[] = {0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x1e,
+                                   0x00, 0x00, 0x00, 0x01, 0x68, 0xce, 0x38, 0x80};
+    const uint8_t new_sps_pps[] = {0x00, 0x00, 0x00, 0x01, 0x67, 0x64, 0x00, 0x28,
+                                   0x00, 0x00, 0x00, 0x01, 0x68, 0xee, 0x3c, 0x80};
+    const uint8_t small_idr[] = {0x00, 0x00, 0x00, 0x01, 0x65, 0x88, 0x84, 0x21};
+    std::vector<uint8_t> big_idr(600U * 1024U, 0x55U);
+    big_idr[0] = 0x00U;
+    big_idr[1] = 0x00U;
+    big_idr[2] = 0x00U;
+    big_idr[3] = 0x01U;
+    big_idr[4] = 0x65U;
+
+    // 1. Not-started reconfig from 512 KiB pool -> >1280x720 clears old SPS/PPS and grows pool to 2 MiB.
+    EvoVideoConfig cfg;
+    cfg.width = 800U;
+    cfg.height = 480U;
+    cfg.display_width = 800U;
+    cfg.display_height = 480U;
+    cfg.pool_count = 2U;
+    cfg.pool_buf_size = 512U * 1024U;
+    cfg.ilm_ctl_path = g_self_exe;
+    cfg.compositor_conf_path = env.conf_flip;
+
+    REQUIRE(video.init(cfg));
+    CHECK_EQ(2, g_drm.bo_new_count);
+    CHECK_EQ(512U * 1024U, g_drm.bos[0]->requested_size);
+
+    video.postCodecConfig(old_sps_pps, sizeof(old_sps_pps));
+    // Resolution change while not started, with no new SPS/PPS yet.
+    video.onVideoConfig(110, carplay::stream::CODEC_H264_AVCC,
+                        NULL, 0U, NULL, 0U, 1920.0f, 1080.0f);
+    CHECK(!video.isStarted());
+    CHECK_EQ(1920U, video.config().width);
+    CHECK_EQ(1080U, video.config().height);
+    CHECK_EQ(2U << 20, video.config().pool_buf_size);
+    CHECK_EQ(2, g_drm.bo_del_count);
+    CHECK_EQ(1, g_drm.dev_del_count);
+    CHECK_EQ(1, g_drm.close_count);
+    CHECK(g_drm.allBosFreed());
+    CHECK(g_drm.allExportedFdsClosed());
+
+    REQUIRE(video.start());
+    REQUIRE(g_drm.bos.size() == 4U);
+    CHECK_EQ(2U << 20, g_drm.bos[2]->requested_size);
+    CHECK_EQ(2U << 20, g_drm.bos[3]->requested_size);
+    CHECK(!g_drm.bos[2]->freed);
+
+    // >512 KiB keyframe accepted, and old_sps_pps was cleared by resolution change.
+    CHECK(video.postVideoFrame(&big_idr[0], big_idr.size(), 100U));
+    CHECK(waitUntilFirstFrame(video, 500));
+    {
+        LockGuard lock(g_xsv.mu);
+        REQUIRE(g_xsv.submitted_frames.size() == 1U);
+        CHECK_BYTES_EQ(big_idr, g_xsv.submitted_frames[0]);
+    }
+    video.stop();
+
+    // 2. Same-resolution stop()/start() preserves cached SPS/PPS and resets config_sent_.
+    g_drm.reset();
+    g_xsv.reset();
+    REQUIRE(video.init(cfg));
+    REQUIRE(video.start());
+    video.postCodecConfig(old_sps_pps, sizeof(old_sps_pps));
+    CHECK(video.postVideoFrame(small_idr, sizeof(small_idr), 200U));
+    CHECK(video.postVideoFrame(small_idr, sizeof(small_idr), 201U));
+
+    video.stop();
+    REQUIRE(video.start());
+    CHECK(video.postVideoFrame(small_idr, sizeof(small_idr), 202U));
+    {
+        LockGuard lock(g_xsv.mu);
+        REQUIRE(g_xsv.submitted_frames.size() == 3U);
+        std::vector<uint8_t> with_old(old_sps_pps, old_sps_pps + sizeof(old_sps_pps));
+        with_old.insert(with_old.end(), small_idr, small_idr + sizeof(small_idr));
+        CHECK_BYTES_EQ(with_old, g_xsv.submitted_frames[0]);
+        CHECK_BYTES_EQ(std::vector<uint8_t>(small_idr, small_idr + sizeof(small_idr)),
+                       g_xsv.submitted_frames[1]);
+        CHECK_BYTES_EQ(with_old, g_xsv.submitted_frames[2]);
+    }
+
+    // 3. In-place <=720p resolution change clears old SPS/PPS even when stop()/start() is NOT taken.
+    video.onVideoConfig(110, carplay::stream::CODEC_H264_AVCC,
+                        NULL, 0U, NULL, 0U, 1280.0f, 720.0f);
+    CHECK_EQ(1280U, video.config().width);
+    CHECK_EQ(720U, video.config().height);
+    CHECK_EQ(512U * 1024U, video.config().pool_buf_size);
+    {
+        LockGuard lock(g_xsv.mu);
+        CHECK_EQ(1, g_xsv.stop_calls);  // unchanged from explicit stop() above
+    }
+    CHECK(video.postVideoFrame(small_idr, sizeof(small_idr), 203U));
+    {
+        LockGuard lock(g_xsv.mu);
+        REQUIRE(g_xsv.submitted_frames.size() == 4U);
+        CHECK_BYTES_EQ(std::vector<uint8_t>(small_idr, small_idr + sizeof(small_idr)),
+                       g_xsv.submitted_frames[3]);
+    }
+
+    // 4. Started reconfig from 512 KiB pool -> >1280x720 takes stop/start, preserves visibility,
+    //    destroys 512 KiB pool, creates 2 MiB pool, and accepts >512 KiB keyframe with new SPS/PPS.
+    video.setVisible(true);
+    CHECK(video.isVisible());
+    video.onVideoConfig(110, carplay::stream::CODEC_H264_AVCC,
+                        new_sps_pps, sizeof(new_sps_pps), NULL, 0U, 1920.0f, 1080.0f);
+    CHECK(video.isStarted());
+    CHECK(video.isReady());
+    CHECK(video.isVisible());
+    CHECK_EQ(1920U, video.config().width);
+    CHECK_EQ(1080U, video.config().height);
+    CHECK_EQ(2U << 20, video.config().pool_buf_size);
+    {
+        LockGuard lock(g_xsv.mu);
+        CHECK_EQ(2, g_xsv.stop_calls);
+        CHECK_EQ(2, g_xsv.close_calls);
+        CHECK_EQ(3, g_xsv.open_calls);
+    }
+    // Check old 512 KiB BOs are freed (and any still-open fd number was recycled to active 2 MiB BOs).
+    REQUIRE(g_drm.bos.size() >= 6U);
+    const int active_fd0 = g_drm.bos[g_drm.bos.size() - 2U]->fd;
+    const int active_fd1 = g_drm.bos[g_drm.bos.size() - 1U]->fd;
+    for (size_t i = 0; i + 2U < g_drm.bos.size(); ++i) {
+        CHECK(g_drm.bos[i]->freed);
+#ifndef _WIN32
+        if (g_drm.bos[i]->dmabuf_exported &&
+            g_drm.bos[i]->fd != active_fd0 &&
+            g_drm.bos[i]->fd != active_fd1) {
+            CHECK(fcntl(g_drm.bos[i]->fd, F_GETFD) == -1 && errno == EBADF);
+        }
+#endif
+    }
+    CHECK_EQ(2U << 20, g_drm.bos[g_drm.bos.size() - 2U]->requested_size);
+    CHECK_EQ(2U << 20, g_drm.bos[g_drm.bos.size() - 1U]->requested_size);
+
+    CHECK(video.postVideoFrame(&big_idr[0], big_idr.size(), 300U));
+    {
+        LockGuard lock(g_xsv.mu);
+        REQUIRE(g_xsv.submitted_frames.size() == 5U);
+        std::vector<uint8_t> expected_big(new_sps_pps, new_sps_pps + sizeof(new_sps_pps));
+        expected_big.insert(expected_big.end(), big_idr.begin(), big_idr.end());
+        CHECK_BYTES_EQ(expected_big, g_xsv.submitted_frames[4]);
+    }
+
+    video.stop();
+    CHECK(g_drm.allBosFreed());
+    CHECK(g_drm.allExportedFdsClosed());
+    CHECK_EQ(g_drm.bo_new_count, g_drm.bo_del_count);
+    CHECK_EQ(g_drm.dev_new_count, g_drm.dev_del_count);
+    CHECK_EQ(g_drm.open_count, g_drm.close_count);
+#endif
+}
+
+TEST_CASE(evoVideoReconfigureFailsFallbackAndAutoShowSink) {
+#ifndef _WIN32
+    REQUIRE(!g_self_exe.empty());
+    ScopedVideoTestEnv env;
+    REQUIRE(env.ok);
+
+    EvoVideo video;
+    video.setDrmOmapApiForTest(makeMockDrmApi());
+    video.setXsvApiForTest(makeMockXsvApi());
+
+    EvoVideoConfig cfg;
+    cfg.width = 800U;
+    cfg.height = 480U;
+    cfg.display_width = 800U;
+    cfg.display_height = 480U;
+    cfg.pool_count = 2U;
+    cfg.pool_buf_size = 512U * 1024U;
+    cfg.ilm_ctl_path = g_self_exe;
+    cfg.compositor_conf_path = env.conf_flip;
+    REQUIRE(video.init(cfg));
+
+    // 1. EvoVideoSink with auto_show = true keeps hidden until after firstFrameSeen().
+    EvoVideoSink sink(video, 110, true);
+    sink.onScreenStreamActive(110, true);
+    CHECK(video.isStarted());
+    CHECK(!video.isVisible());
+
+    const uint8_t non_idr[] = {0x00, 0x00, 0x00, 0x01, 0x41, 0x9a};
+    const uint8_t idr[] = {0x00, 0x00, 0x00, 0x01, 0x65, 0x88};
+    sink.onVideoFrame(110, idr, sizeof(idr), 100U, 100LL);
+    CHECK(waitUntilFirstFrame(video, 500));
+    if (!video.isVisible()) {
+        sink.onVideoFrame(110, non_idr, sizeof(non_idr), 200U, 200LL);
+    }
+    CHECK(video.isVisible());
+    CHECK(readFileText(env.log_path.c_str()).find("set surface 0x7ec00001 visibility 1") !=
+          std::string::npos);
+
+    // 2. While visible, trigger in-place reconfigure failure -> stop/start fallback preserves visibility.
+    const uint8_t sps_pps[] = {0x00, 0x00, 0x00, 0x01, 0x67, 0x64, 0x00, 0x1f,
+                               0x00, 0x00, 0x00, 0x01, 0x68, 0xee, 0x3c, 0x80};
+    {
+        LockGuard lock(g_xsv.mu);
+        g_xsv.reconfigure_fails = true;
+    }
+    sink.onVideoConfig(110, carplay::stream::CODEC_H264_AVCC,
+                       sps_pps, sizeof(sps_pps), NULL, 0U, 1280.0f, 720.0f);
+    CHECK(video.isStarted());
+    CHECK(video.isReady());
+    CHECK(video.isVisible());
+    CHECK_EQ(1280U, video.config().width);
+    CHECK_EQ(720U, video.config().height);
+    {
+        LockGuard lock(g_xsv.mu);
+        CHECK(!g_xsv.reconfigure_fails);
+        CHECK_EQ(2, g_xsv.open_calls);
+        CHECK_EQ(1, g_xsv.close_calls);
+        CHECK_EQ(1, g_xsv.stop_calls);
+        CHECK_EQ(3, g_xsv.configure_calls);
+        CHECK_EQ(1280U, g_xsv.last_width);
+        CHECK_EQ(720U, g_xsv.last_height);
+    }
+
+    // Subsequent IDR receives new SPS/PPS and triggers first frame on restarted stream.
+    sink.onVideoFrame(110, idr, sizeof(idr), 300U, 300LL);
+    CHECK(waitUntilFirstFrame(video, 500));
+    {
+        LockGuard lock(g_xsv.mu);
+        REQUIRE(!g_xsv.submitted_frames.empty());
+        std::vector<uint8_t> expected(sps_pps, sps_pps + sizeof(sps_pps));
+        expected.insert(expected.end(), idr, idr + sizeof(idr));
+        CHECK_BYTES_EQ(expected, g_xsv.submitted_frames.back());
+    }
+
+    sink.onScreenStreamActive(110, false);
+    CHECK(!video.isStarted());
+    CHECK(!video.isVisible());
+    CHECK(g_drm.allBosFreed());
+    CHECK(g_drm.allExportedFdsClosed());
+    CHECK_EQ(g_drm.bo_new_count, g_drm.bo_del_count);
+    CHECK_EQ(g_drm.dev_new_count, g_drm.dev_del_count);
+    CHECK_EQ(g_drm.open_count, g_drm.close_count);
 #endif
 }
 

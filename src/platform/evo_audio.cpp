@@ -346,6 +346,7 @@ EvoAudioConfig::EvoAudioConfig()
       max_queue_ms(500U),
       duck_gain_q15(8192),
       duck_on_alt_stream(false),
+      duck_ramp_ms(15U),
       conceal_packet_loss(false) {}
 
 std::string selectAlsaDevice(const AudioStreamId& id, const EvoAudioConfig& cfg) {
@@ -450,6 +451,7 @@ struct EvoAudioSink::Impl {
         kNeedOpen = 0,
         kOpening,
         kOpen,
+        kParked,
         kFailed
     };
 
@@ -463,8 +465,16 @@ struct EvoAudioSink::Impl {
         unsigned int target_rate;
         EntryState state;
         bool closing;
+        uint64_t start_seq;
         void* pcm;
         PcmRingBuffer ring;
+
+        // Per-stream ducking ramp state (accessed only by the worker thread after creation).
+        int32_t duck_gain_cur_q15;
+        int32_t ramp_start_q15;
+        int32_t ramp_target_q15;
+        size_t ramp_step;
+        size_t ramp_total_frames;
 
         StreamEntry(const AudioStreamId& sid,
                     const audio::AudioFormat& fmt,
@@ -473,7 +483,9 @@ struct EvoAudioSink::Impl {
                     unsigned int src_ch,
                     unsigned int dst_ch,
                     unsigned int rate,
-                    size_t ring_samples)
+                    size_t ring_samples,
+                    uint64_t seq,
+                    int32_t initial_gain_q15)
             : id(sid),
               format(fmt),
               role(r),
@@ -483,8 +495,22 @@ struct EvoAudioSink::Impl {
               target_rate(rate),
               state(kNeedOpen),
               closing(false),
-              pcm(NULL) {
+              start_seq(seq),
+              pcm(NULL),
+              duck_gain_cur_q15(initial_gain_q15),
+              ramp_start_q15(initial_gain_q15),
+              ramp_target_q15(initial_gain_q15),
+              ramp_step(0U),
+              ramp_total_frames(0U) {
             ring.reset(ring_samples);
+        }
+
+        void resetGain(int32_t gain_q15) {
+            duck_gain_cur_q15 = gain_q15;
+            ramp_start_q15 = gain_q15;
+            ramp_target_q15 = gain_q15;
+            ramp_step = 0U;
+            ramp_total_frames = 0U;
         }
     };
 
@@ -499,8 +525,10 @@ struct EvoAudioSink::Impl {
     bool quit;
     bool ducked;
     size_t rr_cursor;
+    uint64_t next_start_seq;
     std::vector<StreamEntry*> active_streams;
     std::vector<StreamEntry*> closing_streams;
+    std::vector<void*> pending_close_pcms;
     Stats stats;
 
     explicit Impl(const EvoAudioConfig& cfg)
@@ -509,7 +537,8 @@ struct EvoAudioSink::Impl {
           started(false),
           quit(false),
           ducked(false),
-          rr_cursor(0) {}
+          rr_cursor(0),
+          next_start_seq(0) {}
 
     ~Impl() {
         stop();
@@ -581,11 +610,17 @@ struct EvoAudioSink::Impl {
     bool hasActiveAltStreamLocked() const {
         for (size_t i = 0; i < active_streams.size(); ++i) {
             const StreamEntry* e = active_streams[i];
-            if (!e->closing && e->role == kRoleAlt && e->state != kFailed) {
+            // A parked alt stream is inaudible and does not duck media.
+            if (!e->closing && e->role == kRoleAlt && e->state != kFailed &&
+                e->state != kParked) {
                 return true;
             }
         }
         return false;
+    }
+
+    bool isMediaDuckedLocked() const {
+        return ducked || (config.duck_on_alt_stream && hasActiveAltStreamLocked());
     }
 
     void moveAllToClosingLocked() {
@@ -606,6 +641,46 @@ struct EvoAudioSink::Impl {
         closing_streams.push_back(e);
     }
 
+    void parkDeviceOwnersLocked(const std::string& dev) {
+        for (size_t i = 0; i < active_streams.size(); ++i) {
+            StreamEntry* e = active_streams[i];
+            if (e->closing || e->device_name != dev ||
+                e->state == kFailed || e->state == kParked) {
+                continue;
+            }
+            if (e->pcm != NULL) {
+                pending_close_pcms.push_back(e->pcm);
+                e->pcm = NULL;
+            }
+            e->ring.clear();
+            e->state = kParked;
+        }
+    }
+
+    void promoteParkedOwnerLocked(const std::string& dev) {
+        StreamEntry* best = NULL;
+        for (size_t i = 0; i < active_streams.size(); ++i) {
+            StreamEntry* e = active_streams[i];
+            if (e->closing || e->device_name != dev || e->state == kFailed) {
+                continue;
+            }
+            if (e->state != kParked) {
+                return;
+            }
+            if (best == NULL || e->start_seq > best->start_seq) {
+                best = e;
+            }
+        }
+        if (best != NULL) {
+            best->ring.clear();
+            best->state = kNeedOpen;
+            const int32_t resume_gain =
+                (best->role == kRoleMedia && isMediaDuckedLocked()) ? config.duck_gain_q15
+                                                                    : kUnityGainQ15;
+            best->resetGain(resume_gain);
+        }
+    }
+
     StreamEntry* createStreamLocked(const AudioStreamId& id, const audio::AudioFormat& format) {
         if (format.codec != audio::kCodecLpcm || format.sample_rate == 0 ||
             format.channels == 0 || format.channels > 2) {
@@ -619,6 +694,7 @@ struct EvoAudioSink::Impl {
         }
         const StreamRole role = classifyStreamRole(id);
         const std::string dev = selectAlsaDevice(id, config);
+        parkDeviceOwnersLocked(dev);
         const unsigned int dst_ch = selectAlsaChannels(id, format, config);
         uint64_t cap_frames =
             (static_cast<uint64_t>(format.sample_rate) * config.max_queue_ms) / 1000ULL;
@@ -626,8 +702,12 @@ struct EvoAudioSink::Impl {
             cap_frames = 1ULL;
         }
         const size_t ring_samples = static_cast<size_t>(cap_frames) * format.channels;
-        StreamEntry* entry = new StreamEntry(
-            id, format, role, dev, format.channels, dst_ch, format.sample_rate, ring_samples);
+        const int32_t init_gain =
+            (role == kRoleMedia && isMediaDuckedLocked()) ? config.duck_gain_q15 : kUnityGainQ15;
+        next_start_seq += 1ULL;
+        StreamEntry* entry = new StreamEntry(id, format, role, dev, format.channels, dst_ch,
+                                             format.sample_rate, ring_samples, next_start_seq,
+                                             init_gain);
         active_streams.push_back(entry);
         return entry;
     }
@@ -647,8 +727,87 @@ struct EvoAudioSink::Impl {
         list.clear();
     }
 
+    void closePcmList(std::vector<void*>& pcms) {
+        for (size_t i = 0; i < pcms.size(); ++i) {
+            void* pcm = pcms[i];
+            if (pcm != NULL) {
+                api.snd_pcm_drop(pcm);
+                api.snd_pcm_close(pcm);
+                ScopedSyncLock lock(sync);
+                stats.streams_closed += 1;
+            }
+        }
+        pcms.clear();
+    }
+
+    static void applyDuckGainToChunk(int16_t* samples,
+                                     size_t frame_count,
+                                     unsigned int channels,
+                                     bool want_duck,
+                                     int32_t target_duck_gain_q15,
+                                     unsigned int sample_rate,
+                                     uint32_t ramp_ms,
+                                     StreamEntry& entry) {
+        if (samples == NULL || frame_count == 0U || channels == 0U || entry.role != kRoleMedia) {
+            return;
+        }
+        const int32_t desired_gain = want_duck ? target_duck_gain_q15 : kUnityGainQ15;
+
+        if (ramp_ms == 0U || sample_rate == 0U) {
+            entry.resetGain(desired_gain);
+            applyGainQ15S16(samples, frame_count * channels, desired_gain);
+            return;
+        }
+
+        const int32_t active_target =
+            (entry.ramp_total_frames > 0U) ? entry.ramp_target_q15 : entry.duck_gain_cur_q15;
+        if (desired_gain != active_target) {
+            if (desired_gain == entry.duck_gain_cur_q15) {
+                entry.resetGain(desired_gain);
+            } else {
+                uint64_t total = (static_cast<uint64_t>(sample_rate) * ramp_ms) / 1000ULL;
+                if (total == 0ULL) {
+                    total = 1ULL;
+                }
+                entry.ramp_start_q15 = entry.duck_gain_cur_q15;
+                entry.ramp_target_q15 = desired_gain;
+                entry.ramp_step = 0U;
+                entry.ramp_total_frames = static_cast<size_t>(total);
+            }
+        }
+
+        if (entry.ramp_total_frames == 0U) {
+            applyGainQ15S16(samples, frame_count * channels, entry.duck_gain_cur_q15);
+            return;
+        }
+
+        size_t f = 0U;
+        while (f < frame_count && entry.ramp_total_frames > 0U) {
+            entry.ramp_step += 1U;
+            int32_t g = entry.ramp_target_q15;
+            if (entry.ramp_step >= entry.ramp_total_frames) {
+                entry.resetGain(entry.ramp_target_q15);
+            } else {
+                const int64_t diff =
+                    static_cast<int64_t>(entry.ramp_target_q15) -
+                    static_cast<int64_t>(entry.ramp_start_q15);
+                g = entry.ramp_start_q15 +
+                    static_cast<int32_t>((diff * static_cast<int64_t>(entry.ramp_step)) /
+                                         static_cast<int64_t>(entry.ramp_total_frames));
+                entry.duck_gain_cur_q15 = g;
+            }
+            applyGainQ15S16(samples + f * channels, channels, g);
+            ++f;
+        }
+
+        if (f < frame_count) {
+            applyGainQ15S16(samples + f * channels, (frame_count - f) * channels,
+                            entry.duck_gain_cur_q15);
+        }
+    }
+
     bool hasWorkLocked() const {
-        if (quit || !closing_streams.empty()) {
+        if (quit || !closing_streams.empty() || !pending_close_pcms.empty()) {
             return true;
         }
         for (size_t i = 0; i < active_streams.size(); ++i) {
@@ -668,6 +827,7 @@ struct EvoAudioSink::Impl {
 
     void workerLoop() {
         std::vector<StreamEntry*> to_close;
+        std::vector<void*> to_close_pcms;
         std::vector<int16_t> pop_buf;
         std::vector<int16_t> out_buf;
 
@@ -682,8 +842,10 @@ struct EvoAudioSink::Impl {
             std::string write_dev;
             unsigned int write_src_ch = 0;
             unsigned int write_dst_ch = 0;
+            unsigned int write_rate = 0;
             bool apply_duck = false;
             int32_t duck_gain = config.duck_gain_q15;
+            uint32_t ramp_ms = config.duck_ramp_ms;
             size_t popped_frames = 0;
 
             {
@@ -692,9 +854,11 @@ struct EvoAudioSink::Impl {
                     sync.wait();
                 }
 
-                // 1. Always drain closing streams first so old ALSA handles close before re-open.
-                if (!closing_streams.empty()) {
+                // 1. Always drain closing streams & parked handles first so old ALSA handles close
+                //    before any new handle on the same device is opened.
+                if (!closing_streams.empty() || !pending_close_pcms.empty()) {
                     to_close.swap(closing_streams);
+                    to_close_pcms.swap(pending_close_pcms);
                 } else if (quit) {
                     moveAllToClosingLocked();
                     to_close.swap(closing_streams);
@@ -735,9 +899,8 @@ struct EvoAudioSink::Impl {
                                     write_dev = e->device_name;
                                     write_src_ch = e->src_channels;
                                     write_dst_ch = e->target_channels;
-                                    apply_duck = (e->role == kRoleMedia) &&
-                                                 (ducked || (config.duck_on_alt_stream &&
-                                                             hasActiveAltStreamLocked()));
+                                    write_rate = e->target_rate;
+                                    apply_duck = (e->role == kRoleMedia) && isMediaDuckedLocked();
                                     rr_cursor = (idx + 1U) % n;
                                     break;
                                 }
@@ -747,10 +910,12 @@ struct EvoAudioSink::Impl {
                 }
             }
 
-            if (!to_close.empty()) {
+            if (!to_close.empty() || !to_close_pcms.empty()) {
                 closeAndDeleteList(to_close);
+                closePcmList(to_close_pcms);
                 ScopedSyncLock lock(sync);
-                if (quit && active_streams.empty() && closing_streams.empty()) {
+                if (quit && active_streams.empty() && closing_streams.empty() &&
+                    pending_close_pcms.empty()) {
                     return;
                 }
                 continue;
@@ -758,7 +923,8 @@ struct EvoAudioSink::Impl {
 
             {
                 ScopedSyncLock lock(sync);
-                if (quit && active_streams.empty() && closing_streams.empty()) {
+                if (quit && active_streams.empty() && closing_streams.empty() &&
+                    pending_close_pcms.empty()) {
                     return;
                 }
             }
@@ -786,8 +952,17 @@ struct EvoAudioSink::Impl {
                 ScopedSyncLock lock(sync);
                 if (to_open->closing || quit) {
                     if (pcm != NULL) {
+                        stats.streams_opened += 1;
                         // Store on entry so the closing pass drops & closes it cleanly.
                         to_open->pcm = pcm;
+                    }
+                } else if (to_open->state != kOpening) {
+                    // Parked (or parked and re-promoted) while snd_pcm_open was running.
+                    if (pcm != NULL) {
+                        stats.streams_opened += 1;
+                        pending_close_pcms.push_back(pcm);
+                    } else if (err < 0) {
+                        stats.open_failures += 1;
                     }
                 } else if (err < 0 || pcm == NULL) {
                     CARPLAY_LOG_ERROR(kTag, "cannot open ALSA playback %s (%u Hz, %u ch): %s",
@@ -795,6 +970,7 @@ struct EvoAudioSink::Impl {
                     to_open->state = kFailed;
                     to_open->ring.clear();
                     stats.open_failures += 1;
+                    promoteParkedOwnerLocked(to_open->device_name);
                 } else {
                     to_open->pcm = pcm;
                     to_open->state = kOpen;
@@ -808,8 +984,9 @@ struct EvoAudioSink::Impl {
             if (to_write != NULL && popped_frames > 0) {
                 const size_t out_frames = adaptChannelsS16(
                     &pop_buf[0], popped_frames, write_src_ch, write_dst_ch, out_buf);
-                if (apply_duck && out_frames > 0) {
-                    applyGainQ15S16(&out_buf[0], out_buf.size(), duck_gain);
+                if (out_frames > 0) {
+                    applyDuckGainToChunk(&out_buf[0], out_frames, write_dst_ch, apply_duck,
+                                         duck_gain, write_rate, ramp_ms, *to_write);
                 }
 
                 size_t written_frames = 0;
@@ -821,7 +998,8 @@ struct EvoAudioSink::Impl {
                 while (written_frames < out_frames) {
                     {
                         ScopedSyncLock lock(sync);
-                        if (to_write->closing || quit) {
+                        if (to_write->closing || to_write->state != kOpen ||
+                            to_write->pcm != write_pcm || quit) {
                             break;
                         }
                     }
@@ -865,6 +1043,7 @@ struct EvoAudioSink::Impl {
                             to_write->pcm = NULL;
                             to_write->state = kFailed;
                             to_write->ring.clear();
+                            promoteParkedOwnerLocked(to_write->device_name);
                         }
                     }
                 }
@@ -940,6 +1119,11 @@ void EvoAudioSink::onAudioPcm(const AudioStreamId& id,
         return;
     }
     Impl::StreamEntry* e = impl_->findActiveLocked(id);
+    if (e != NULL && e->state == Impl::kParked) {
+        // Parked streams discard incoming PCM and never trigger reopen or ownership changes.
+        impl_->stats.parked_frames_discarded += static_cast<uint64_t>(frame_count);
+        return;
+    }
     // A format change without a fresh onAudioStarted must reopen the stream:
     // pushFrames() sizes its copy from the entry's channel count, not `format`.
     if (e == NULL || e->src_channels != format.channels || e->target_rate != format.sample_rate) {
@@ -968,7 +1152,7 @@ void EvoAudioSink::onAudioPacketLost(const AudioStreamId& id,
         return;
     }
     Impl::StreamEntry* e = impl_->findActiveLocked(id);
-    if (e == NULL || e->state == Impl::kFailed) {
+    if (e == NULL || e->state == Impl::kFailed || e->state == Impl::kParked) {
         return;
     }
     size_t conceal_frames = format.sample_rate / 50U;
@@ -985,7 +1169,9 @@ void EvoAudioSink::onAudioStopped(const AudioStreamId& id) {
     ScopedSyncLock lock(impl_->sync);
     for (size_t i = 0; i < impl_->active_streams.size(); ++i) {
         if (impl_->active_streams[i]->id == id) {
+            const std::string dev = impl_->active_streams[i]->device_name;
             impl_->retireActiveByIndexLocked(i);
+            impl_->promoteParkedOwnerLocked(dev);
             impl_->sync.signal();
             break;
         }
@@ -1001,7 +1187,7 @@ void EvoAudioSink::setDucked(bool ducked) {
 
 bool EvoAudioSink::isDucked() const {
     ScopedSyncLock lock(impl_->sync);
-    return impl_->ducked || (impl_->config.duck_on_alt_stream && impl_->hasActiveAltStreamLocked());
+    return impl_->isMediaDuckedLocked();
 }
 
 void EvoAudioSink::stopAll() {
@@ -1016,6 +1202,13 @@ EvoAudioSink::Stats EvoAudioSink::stats() const {
     ScopedSyncLock lock(impl_->sync);
     Stats copy = impl_->stats;
     copy.active_streams = impl_->active_streams.size();
+    size_t parked = 0U;
+    for (size_t i = 0; i < impl_->active_streams.size(); ++i) {
+        if (impl_->active_streams[i]->state == Impl::kParked) {
+            ++parked;
+        }
+    }
+    copy.parked_streams = parked;
     return copy;
 }
 
