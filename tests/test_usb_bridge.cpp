@@ -115,6 +115,85 @@ std::vector<uint8_t> buildSyntheticCarPlayBlob(bool include_ncm) {
     return blob;
 }
 
+std::vector<uint8_t> buildIos17UsbmuxNcmBlob(bool with_apple_ethernet) {
+    std::vector<uint8_t> body;
+    // Interface 0: Apple USBMUX (0xff/0xfe/0x02), Bulk OUT 0x04, Bulk IN 0x85
+    body.push_back(9U);
+    body.push_back(usb::kDescTypeInterface);
+    body.push_back(0U);
+    body.push_back(0U);
+    body.push_back(2U);
+    body.push_back(usb::kAppleUsbmuxClass);
+    body.push_back(usb::kAppleUsbmuxSubClass);
+    body.push_back(usb::kAppleUsbmuxProtocol);
+    body.push_back(0U);
+    body.push_back(7U); body.push_back(usb::kDescTypeEndpoint); body.push_back(0x04U);
+    body.push_back(usb::kEpTypeBulk); pushU16Le(body, 512U); body.push_back(0U);
+    body.push_back(7U); body.push_back(usb::kDescTypeEndpoint); body.push_back(0x85U);
+    body.push_back(usb::kEpTypeBulk); pushU16Le(body, 512U); body.push_back(0U);
+
+    // Interface 1: CDC-NCM Control
+    body.push_back(9U);
+    body.push_back(usb::kDescTypeInterface);
+    body.push_back(1U);
+    body.push_back(0U);
+    body.push_back(1U);
+    body.push_back(usb::kClassCommunications);
+    body.push_back(usb::kSubClassCdcNcm);
+    body.push_back(0U);
+    body.push_back(0U);
+    body.push_back(5U); body.push_back(usb::kDescTypeCsInterface); body.push_back(usb::kCdcSubtypeHeader);
+    pushU16Le(body, 0x0120U);
+    body.push_back(5U); body.push_back(usb::kDescTypeCsInterface); body.push_back(usb::kCdcSubtypeUnion);
+    body.push_back(1U); body.push_back(2U);
+    body.push_back(13U); body.push_back(usb::kDescTypeCsInterface); body.push_back(usb::kCdcSubtypeEthernet);
+    body.push_back(4U); pushU32Le(body, 0U); pushU16Le(body, 1514U); pushU16Le(body, 0U); body.push_back(0U);
+    body.push_back(6U); body.push_back(usb::kDescTypeCsInterface); body.push_back(usb::kCdcSubtypeNcm);
+    pushU16Le(body, 0x0100U); body.push_back(0x0fU);
+    body.push_back(7U); body.push_back(usb::kDescTypeEndpoint); body.push_back(0x82U);
+    body.push_back(usb::kEpTypeInterrupt); pushU16Le(body, 16U); body.push_back(9U);
+
+    // Interface 2 alt 0: idle, alt 1: active
+    body.push_back(9U); body.push_back(usb::kDescTypeInterface); body.push_back(2U); body.push_back(0U);
+    body.push_back(0U); body.push_back(usb::kClassCdcData); body.push_back(0U); body.push_back(usb::kProtocolCdcNcmData);
+    body.push_back(0U);
+    body.push_back(9U); body.push_back(usb::kDescTypeInterface); body.push_back(2U); body.push_back(1U);
+    body.push_back(2U); body.push_back(usb::kClassCdcData); body.push_back(0U); body.push_back(usb::kProtocolCdcNcmData);
+    body.push_back(0U);
+    body.push_back(7U); body.push_back(usb::kDescTypeEndpoint); body.push_back(0x83U);
+    body.push_back(usb::kEpTypeBulk); pushU16Le(body, 512U); body.push_back(0U);
+    body.push_back(7U); body.push_back(usb::kDescTypeEndpoint); body.push_back(0x03U);
+    body.push_back(usb::kEpTypeBulk); pushU16Le(body, 512U); body.push_back(0U);
+
+    uint8_t num_ifaces = 3U;
+    if (with_apple_ethernet) {
+        num_ifaces = 4U;
+        // Interface 3: Apple Ethernet (0xff/0xfd/0x01)
+        body.push_back(9U);
+        body.push_back(usb::kDescTypeInterface);
+        body.push_back(3U);
+        body.push_back(0U);
+        body.push_back(0U);
+        body.push_back(usb::kAppleEthernetClass);
+        body.push_back(usb::kAppleEthernetSubClass);
+        body.push_back(usb::kAppleEthernetProtocol);
+        body.push_back(0U);
+    }
+
+    std::vector<uint8_t> blob;
+    blob.push_back(18U); blob.push_back(usb::kDescTypeDevice); pushU16Le(blob, 0x0200U);
+    blob.push_back(0U); blob.push_back(0U); blob.push_back(0U); blob.push_back(64U);
+    pushU16Le(blob, usb::kAppleVendorId); pushU16Le(blob, 0x12a8U); pushU16Le(blob, 0x0100U);
+    blob.push_back(1U); blob.push_back(2U); blob.push_back(3U); blob.push_back(1U);
+    blob.push_back(9U); blob.push_back(usb::kDescTypeConfiguration);
+    pushU16Le(blob, static_cast<uint16_t>(9U + body.size()));
+    blob.push_back(num_ifaces);
+    blob.push_back(with_apple_ethernet ? 5U : 4U);
+    blob.push_back(0U); blob.push_back(0xc0U); blob.push_back(250U);
+    blob.insert(blob.end(), body.begin(), body.end());
+    return blob;
+}
+
 std::vector<uint8_t> makeEthFrame(uint8_t tag, size_t payload_bytes) {
     std::vector<uint8_t> f(14U + payload_bytes, 0U);
     f[0] = 0x33U; f[1] = 0x33U; f[5] = 0x01U;
@@ -161,9 +240,20 @@ public:
           next_token(100U),
           read_end(kInvalidSocket),
           write_end(kInvalidSocket),
+          last_err(0),
           set_config_calls(0),
-          switch_calls(0) {
+          switch_calls(0),
+          reset_calls(0),
+          reject_switch(false),
+          switch_zero_response(false),
+          reset_ok(true),
+          get_driver_fail(false),
+          submit_fail_errno(0) {
         std::memset(&last_switch_req, 0, sizeof(last_switch_req));
+        apple_usb_mode_bytes.push_back(0x01U);
+        apple_usb_mode_bytes.push_back(0x02U);
+        apple_usb_mode_bytes.push_back(0x03U);
+        apple_usb_mode_bytes.push_back(0x04U);
     }
 
     ~FakeUsbDevfs() { wakePairClose(read_end, write_end); }
@@ -175,7 +265,10 @@ public:
         uint8_t req;
         uint16_t val;
         uint16_t idx;
+        uint16_t len;
     };
+
+    virtual int lastErrno() const { return last_err; }
 
     virtual bool enumerateDevices(const std::string&, std::vector<UsbDeviceInfo>& out) {
         out.clear();
@@ -190,8 +283,10 @@ public:
                             SocketHandle& fd_out,
                             std::vector<uint8_t>& raw_descriptors_out) {
         if (!device_present) {
+            last_err = ENOENT;
             return false;
         }
+        last_err = 0;
         fd_out = read_end;
         raw_descriptors_out = raw_descriptors;
         return true;
@@ -211,11 +306,13 @@ public:
                                  uint16_t length,
                                  uint32_t,
                                  int& transferred_out) {
+        last_err = 0;
         ControlCall cc;
         cc.req_type = request_type;
         cc.req = request;
         cc.val = value;
         cc.idx = index;
+        cc.len = length;
         control_calls.push_back(cc);
 
         if (request_type == 0x80U && request == 0x06U && (value >> 8) == usb::kDescTypeString) {
@@ -232,6 +329,46 @@ public:
                 return true;
             }
         }
+        if (request_type == kUsbStandardDeviceIn && request == kUsbReqGetConfiguration) {
+            if (data != NULL && length >= 1U) {
+                data[0] = present_info.configuration_value;
+                transferred_out = 1;
+                return true;
+            }
+            transferred_out = 0;
+            return false;
+        }
+        if (request_type == kUsbVendorDeviceIn && request == kAppleReqCarPlayConfig) {
+            ++switch_calls;
+            last_switch_req = cc;
+            if (reject_switch) {
+                last_err = EPIPE;
+                transferred_out = 0;
+                return false;
+            }
+            if (switch_zero_response) {
+                transferred_out = 0;
+                return true;
+            }
+            if (data != NULL && length >= 1U) {
+                data[0] = 0x00U;
+            }
+            transferred_out = length >= 1U ? 1 : 0;
+            return true;
+        }
+        if (request_type == kUsbVendorDeviceIn && request == kAppleReqGetUsbMode) {
+            if (apple_usb_mode_bytes.empty()) {
+                last_err = EPIPE;
+                transferred_out = 0;
+                return false;
+            }
+            const size_t n = apple_usb_mode_bytes.size() < length ? apple_usb_mode_bytes.size() : length;
+            if (data != NULL && n > 0U) {
+                std::memcpy(data, &apple_usb_mode_bytes[0], n);
+            }
+            transferred_out = static_cast<int>(n);
+            return true;
+        }
         if (request_type == 0x40U) {
             ++switch_calls;
             last_switch_req = cc;
@@ -241,24 +378,77 @@ public:
     }
 
     virtual bool setConfiguration(SocketHandle, uint8_t cfg) {
+        last_err = 0;
         ++set_config_calls;
         present_info.configuration_value = cfg;
         return true;
     }
-    virtual bool claimInterface(SocketHandle, uint8_t iface, bool) {
+
+    virtual bool getInterfaceDriver(SocketHandle, uint8_t iface, std::string& driver_out) {
+        last_err = 0;
+        driver_out.clear();
+        if (get_driver_fail) {
+            last_err = EIO;
+            return false;
+        }
+        for (size_t i = 0; i < bound_drivers.size(); ++i) {
+            if (bound_drivers[i].first == iface) {
+                driver_out = bound_drivers[i].second;
+                return true;
+            }
+        }
+        return true;
+    }
+
+    virtual bool claimInterface(SocketHandle, uint8_t iface, bool detach) {
+        last_err = 0;
+        if (detach) {
+            detached_ifaces.push_back(iface);
+            for (size_t i = 0; i < bound_drivers.size();) {
+                if (bound_drivers[i].first == iface) {
+                    bound_drivers.erase(bound_drivers.begin() + static_cast<ptrdiff_t>(i));
+                } else {
+                    ++i;
+                }
+            }
+        }
+        for (size_t i = 0; i < bound_drivers.size(); ++i) {
+            if (bound_drivers[i].first == iface) {
+                last_err = EBUSY;
+                return false;
+            }
+        }
         claimed.push_back(iface);
         return true;
     }
+
     virtual bool releaseInterface(SocketHandle, uint8_t iface) {
+        last_err = 0;
         released.push_back(iface);
         return true;
     }
-    virtual bool setInterface(SocketHandle, uint8_t, uint8_t) { return true; }
+
+    virtual bool setInterface(SocketHandle, uint8_t, uint8_t) {
+        last_err = 0;
+        return true;
+    }
+
+    virtual bool resetDevice(SocketHandle) {
+        last_err = 0;
+        ++reset_calls;
+        return reset_ok;
+    }
 
     virtual bool submitBulkUrb(SocketHandle,
                                const UsbUrbSubmit& req,
                                uint64_t urb_id,
                                uintptr_t& os_token_out) {
+        if (submit_fail_errno != 0) {
+            last_err = submit_fail_errno;
+            os_token_out = 0;
+            return false;
+        }
+        last_err = 0;
         const uintptr_t tok = next_token++;
         os_token_out = tok;
         SubmittedUrb su;
@@ -270,6 +460,7 @@ public:
     }
 
     virtual UsbReapStatus reapUrb(SocketHandle, UsbUrbCompletion& out) {
+        last_err = 0;
         if (completions.empty()) {
             return kUsbReapEmpty;
         }
@@ -279,6 +470,7 @@ public:
     }
 
     virtual bool discardUrb(SocketHandle, uintptr_t os_token) {
+        last_err = 0;
         for (size_t i = 0; i < in_flight.size(); ++i) {
             if (in_flight[i].token == os_token) {
                 in_flight.erase(in_flight.begin() + static_cast<ptrdiff_t>(i));
@@ -316,10 +508,20 @@ public:
     uintptr_t next_token;
     SocketHandle read_end;
     SocketHandle write_end;
+    int last_err;
     int set_config_calls;
     int switch_calls;
+    int reset_calls;
+    bool reject_switch;
+    bool switch_zero_response;
+    bool reset_ok;
+    bool get_driver_fail;
+    int submit_fail_errno;
+    std::vector<uint8_t> apple_usb_mode_bytes;
     ControlCall last_switch_req;
     std::vector<ControlCall> control_calls;
+    std::vector<std::pair<uint8_t, std::string> > bound_drivers;
+    std::vector<uint8_t> detached_ifaces;
     std::vector<uint8_t> claimed;
     std::vector<uint8_t> released;
     std::vector<SubmittedUrb> in_flight;
@@ -440,8 +642,16 @@ public:
           open_(false),
           next_id_(1U),
           switch_calls_(0),
-          set_cfg_calls_(0) {
+          set_cfg_calls_(0),
+          reset_calls_(0),
+          ignored_count_(0),
+          switch_ok_(true),
+          claim_fail_status_(kUsbClaimOk) {
         ntb_params_ = ncm::NtbParameters::defaults();
+        mode_bytes_.push_back(0x01U);
+        mode_bytes_.push_back(0x00U);
+        mode_bytes_.push_back(0x00U);
+        mode_bytes_.push_back(0x00U);
     }
 
     virtual bool start(Reactor&, UsbHostListener* listener) {
@@ -469,8 +679,37 @@ public:
         return true;
     }
 
-    virtual bool claimInterface(uint8_t iface, bool) {
+    virtual bool claimInterface(uint8_t iface, bool detach_kernel_driver) {
+        UsbClaimStatus st = kUsbClaimOk;
+        std::string drv;
+        return claimInterfaceWithStatus(iface, detach_kernel_driver, false, st, drv);
+    }
+
+    virtual bool claimInterfaceWithStatus(uint8_t iface,
+                                          bool detach_kernel_driver,
+                                          bool detach_usbfs_driver,
+                                          UsbClaimStatus& status_out,
+                                          std::string& driver_out) {
+        driver_out.clear();
+        if (claim_fail_status_ != kUsbClaimOk) {
+            if (claim_fail_status_ == kUsbClaimBusyUserspace && detach_usbfs_driver) {
+                claimed_ifaces_.push_back(iface);
+                status_out = kUsbClaimOk;
+                driver_out = claim_fail_driver_;
+                return true;
+            }
+            if (claim_fail_status_ == kUsbClaimBusyKernel && detach_kernel_driver) {
+                claimed_ifaces_.push_back(iface);
+                status_out = kUsbClaimOk;
+                driver_out = claim_fail_driver_;
+                return true;
+            }
+            status_out = claim_fail_status_;
+            driver_out = claim_fail_driver_;
+            return false;
+        }
         claimed_ifaces_.push_back(iface);
+        status_out = kUsbClaimOk;
         return true;
     }
 
@@ -478,6 +717,11 @@ public:
     virtual bool setInterface(uint8_t iface, uint8_t alt) {
         set_ifaces_.push_back(std::make_pair(iface, alt));
         return true;
+    }
+
+    virtual bool resetDevice() {
+        ++reset_calls_;
+        return open_;
     }
 
     virtual bool controlTransfer(uint8_t request_type,
@@ -512,9 +756,19 @@ public:
         return true;
     }
 
+    virtual bool queryActiveConfiguration(uint8_t& config_value_out) {
+        config_value_out = info_.configuration_value;
+        return open_;
+    }
+
+    virtual bool queryAppleUsbMode(std::vector<uint8_t>& mode_out) {
+        mode_out = mode_bytes_;
+        return !mode_out.empty();
+    }
+
     virtual bool requestCarPlayModeSwitch(const AppleCarPlaySwitchRequest&) {
         ++switch_calls_;
-        return true;
+        return switch_ok_;
     }
 
     virtual uint64_t submitBulkIn(uint8_t endpoint, size_t, void* user_ctx) {
@@ -563,6 +817,11 @@ public:
             }
         }
         return false;
+    }
+
+    virtual void ignoreCurrentDevice() {
+        ++ignored_count_;
+        closeCurrentDevice();
     }
 
     virtual void closeCurrentDevice() {
@@ -631,6 +890,12 @@ public:
     ncm::NtbParameters ntb_params_;
     int switch_calls_;
     int set_cfg_calls_;
+    int reset_calls_;
+    int ignored_count_;
+    bool switch_ok_;
+    UsbClaimStatus claim_fail_status_;
+    std::string claim_fail_driver_;
+    std::vector<uint8_t> mode_bytes_;
     std::vector<uint8_t> claimed_ifaces_;
     std::vector<std::pair<uint8_t, uint8_t> > set_ifaces_;
     std::vector<std::vector<uint8_t> > set_ntb_input_sizes_;
@@ -1136,6 +1401,435 @@ TEST_CASE(bridgeMidTransferRemovalAndMalformedNtbRecovery) {
     fake_usb.simulateArrival(buildSyntheticCarPlayBlob(true), 4U);
     CHECK_EQ(kBridgeActive, bridge.state());
     CHECK(fake_tap.isOpen());
+    bridge.stop();
+}
+
+TEST_CASE(posixSysfsFilteringHubsAndFixedDevices) {
+    CHECK(isValidUsbPortName("1-1"));
+    CHECK(isValidUsbPortName("3-1.2"));
+    CHECK(!isValidUsbPortName(""));
+    CHECK(!isValidUsbPortName("usb1"));
+    CHECK(!isValidUsbPortName("1-1:1.0"));
+    CHECK(!isValidUsbPortName(".."));
+    CHECK(!isValidUsbPortName("1/1"));
+
+#ifdef __linux__
+    char tmpl[] = "/tmp/carplay_sysfs_flt_XXXXXX";
+    char* root = mkdtemp(tmpl);
+    REQUIRE(root != NULL);
+
+    const std::string base(root);
+    const std::string usb1_dir = base + "/usb1";
+    const std::string iface_dir = base + "/1-1:1.0";
+    const std::string hub_dir = base + "/1-2";
+    const std::string fixed_dir = base + "/1-3";
+    const std::string other_dir = base + "/2-1";
+    const std::string target_dir = base + "/3-1";
+    REQUIRE(mkdir(usb1_dir.c_str(), 0700) == 0);
+    REQUIRE(mkdir(iface_dir.c_str(), 0700) == 0);
+    REQUIRE(mkdir(hub_dir.c_str(), 0700) == 0);
+    REQUIRE(mkdir(fixed_dir.c_str(), 0700) == 0);
+    REQUIRE(mkdir(other_dir.c_str(), 0700) == 0);
+    REQUIRE(mkdir(target_dir.c_str(), 0700) == 0);
+
+    // usb1 root hub entry (must be skipped by name)
+    REQUIRE(writeTempTextFile(usb1_dir + "/idVendor", "05ac\n"));
+    REQUIRE(writeTempTextFile(usb1_dir + "/idProduct", "0001\n"));
+    REQUIRE(writeTempTextFile(usb1_dir + "/busnum", "1\n"));
+    REQUIRE(writeTempTextFile(usb1_dir + "/devnum", "1\n"));
+
+    // 1-2: USB hub (bDeviceClass=09)
+    REQUIRE(writeTempTextFile(hub_dir + "/idVendor", "05ac\n"));
+    REQUIRE(writeTempTextFile(hub_dir + "/idProduct", "1006\n"));
+    REQUIRE(writeTempTextFile(hub_dir + "/busnum", "1\n"));
+    REQUIRE(writeTempTextFile(hub_dir + "/devnum", "2\n"));
+    REQUIRE(writeTempTextFile(hub_dir + "/bDeviceClass", "09\n"));
+
+    // 1-3: soldered on-board fixed chip
+    REQUIRE(writeTempTextFile(fixed_dir + "/idVendor", "05ac\n"));
+    REQUIRE(writeTempTextFile(fixed_dir + "/idProduct", "12a8\n"));
+    REQUIRE(writeTempTextFile(fixed_dir + "/busnum", "1\n"));
+    REQUIRE(writeTempTextFile(fixed_dir + "/devnum", "3\n"));
+    REQUIRE(writeTempTextFile(fixed_dir + "/removable", "fixed\n"));
+
+    // 2-1: another removable Apple device on a different port
+    REQUIRE(writeTempTextFile(other_dir + "/idVendor", "05ac\n"));
+    REQUIRE(writeTempTextFile(other_dir + "/idProduct", "12a8\n"));
+    REQUIRE(writeTempTextFile(other_dir + "/busnum", "2\n"));
+    REQUIRE(writeTempTextFile(other_dir + "/devnum", "4\n"));
+    REQUIRE(writeTempTextFile(other_dir + "/removable", "removable\n"));
+
+    // 3-1: pinned target Apple port
+    REQUIRE(writeTempTextFile(target_dir + "/idVendor", "05ac\n"));
+    REQUIRE(writeTempTextFile(target_dir + "/idProduct", "12a8\n"));
+    REQUIRE(writeTempTextFile(target_dir + "/busnum", "3\n"));
+    REQUIRE(writeTempTextFile(target_dir + "/devnum", "5\n"));
+    REQUIRE(writeTempTextFile(target_dir + "/removable", "removable\n"));
+
+    PosixUsbDevfs devfs;
+    std::vector<UsbDeviceInfo> list;
+    REQUIRE(devfs.enumerateDevices(base, list));
+    // usb1 and 1-1:1.0 are excluded at enumeration time; 4 device nodes remain
+    CHECK_EQ(4U, list.size());
+
+    // Now test UsbHost filtering with a wrapper that enumerates the real temp sysfs tree
+    // and opens via FakeUsbDevfs.
+    class TempSysfsBackend : public FakeUsbDevfs {
+    public:
+        explicit TempSysfsBackend(PosixUsbDevfs* real_sysfs) : real_(real_sysfs) {}
+        virtual bool enumerateDevices(const std::string& root_path,
+                                      std::vector<UsbDeviceInfo>& out) {
+            return real_->enumerateDevices(root_path, out);
+        }
+        PosixUsbDevfs* real_;
+    } temp_backend(&devfs);
+    REQUIRE(temp_backend.initWakeFd());
+    temp_backend.device_present = true;
+    temp_backend.raw_descriptors = buildSyntheticCarPlayBlob(true);
+
+    Reactor reactor;
+    REQUIRE(reactor.init());
+    UsbHostConfig cfg;
+    cfg.sysfs_devices_root = base;
+    cfg.hotplug_poll_ms = 0;
+    cfg.usb_port_filter = "3-1";
+    cfg.ignore_fixed_devices = true;
+    UsbHost host(cfg, &temp_backend);
+    RecordingHostListener hl;
+    REQUIRE(host.start(reactor, &hl));
+    host.pollHotplug();
+    REQUIRE(hl.arrived == 1);
+    REQUIRE(host.isDeviceOpen());
+    CHECK_EQ(std::string("3-1"), host.currentDevice().sysfs_name);
+    CHECK_EQ(3U, host.currentDevice().bus_num);
+    CHECK_EQ(5U, host.currentDevice().dev_num);
+    host.stop();
+
+    // Cleanup temp tree
+    const char* dirs[] = {"usb1", "1-2", "1-3", "2-1", "3-1"};
+    const char* files[] = {"idVendor", "idProduct", "busnum", "devnum", "bDeviceClass", "removable"};
+    for (size_t d = 0; d < sizeof(dirs) / sizeof(dirs[0]); ++d) {
+        const std::string dp = base + "/" + dirs[d];
+        for (size_t f = 0; f < sizeof(files) / sizeof(files[0]); ++f) {
+            unlink((dp + "/" + files[f]).c_str());
+        }
+        rmdir(dp.c_str());
+    }
+    rmdir(iface_dir.c_str());
+    rmdir(base.c_str());
+#endif
+}
+
+TEST_CASE(usbHostOwnershipUsbfsRefusalAndIgnoredAntiSpam) {
+    Reactor reactor;
+    REQUIRE(reactor.init());
+
+    FakeUsbDevfs fake_devfs;
+    REQUIRE(fake_devfs.initWakeFd());
+    fake_devfs.present_info.sysfs_name = "1-1";
+    fake_devfs.present_info.vendor_id = usb::kAppleVendorId;
+    fake_devfs.present_info.product_id = 0x12a8U;
+    fake_devfs.present_info.bus_num = 1U;
+    fake_devfs.present_info.dev_num = 7U;
+    fake_devfs.present_info.configuration_value = 4U;
+    fake_devfs.raw_descriptors = buildSyntheticCarPlayBlob(true);
+    fake_devfs.device_present = true;
+    fake_devfs.bound_drivers.push_back(std::make_pair(0U, std::string("usbfs")));
+    fake_devfs.bound_drivers.push_back(std::make_pair(1U, std::string("snd-usb-audio")));
+
+    UsbHostConfig cfg;
+    cfg.hotplug_poll_ms = 0;
+    cfg.detach_kernel_driver = true;
+    cfg.detach_usbfs_driver = false;
+    UsbHost host(cfg, &fake_devfs);
+    RecordingHostListener hl;
+    REQUIRE(host.start(reactor, &hl));
+    host.pollHotplug();
+    REQUIRE(hl.arrived == 1);
+
+    // 1. Userspace "usbfs" holder must be refused without calling USBDEVFS_DISCONNECT
+    UsbClaimStatus st = kUsbClaimError;
+    std::string drv;
+    CHECK(!host.claimInterfaceWithStatus(0U, true, false, st, drv));
+    CHECK_EQ(kUsbClaimBusyUserspace, st);
+    CHECK_EQ(std::string("usbfs"), drv);
+    CHECK(fake_devfs.detached_ifaces.empty());
+
+    // 2. Kernel driver with detach disabled -> kUsbClaimBusyKernel
+    CHECK(!host.claimInterfaceWithStatus(1U, false, false, st, drv));
+    CHECK_EQ(kUsbClaimBusyKernel, st);
+    CHECK_EQ(std::string("snd-usb-audio"), drv);
+    CHECK(fake_devfs.detached_ifaces.empty());
+
+    // 3. Kernel driver with detach enabled -> detached and claimed
+    CHECK(host.claimInterfaceWithStatus(1U, true, false, st, drv));
+    CHECK_EQ(kUsbClaimOk, st);
+    REQUIRE(fake_devfs.detached_ifaces.size() == 1U);
+    CHECK_EQ(1U, fake_devfs.detached_ifaces[0]);
+
+    // 4. Explicit detach_usbfs_driver=true allows detaching "usbfs"
+    CHECK(host.claimInterfaceWithStatus(0U, true, true, st, drv));
+    CHECK_EQ(kUsbClaimOk, st);
+    CHECK_EQ(2U, fake_devfs.detached_ifaces.size());
+
+    // 5. ignoreCurrentDevice leaves device alone until unplug + replug
+    host.ignoreCurrentDevice();
+    CHECK(!host.isDeviceOpen());
+    host.pollHotplug();
+    CHECK(!host.isDeviceOpen());
+    CHECK_EQ(1, hl.arrived);
+
+    // Simulate unplug then replug -> forgotten from ignored list -> re-opened!
+    fake_devfs.device_present = false;
+    host.pollHotplug();
+    fake_devfs.device_present = true;
+    host.pollHotplug();
+    CHECK(host.isDeviceOpen());
+    CHECK_EQ(2, hl.arrived);
+
+    // 6. ENODEV on submitBulkOut triggers immediate disconnect notification
+    fake_devfs.submit_fail_errno = ENODEV;
+    const uint8_t pkt[4] = {1U, 2U, 3U, 4U};
+    CHECK_EQ(0U, host.submitBulkOut(0x01U, pkt, sizeof(pkt), false, NULL));
+    CHECK(!host.isDeviceOpen());
+    CHECK_EQ(1, hl.removed);
+
+    host.stop();
+}
+
+TEST_CASE(usbHostAppleControlQueriesAndReset) {
+    Reactor reactor;
+    REQUIRE(reactor.init());
+
+    FakeUsbDevfs fake_devfs;
+    REQUIRE(fake_devfs.initWakeFd());
+    fake_devfs.present_info.sysfs_name = "1-1";
+    fake_devfs.present_info.vendor_id = usb::kAppleVendorId;
+    fake_devfs.present_info.product_id = 0x12a8U;
+    fake_devfs.present_info.bus_num = 1U;
+    fake_devfs.present_info.dev_num = 8U;
+    fake_devfs.present_info.configuration_value = 4U;
+    fake_devfs.raw_descriptors = buildSyntheticCarPlayBlob(true);
+    fake_devfs.device_present = true;
+
+    UsbHostConfig cfg;
+    cfg.hotplug_poll_ms = 0;
+    UsbHost host(cfg, &fake_devfs);
+    RecordingHostListener hl;
+    REQUIRE(host.start(reactor, &hl));
+    host.pollHotplug();
+    REQUIRE(host.isDeviceOpen());
+
+    // Verified Apple CarPlay mode switch: 0xc0 / 0x52 / wValue=0 / wIndex=4 / wLength=1
+    CHECK(host.requestCarPlayModeSwitch(AppleCarPlaySwitchRequest()));
+    CHECK_EQ(1, fake_devfs.switch_calls);
+    CHECK_EQ(0xc0U, fake_devfs.last_switch_req.req_type);
+    CHECK_EQ(0x52U, fake_devfs.last_switch_req.req);
+    CHECK_EQ(0U, fake_devfs.last_switch_req.val);
+    CHECK_EQ(4U, fake_devfs.last_switch_req.idx);
+    CHECK_EQ(1U, fake_devfs.last_switch_req.len);
+
+    // Must reject 0-byte response or stalled vendor switch request
+    fake_devfs.switch_zero_response = true;
+    CHECK(!host.requestCarPlayModeSwitch(AppleCarPlaySwitchRequest()));
+    fake_devfs.switch_zero_response = false;
+    fake_devfs.reject_switch = true;
+    CHECK(!host.requestCarPlayModeSwitch(AppleCarPlaySwitchRequest()));
+
+    // Query Apple USB mode (0xc0 / 0x45)
+    std::vector<uint8_t> mode;
+    REQUIRE(host.queryAppleUsbMode(mode));
+    REQUIRE(mode.size() == 4U);
+    CHECK_EQ(0x01U, mode[0]);
+    CHECK_EQ(0x04U, mode[3]);
+
+    // Query standard GET_CONFIGURATION (0x80 / 0x08)
+    uint8_t active_cfg = 0U;
+    REQUIRE(host.queryActiveConfiguration(active_cfg));
+    CHECK_EQ(4U, active_cfg);
+
+    // USBDEVFS_RESET
+    CHECK(host.resetDevice());
+    CHECK_EQ(1, fake_devfs.reset_calls);
+
+    host.stop();
+}
+
+TEST_CASE(bridgeCoexistenceUsbfsConflictAndLeaveAlone) {
+    Reactor reactor;
+    REQUIRE(reactor.init());
+
+    // Default policy (detach_usbfs_driver = false): yield gracefully and ignore device
+    {
+        FakeUsbHost fake_usb;
+        FakeTapPort fake_tap;
+        fake_usb.claim_fail_status_ = kUsbClaimBusyUserspace;
+        fake_usb.claim_fail_driver_ = "usbfs";
+
+        UsbCarPlayBridge bridge(fake_usb, fake_tap);
+        RecordingBridgeListener listener;
+        REQUIRE(bridge.start(reactor, &listener));
+
+        fake_usb.simulateArrival(buildSyntheticCarPlayBlob(true), 1U);
+        CHECK_EQ(kBridgeWaiting, bridge.state());
+        CHECK_EQ(1U, bridge.stats().ownership_conflicts);
+        CHECK_EQ(1, fake_usb.ignored_count_);
+        CHECK(!fake_usb.isDeviceOpen());
+        CHECK(!fake_tap.isOpen());
+        REQUIRE(!listener.errors.empty());
+        CHECK(listener.errors[0].find("usbfs") != std::string::npos);
+        CHECK(listener.errors[0].find("MediaPlayer") != std::string::npos);
+        bridge.stop();
+    }
+
+    // Explicit opt-in (detach_usbfs_driver = true): detaches and activates
+    {
+        FakeUsbHost fake_usb;
+        FakeTapPort fake_tap;
+        fake_usb.claim_fail_status_ = kUsbClaimBusyUserspace;
+        fake_usb.claim_fail_driver_ = "usbfs";
+
+        UsbCarPlayBridgeConfig cfg;
+        cfg.detach_usbfs_driver = true;
+        UsbCarPlayBridge bridge(fake_usb, fake_tap, cfg);
+        RecordingBridgeListener listener;
+        REQUIRE(bridge.start(reactor, &listener));
+
+        fake_usb.simulateArrival(buildSyntheticCarPlayBlob(true), 4U);
+        CHECK_EQ(kBridgeActive, bridge.state());
+        CHECK_EQ(0U, bridge.stats().ownership_conflicts);
+        CHECK_EQ(0, fake_usb.ignored_count_);
+        CHECK(fake_tap.isOpen());
+        bridge.stop();
+    }
+}
+
+TEST_CASE(bridgeIos17UsbmuxNcmSwitchAndRejectionFallback) {
+    Reactor reactor;
+    REQUIRE(reactor.init());
+
+    // Case A: USBMUX + NCM without Apple Ethernet -> sends 0xc0/0x52, closes for re-enum,
+    // then becomes active when device returns with Apple Ethernet (ff/fd/01).
+    {
+        FakeUsbHost fake_usb;
+        FakeTapPort fake_tap;
+        UsbCarPlayBridgeConfig cfg;
+        cfg.auto_request_carplay_switch = true;
+        cfg.ncm_allow_control_fallback = true;
+        UsbCarPlayBridge bridge(fake_usb, fake_tap, cfg);
+        RecordingBridgeListener listener;
+        REQUIRE(bridge.start(reactor, &listener));
+
+        fake_usb.simulateArrival(buildIos17UsbmuxNcmBlob(false), 4U);
+        CHECK_EQ(1, fake_usb.switch_calls_);
+        CHECK_EQ(kBridgeWaiting, bridge.state());
+        CHECK(!fake_usb.isDeviceOpen());
+        CHECK(!fake_tap.isOpen());
+
+        // Re-enumeration now exposes Apple Ethernet (is_carplay_mode=true)
+        fake_usb.simulateArrival(buildIos17UsbmuxNcmBlob(true), 5U);
+        CHECK_EQ(kBridgeActive, bridge.state());
+        CHECK(bridge.selection().is_carplay_mode);
+        CHECK(fake_tap.isOpen());
+        CHECK_EQ(1, listener.ncm_ready_count);
+        bridge.stop();
+    }
+
+    // Case B: USBMUX + NCM where 0xc0/0x52 is rejected, fallback enabled -> continues in NCM
+    {
+        FakeUsbHost fake_usb;
+        FakeTapPort fake_tap;
+        fake_usb.switch_ok_ = false;
+        UsbCarPlayBridgeConfig cfg;
+        cfg.auto_request_carplay_switch = true;
+        cfg.ncm_allow_control_fallback = true;
+        UsbCarPlayBridge bridge(fake_usb, fake_tap, cfg);
+        RecordingBridgeListener listener;
+        REQUIRE(bridge.start(reactor, &listener));
+
+        fake_usb.simulateArrival(buildIos17UsbmuxNcmBlob(false), 4U);
+        CHECK_EQ(1, fake_usb.switch_calls_);
+        CHECK_EQ(kBridgeActive, bridge.state());
+        CHECK(fake_tap.isOpen());
+        CHECK_EQ(1, listener.ncm_ready_count);
+        bridge.stop();
+    }
+
+    // Case C: USBMUX + NCM where 0xc0/0x52 is rejected and fallback disabled -> stays waiting
+    {
+        FakeUsbHost fake_usb;
+        FakeTapPort fake_tap;
+        fake_usb.switch_ok_ = false;
+        UsbCarPlayBridgeConfig cfg;
+        cfg.auto_request_carplay_switch = true;
+        cfg.ncm_allow_control_fallback = false;
+        UsbCarPlayBridge bridge(fake_usb, fake_tap, cfg);
+        RecordingBridgeListener listener;
+        REQUIRE(bridge.start(reactor, &listener));
+
+        fake_usb.simulateArrival(buildIos17UsbmuxNcmBlob(false), 4U);
+        CHECK_EQ(1, fake_usb.switch_calls_);
+        CHECK_EQ(kBridgeWaiting, bridge.state());
+        CHECK(!fake_tap.isOpen());
+        CHECK(!listener.errors.empty());
+        bridge.stop();
+    }
+}
+
+TEST_CASE(bridgeNcmStreamSplitAndPreReadyOutNak) {
+    Reactor reactor;
+    REQUIRE(reactor.init());
+
+    FakeUsbHost fake_usb;
+    FakeTapPort fake_tap;
+    UsbCarPlayBridgeConfig cfg;
+    cfg.max_consecutive_urb_errors = 4U;
+    UsbCarPlayBridge bridge(fake_usb, fake_tap, cfg);
+    RecordingBridgeListener listener;
+    REQUIRE(bridge.start(reactor, &listener));
+
+    fake_usb.simulateArrival(buildSyntheticCarPlayBlob(true), 4U);
+    REQUIRE(bridge.state() == kBridgeActive);
+
+    // 1. Pre-ready NCM Bulk OUT NAKs (-ETIMEDOUT > max_consecutive_urb_errors) must NOT kill bridge
+    for (int i = 0; i < 10; ++i) {
+        const std::vector<uint8_t> f = makeEthFrame(static_cast<uint8_t>(i + 1), 40U);
+        fake_tap.injectFromKernel(f);
+        REQUIRE(fake_usb.completeFirstUrbOnEp(0x03U, -ETIMEDOUT, std::vector<uint8_t>()));
+    }
+    CHECK_EQ(kBridgeActive, bridge.state());
+    CHECK_EQ(10U, bridge.stats().ncm_out_not_ready_drops);
+
+    // Once one OUT succeeds, bridge marks NCM OUT ready
+    fake_tap.injectFromKernel(makeEthFrame(0x77U, 40U));
+    REQUIRE(fake_usb.completeFirstUrbOnEp(0x03U, 0, std::vector<uint8_t>()));
+    CHECK_EQ(kBridgeActive, bridge.state());
+
+    // 2. NCM Bulk IN: 2 frames in 1 NTB padded to wBlockLength=512 plus 1-byte 0x00 short-packet
+    // pad, split across 2 URBs.
+    std::vector<std::vector<uint8_t> > in_eth;
+    in_eth.push_back(makeEthFrame(0x11U, 64U));
+    in_eth.push_back(makeEthFrame(0x22U, 128U));
+    std::vector<uint8_t> ntb;
+    REQUIRE(ncm::buildNtb16(in_eth, 1U, ncm::NtbBuildOptions(), ntb));
+    REQUIRE(ntb.size() < 512U);
+    ntb.resize(512U, 0U);
+    ntb[8] = static_cast<uint8_t>(512U & 0xffU);
+    ntb[9] = static_cast<uint8_t>((512U >> 8) & 0xffU);
+    ntb.push_back(0x00U);  // 1-byte short-packet pad after 512B NTB
+
+    const size_t split = 25U;
+    CHECK(fake_usb.completeFirstUrbOnEp(0x83U, 0,
+                                        std::vector<uint8_t>(ntb.begin(), ntb.begin() + split)));
+    CHECK_EQ(0U, fake_tap.rx_from_usb.size());  // waiting for second URB
+    CHECK(fake_usb.completeFirstUrbOnEp(0x83U, 0,
+                                        std::vector<uint8_t>(ntb.begin() + split, ntb.end())));
+    CHECK_EQ(1U, bridge.stats().ncm_rx_ntbs);
+    CHECK_EQ(0U, bridge.stats().ncm_rx_errors);
+    REQUIRE(fake_tap.rx_from_usb.size() == 2U);
+    CHECK_BYTES_EQ(in_eth[0], fake_tap.rx_from_usb[0]);
+    CHECK_BYTES_EQ(in_eth[1], fake_tap.rx_from_usb[1]);
+
     bridge.stop();
 }
 

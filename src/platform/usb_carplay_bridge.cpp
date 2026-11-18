@@ -1,7 +1,18 @@
+// Derived in part from DiPlay-main:
+//   shared/src/main/java/com/shilapi/xcertplay/transport/IphoneUsbHost.kt
+//   shared/src/main/java/com/shilapi/xcertplay/orchestration/WiredConfigurationAction.kt
+//   shared/src/main/java/com/shilapi/xcertplay/transport/NcmUsbBridge.kt
+//   shared/src/main/java/com/shilapi/xcertplay/transport/UsbConfigurationSelection.kt
+// GPL-3.0, Copyright (c) DiPlay contributors.
+// Derived from EntryNav2-Android-Auto 0.12.0 platform/usb_loop.cpp, platform/usb_bridge.cpp,
+// PolyForm Noncommercial License 1.0.0.
+
 #include "carplay/platform/usb_carplay_bridge.hpp"
 
 #include <cerrno>
+#include <cstdio>
 #include <cstring>
+#include <sstream>
 
 #include "carplay/platform/log.hpp"
 
@@ -46,6 +57,22 @@ bool isUrbDisconnectStatus(int status) {
     return false;
 }
 
+std::string formatHexBytes(const std::vector<uint8_t>& bytes) {
+    if (bytes.empty()) {
+        return "none";
+    }
+    std::string out;
+    char tmp[4];
+    for (size_t i = 0; i < bytes.size(); ++i) {
+        std::snprintf(tmp, sizeof(tmp), "%02x", static_cast<unsigned>(bytes[i]));
+        if (i > 0U) {
+            out += ':';
+        }
+        out += tmp;
+    }
+    return out;
+}
+
 }  // namespace
 
 UsbCarPlayBridge::UsbCarPlayBridge(UsbHostInterface& usb,
@@ -59,11 +86,14 @@ UsbCarPlayBridge::UsbCarPlayBridge(UsbHostInterface& usb,
       state_(kBridgeStopped),
       session_gen_(0),
       switch_sent_for_device_(false),
+      awaiting_reenum_from_switch_(false),
       effective_ntb_in_bytes_(16384U),
       effective_ntb_out_bytes_(16384U),
       has_device_ncm_mac_(false),
       iap2_out_inflight_(0),
       ncm_out_inflight_(0),
+      ncm_out_ready_(false),
+      ncm_out_not_ready_logged_(false),
       ncm_tx_seq_(0),
       consecutive_urb_errors_(0) {
     std::memset(device_ncm_mac_, 0, sizeof(device_ncm_mac_));
@@ -94,6 +124,7 @@ void UsbCarPlayBridge::stop() {
     if (state_ == kBridgeStopped) {
         return;
     }
+    awaiting_reenum_from_switch_ = false;
     teardownDevice(false, true);
     usb_->stop();
     reactor_ = NULL;
@@ -131,6 +162,37 @@ bool UsbCarPlayBridge::sendCarPlayModeSwitch() {
     return usb_->requestCarPlayModeSwitch(config_.switch_request);
 }
 
+bool UsbCarPlayBridge::claimBridgeInterface(uint8_t interface_number, const char* role) {
+    UsbClaimStatus st = kUsbClaimError;
+    std::string driver;
+    if (usb_->claimInterfaceWithStatus(interface_number, config_.detach_kernel_driver,
+                                       config_.detach_usbfs_driver, st, driver)) {
+        return true;
+    }
+    std::ostringstream oss;
+    if (st == kUsbClaimBusyUserspace) {
+        ++stats_.ownership_conflicts;
+        oss << "USB " << role << " interface " << static_cast<unsigned>(interface_number)
+            << " is already claimed by userspace driver '"
+            << (driver.empty() ? "usbfs" : driver)
+            << "' (likely BMW MediaPlayer/CARPLAY); refusing to detach, leaving device alone";
+        reportError(oss.str());
+        usb_->ignoreCurrentDevice();
+    } else if (st == kUsbClaimBusyKernel) {
+        ++stats_.ownership_conflicts;
+        oss << "USB " << role << " interface " << static_cast<unsigned>(interface_number)
+            << " is bound to kernel driver '" << driver
+            << "' and kernel detach is disabled; leaving device alone";
+        reportError(oss.str());
+        usb_->ignoreCurrentDevice();
+    } else {
+        oss << "failed to claim USB " << role << " interface "
+            << static_cast<unsigned>(interface_number);
+        reportError(oss.str());
+    }
+    return false;
+}
+
 void UsbCarPlayBridge::onUsbDeviceArrived(
     const UsbDeviceInfo& info,
     const usb::DeviceDescriptor& dev_desc,
@@ -139,6 +201,9 @@ void UsbCarPlayBridge::onUsbDeviceArrived(
     if (state_ == kBridgeStopped) {
         return;
     }
+
+    const bool after_switch_reenum = awaiting_reenum_from_switch_;
+    awaiting_reenum_from_switch_ = false;
 
     ++stats_.device_arrivals;
     ++session_gen_;
@@ -151,41 +216,82 @@ void UsbCarPlayBridge::onUsbDeviceArrived(
             switch_sent_for_device_ = true;
             CARPLAY_LOG_INFO("usb-bridge",
                              "no iAP2/NCM interface in current descriptors; sending CarPlay mode switch");
-            sendCarPlayModeSwitch();
+            if (!sendCarPlayModeSwitch()) {
+                std::vector<uint8_t> mode;
+                if (usb_->queryAppleUsbMode(mode)) {
+                    CARPLAY_LOG_INFO("usb-bridge", "Apple USB mode query after rejection: %s",
+                                     formatHexBytes(mode).c_str());
+                }
+            }
         }
         reportError("no CarPlay iAP2 or CDC-NCM interfaces found in USB descriptors");
         teardownDevice(false, true);
-        if (state_ != kBridgeStopped) {
-            setState(kBridgeWaiting);
-        }
         return;
+    }
+
+    // DiPlay WiredConfigurationAction: iOS 17+/26 offers USBMUX+NCM without Apple Ethernet
+    // (0xff/0xfd/0x01) even outside CarPlay mode (#634). When auto_request_carplay_switch is
+    // enabled, try 0xc0/0x52 first so the phone can re-enumerate into full CarPlay mode; only
+    // fall back to USBMUX+NCM without Apple Ethernet if 0x52 is rejected or already tried.
+    if (selection_.ncm.found && !selection_.iap2.found && selection_.has_usbmux &&
+        !selection_.is_carplay_mode) {
+        if (!after_switch_reenum && config_.auto_request_carplay_switch &&
+            !switch_sent_for_device_) {
+            switch_sent_for_device_ = true;
+            CARPLAY_LOG_INFO(
+                "usb-bridge",
+                "USBMUX+NCM present without Apple Ethernet (0xff/0xfd/0x01); requesting CarPlay mode");
+            if (sendCarPlayModeSwitch()) {
+                CARPLAY_LOG_INFO("usb-bridge",
+                                 "CarPlay mode request accepted; closing to await re-enumeration");
+                awaiting_reenum_from_switch_ = true;
+                teardownDevice(false, true);
+                return;
+            }
+            std::vector<uint8_t> mode;
+            if (usb_->queryAppleUsbMode(mode)) {
+                CARPLAY_LOG_INFO("usb-bridge", "Apple USB mode query after rejection: %s",
+                                 formatHexBytes(mode).c_str());
+            }
+            if (!config_.ncm_allow_control_fallback) {
+                reportError("CarPlay mode switch rejected and USBMUX+NCM fallback disabled");
+                teardownDevice(false, true);
+                return;
+            }
+            CARPLAY_LOG_WARN(
+                "usb-bridge",
+                "CarPlay mode switch rejected; falling back to offered USBMUX+NCM configuration");
+        } else if (after_switch_reenum && !config_.ncm_allow_control_fallback) {
+            reportError("re-enumerated USB device still lacks Apple Ethernet (0xff/0xfd/0x01)");
+            teardownDevice(false, true);
+            return;
+        }
     }
 
     if (!selection_.ncm.found && config_.auto_request_carplay_switch && !switch_sent_for_device_) {
         switch_sent_for_device_ = true;
         CARPLAY_LOG_INFO("usb-bridge",
-                         "CDC-NCM absent; issuing Apple CarPlay switch request (unverified)");
-        sendCarPlayModeSwitch();
+                         "CDC-NCM absent; issuing Apple CarPlay switch request (0xc0/0x52)");
+        if (!sendCarPlayModeSwitch()) {
+            std::vector<uint8_t> mode;
+            if (usb_->queryAppleUsbMode(mode)) {
+                CARPLAY_LOG_INFO("usb-bridge", "Apple USB mode query after rejection: %s",
+                                 formatHexBytes(mode).c_str());
+            }
+        }
     }
 
     if (info.configuration_value != selection_.configuration_value) {
         if (!usb_->setConfiguration(selection_.configuration_value)) {
             reportError("USB SET_CONFIGURATION failed");
             teardownDevice(false, true);
-            if (state_ != kBridgeStopped) {
-                setState(kBridgeWaiting);
-            }
             return;
         }
     }
 
     if (selection_.iap2.found) {
-        if (!usb_->claimInterface(selection_.iap2.interface_number, config_.detach_kernel_driver)) {
-            reportError("failed to claim USB iAP2 interface");
+        if (!claimBridgeInterface(selection_.iap2.interface_number, "iAP2")) {
             teardownDevice(false, true);
-            if (state_ != kBridgeStopped) {
-                setState(kBridgeWaiting);
-            }
             return;
         }
         if (selection_.iap2.alternate_setting != 0U) {
@@ -193,9 +299,6 @@ void UsbCarPlayBridge::onUsbDeviceArrived(
                                     selection_.iap2.alternate_setting)) {
                 reportError("failed to set alternate setting on USB iAP2 interface");
                 teardownDevice(false, true);
-                if (state_ != kBridgeStopped) {
-                    setState(kBridgeWaiting);
-                }
                 return;
             }
         }
@@ -205,9 +308,6 @@ void UsbCarPlayBridge::onUsbDeviceArrived(
     if (selection_.ncm.found) {
         if (!setupNcm()) {
             teardownDevice(false, true);
-            if (state_ != kBridgeStopped) {
-                setState(kBridgeWaiting);
-            }
             return;
         }
         ncm_ready = true;
@@ -216,6 +316,8 @@ void UsbCarPlayBridge::onUsbDeviceArrived(
     consecutive_urb_errors_ = 0;
     iap2_out_inflight_ = 0;
     ncm_out_inflight_ = 0;
+    ncm_out_ready_ = false;
+    ncm_out_not_ready_logged_ = false;
     ncm_tx_seq_ = 0;
     iap2_tx_queue_.clear();
     ncm_tx_frames_.clear();
@@ -223,18 +325,12 @@ void UsbCarPlayBridge::onUsbDeviceArrived(
     if (selection_.iap2.found && !submitIap2InUrbs()) {
         reportError("failed to submit initial iAP2 Bulk IN URBs");
         teardownDevice(false, true);
-        if (state_ != kBridgeStopped) {
-            setState(kBridgeWaiting);
-        }
         return;
     }
 
     if (ncm_ready && !submitNcmInUrbs()) {
         reportError("failed to submit initial CDC-NCM Bulk IN URBs");
         teardownDevice(false, true);
-        if (state_ != kBridgeStopped) {
-            setState(kBridgeWaiting);
-        }
         return;
     }
 
@@ -259,13 +355,11 @@ void UsbCarPlayBridge::onUsbDeviceArrived(
 
 bool UsbCarPlayBridge::setupNcm() {
     const usb::NcmInterfaceSelection& ncm_sel = selection_.ncm;
-    if (!usb_->claimInterface(ncm_sel.control_interface, config_.detach_kernel_driver)) {
-        reportError("failed to claim CDC-NCM control interface");
+    if (!claimBridgeInterface(ncm_sel.control_interface, "CDC-NCM control")) {
         return false;
     }
     if (ncm_sel.data_interface != ncm_sel.control_interface) {
-        if (!usb_->claimInterface(ncm_sel.data_interface, config_.detach_kernel_driver)) {
-            reportError("failed to claim CDC-NCM data interface");
+        if (!claimBridgeInterface(ncm_sel.data_interface, "CDC-NCM data")) {
             return false;
         }
     }
@@ -316,6 +410,17 @@ bool UsbCarPlayBridge::setupNcm() {
         out_max = 2048U;
     }
     effective_ntb_out_bytes_ = out_max;
+
+    ncm::NtbParseOptions parse_opts =
+        ncm::NtbParseOptions::fromParameters(ntb_params_, config_.ncm_strict_in_alignment);
+    parse_opts.max_ntb_size = effective_ntb_in_bytes_;
+    ncm_rx_decoder_.reset();
+    ncm_rx_decoder_.setParseOptions(parse_opts);
+    const uint16_t pkt_sz =
+        config_.ncm_usb_packet_size > 0U
+            ? config_.ncm_usb_packet_size
+            : (ncm_sel.bulk_in_max_packet > 0U ? ncm_sel.bulk_in_max_packet : 512U);
+    ncm_rx_decoder_.setUsbPacketSize(pkt_sz);
 
     // SET_NTB_FORMAT (NTB-16) when device advertises NTB-32 too (best-effort).
     if ((ntb_params_.formats_supported & 0x0002U) != 0U) {
@@ -415,6 +520,7 @@ bool UsbCarPlayBridge::writeIap2(const uint8_t* data, size_t len) {
 void UsbCarPlayBridge::pumpIap2Out() {
     const size_t max_inflight =
         config_.iap2_max_out_urbs_inflight > 0U ? config_.iap2_max_out_urbs_inflight : 1U;
+    const uint64_t my_gen = session_gen_;
     while ((state_ == kBridgeIap2Only || state_ == kBridgeActive) &&
            iap2_out_inflight_ < max_inflight && !iap2_tx_queue_.empty()) {
         const std::vector<uint8_t>& chunk = iap2_tx_queue_.front();
@@ -424,6 +530,9 @@ void UsbCarPlayBridge::pumpIap2Out() {
             selection_.iap2.bulk_out_ep, chunk.empty() ? NULL : &chunk[0], chunk.size(), zlp,
             &kTagIap2Out);
         if (id == 0U) {
+            if (session_gen_ != my_gen || state_ == kBridgeStopped || state_ == kBridgeWaiting) {
+                return;
+            }
             reportError("submitBulkOut failed on iAP2 endpoint");
             teardownDevice(true, true);
             return;
@@ -439,6 +548,7 @@ void UsbCarPlayBridge::pumpNcmOut() {
         config_.ncm_max_out_urbs_inflight > 0U ? config_.ncm_max_out_urbs_inflight : 1U;
     ncm::NtbBuildOptions build_opts = ncm::NtbBuildOptions::fromParameters(ntb_params_);
     build_opts.max_ntb_size = effective_ntb_out_bytes_;
+    const uint64_t my_gen = session_gen_;
 
     while (state_ == kBridgeActive && ncm_out_inflight_ < max_inflight && !ncm_tx_frames_.empty()) {
         std::vector<std::vector<uint8_t> > batch_input;
@@ -469,6 +579,9 @@ void UsbCarPlayBridge::pumpNcmOut() {
         const uint64_t id = usb_->submitBulkOut(selection_.ncm.bulk_out_ep, &ntb_bytes[0],
                                                 ntb_bytes.size(), zlp, &kTagNcmOut);
         if (id == 0U) {
+            if (session_gen_ != my_gen || state_ == kBridgeStopped || state_ == kBridgeWaiting) {
+                return;
+            }
             reportError("submitBulkOut failed on CDC-NCM endpoint");
             teardownDevice(true, true);
             return;
@@ -515,6 +628,26 @@ void UsbCarPlayBridge::onUsbUrbComplete(uint64_t urb_id,
 
     const uint64_t my_gen = session_gen_;
 
+    // DiPlay NcmUsbBridge.kt: before StartCarPlaySession completes, the iPhone NAKs CDC-NCM Bulk
+    // OUT (timeouts / stall / EPROTO). Do not count pre-ready NCM OUT failures as fatal bridge
+    // errors; allow later packets and iAP2 handshake traffic to proceed cleanly.
+    if (user_ctx == &kTagNcmOut && status != 0 && !ncm_out_ready_) {
+        if (ncm_out_inflight_ > 0U) {
+            --ncm_out_inflight_;
+        }
+        ++stats_.ncm_out_not_ready_drops;
+        if (!ncm_out_not_ready_logged_) {
+            ncm_out_not_ready_logged_ = true;
+            CARPLAY_LOG_INFO("usb-bridge",
+                             "CDC-NCM bulk-out not ready yet (status=%d); retaining bridge",
+                             status);
+        }
+        if (session_gen_ == my_gen && state_ == kBridgeActive) {
+            pumpNcmOut();
+        }
+        return;
+    }
+
     if (status != 0) {
         ++consecutive_urb_errors_;
         if (config_.max_consecutive_urb_errors > 0U &&
@@ -552,17 +685,18 @@ void UsbCarPlayBridge::onUsbUrbComplete(uint64_t urb_id,
 
     if (user_ctx == &kTagNcmIn) {
         if (status == 0 && len > 0U && data != NULL) {
-            ncm::NtbParseOptions parse_opts =
-                ncm::NtbParseOptions::fromParameters(ntb_params_, config_.ncm_strict_in_alignment);
-            parse_opts.max_ntb_size = effective_ntb_in_bytes_;
-
-            ncm::Ntb16Frame ntb;
-            std::string err;
-            if (!ncm::parseNtb16(data, len, parse_opts, ntb, &err)) {
-                ++stats_.ncm_rx_errors;
-                CARPLAY_LOG_WARN("usb-bridge", "dropped malformed IN NTB-16: %s", err.c_str());
-            } else {
-                ++stats_.ncm_rx_ntbs;
+            std::vector<ncm::Ntb16Frame> ntbs;
+            ncm::NtbStreamStats delta;
+            ncm_rx_decoder_.push(data, len, ntbs, &delta);
+            stats_.ncm_rx_ntbs += delta.ntbs_parsed;
+            stats_.ncm_rx_errors += delta.parse_errors;
+            if (delta.parse_errors > 0U) {
+                CARPLAY_LOG_WARN("usb-bridge",
+                                 "dropped/resynced malformed IN NTB-16 stream (errors=+%llu)",
+                                 static_cast<unsigned long long>(delta.parse_errors));
+            }
+            for (size_t ni = 0; ni < ntbs.size(); ++ni) {
+                const ncm::Ntb16Frame& ntb = ntbs[ni];
                 for (size_t i = 0; i < ntb.datagrams.size(); ++i) {
                     const std::vector<uint8_t>& frame = ntb.datagrams[i];
                     if (frame.size() < kMinEthernetFrameBytes) {
@@ -586,6 +720,13 @@ void UsbCarPlayBridge::onUsbUrbComplete(uint64_t urb_id,
     }
 
     if (user_ctx == &kTagNcmOut) {
+        if (status == 0 && !ncm_out_ready_) {
+            ncm_out_ready_ = true;
+            if (ncm_out_not_ready_logged_) {
+                ncm_out_not_ready_logged_ = false;
+                CARPLAY_LOG_INFO("usb-bridge", "CDC-NCM bulk-out became ready");
+            }
+        }
         if (ncm_out_inflight_ > 0U) {
             --ncm_out_inflight_;
         }
@@ -633,17 +774,22 @@ void UsbCarPlayBridge::teardownDevice(bool notify_listener, bool close_usb) {
 
     selection_ = usb::CarPlayUsbSelection();
     ntb_params_ = ncm::NtbParameters();
+    ncm_rx_decoder_.reset();
     has_device_ncm_mac_ = false;
     std::memset(device_ncm_mac_, 0, sizeof(device_ncm_mac_));
     iap2_out_inflight_ = 0;
     iap2_tx_queue_.clear();
     ncm_out_inflight_ = 0;
+    ncm_out_ready_ = false;
+    ncm_out_not_ready_logged_ = false;
     ncm_tx_seq_ = 0;
     ncm_tx_frames_.clear();
     consecutive_urb_errors_ = 0;
 
     if (was_connected) {
         ++stats_.device_removals;
+    }
+    if (!awaiting_reenum_from_switch_) {
         switch_sent_for_device_ = false;
     }
     if (state_ != kBridgeStopped) {

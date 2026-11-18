@@ -1,3 +1,8 @@
+// Derived in part from DiPlay-main:
+//   shared/src/main/java/com/shilapi/xcertplay/transport/Ntb16Codec.kt
+//   shared/src/main/java/com/shilapi/xcertplay/transport/NcmUsbBridge.kt
+// GPL-3.0, Copyright (c) DiPlay contributors.
+
 #include "carplay/cdc_ncm.hpp"
 
 #include <cstring>
@@ -244,6 +249,7 @@ bool parseNtb16(const uint8_t* data,
         bool has_crc;
     };
     std::vector<PendingDatagram> pending;
+    uint32_t total_datagram_bytes = 0U;
 
     uint16_t ndp_off = first_ndp;
     for (size_t depth = 0; ndp_off != 0U; ++depth) {
@@ -301,6 +307,10 @@ bool parseNtb16(const uint8_t* data,
                 setError(error_out, "malformed half-zero NDP16 datagram pointer");
                 return false;
             }
+            if (opts.max_datagrams > 0U && pending.size() >= opts.max_datagrams) {
+                setError(error_out, "NDP16 datagram count exceeds max_datagrams");
+                return false;
+            }
             if (dg_idx < kNth16Bytes) {
                 setError(error_out, "NDP16 datagram index points inside NTH16");
                 return false;
@@ -310,6 +320,11 @@ bool parseNtb16(const uint8_t* data,
                 setError(error_out, "NDP16 datagram extends past wBlockLength");
                 return false;
             }
+            if (total_datagram_bytes + dg_len > block_len) {
+                setError(error_out, "NDP16 datagrams overlap or exceed wBlockLength");
+                return false;
+            }
+            total_datagram_bytes += dg_len;
             if (opts.check_in_alignment && opts.ndp_in_divisor > 1U) {
                 if ((dg_idx % opts.ndp_in_divisor) != opts.ndp_in_payload_remainder) {
                     setError(error_out, "NDP16 datagram index violates wNdpInDivisor/Remainder");
@@ -340,6 +355,14 @@ bool parseNtb16(const uint8_t* data,
     for (size_t i = 0; i < pending.size(); ++i) {
         const PendingDatagram& pd = pending[i];
         const uint32_t dg_end = pd.offset + pd.length;
+        for (size_t j = 0; j < i; ++j) {
+            const PendingDatagram& other = pending[j];
+            if (rangesOverlap(pd.offset, dg_end, other.offset, other.offset + other.length)) {
+                setError(error_out, "NDP16 datagrams overlap each other");
+                out = Ntb16Frame();
+                return false;
+            }
+        }
         for (size_t r = 0; r < ndp_ranges.size(); ++r) {
             if (rangesOverlap(pd.offset, dg_end, ndp_ranges[r].start, ndp_ranges[r].end)) {
                 setError(error_out, "NDP16 datagram overlaps NDP16 table");
@@ -518,6 +541,184 @@ bool buildNtb16(const std::vector<std::vector<uint8_t> >& frames,
         return false;
     }
     return true;
+}
+
+Ntb16StreamDecoder::Ntb16StreamDecoder(const NtbParseOptions& opts,
+                                       uint16_t usb_packet_size,
+                                       size_t max_buffer_bytes)
+    : opts_(opts),
+      usb_packet_size_(usb_packet_size > 0U ? usb_packet_size : 512U),
+      max_buffer_bytes_(max_buffer_bytes >= kNth16Bytes ? max_buffer_bytes : 262144U),
+      optional_short_pad_(false),
+      in_resync_(false) {}
+
+void Ntb16StreamDecoder::reset() {
+    buffer_.clear();
+    optional_short_pad_ = false;
+    in_resync_ = false;
+}
+
+void Ntb16StreamDecoder::setUsbPacketSize(uint16_t usb_packet_size) {
+    usb_packet_size_ = (usb_packet_size > 0U) ? usb_packet_size : 512U;
+}
+
+bool Ntb16StreamDecoder::plausibleHeaderAt(size_t offset) const {
+    if (offset + kNth16Bytes > buffer_.size()) {
+        return false;
+    }
+    const uint32_t sig = readU32Le(&buffer_[offset]);
+    if (sig != kNth16Signature) {
+        return false;
+    }
+    const uint16_t hdr_len = readU16Le(&buffer_[offset + 4U]);
+    const uint16_t block_len = readU16Le(&buffer_[offset + 8U]);
+    const uint16_t ndp_idx = readU16Le(&buffer_[offset + 10U]);
+    if (hdr_len != kNth16Bytes || block_len < kNth16Bytes + kNdp16MinBytes) {
+        return false;
+    }
+    if (opts_.max_ntb_size > 0U && block_len > opts_.max_ntb_size) {
+        return false;
+    }
+    return ndp_idx >= kNth16Bytes && (ndp_idx % 4U) == 0U &&
+           static_cast<uint32_t>(ndp_idx) + kNdp16HeaderBytes <= block_len;
+}
+
+void Ntb16StreamDecoder::recordErrorAndResync(NtbStreamStats* delta) {
+    if (!in_resync_) {
+        in_resync_ = true;
+        ++stats_.parse_errors;
+        ++stats_.resyncs;
+        if (delta != NULL) {
+            ++delta->parse_errors;
+            ++delta->resyncs;
+        }
+    }
+}
+
+void Ntb16StreamDecoder::finishResync() { in_resync_ = false; }
+
+bool Ntb16StreamDecoder::resynchronize(NtbStreamStats* delta) {
+    if (buffer_.size() <= 1U) {
+        if (!buffer_.empty()) {
+            stats_.resync_bytes_skipped += buffer_.size();
+            if (delta != NULL) {
+                delta->resync_bytes_skipped += buffer_.size();
+            }
+            buffer_.clear();
+        }
+        return false;
+    }
+    if (buffer_.size() > kNth16Bytes) {
+        const size_t limit = buffer_.size() - kNth16Bytes;
+        for (size_t off = 1U; off <= limit; ++off) {
+            if (plausibleHeaderAt(off)) {
+                buffer_.erase(buffer_.begin(), buffer_.begin() + static_cast<ptrdiff_t>(off));
+                stats_.resync_bytes_skipped += off;
+                if (delta != NULL) {
+                    delta->resync_bytes_skipped += off;
+                }
+                return true;
+            }
+        }
+    }
+    const size_t keep = kNth16Bytes - 1U;
+    if (buffer_.size() > keep) {
+        const size_t drop = buffer_.size() - keep;
+        buffer_.erase(buffer_.begin(), buffer_.begin() + static_cast<ptrdiff_t>(drop));
+        stats_.resync_bytes_skipped += drop;
+        if (delta != NULL) {
+            delta->resync_bytes_skipped += drop;
+        }
+    }
+    return false;
+}
+
+void Ntb16StreamDecoder::push(const uint8_t* data,
+                              size_t len,
+                              std::vector<Ntb16Frame>& out_frames,
+                              NtbStreamStats* delta_stats_out) {
+    NtbStreamStats delta;
+    if (delta_stats_out != NULL) {
+        *delta_stats_out = delta;
+    }
+    if (data == NULL || len == 0U) {
+        return;
+    }
+    if (buffer_.size() + len > max_buffer_bytes_) {
+        recordErrorAndResync(&delta);
+        stats_.resync_bytes_skipped += buffer_.size();
+        delta.resync_bytes_skipped += buffer_.size();
+        buffer_.clear();
+        optional_short_pad_ = false;
+        if (len > max_buffer_bytes_) {
+            stats_.resync_bytes_skipped += len;
+            delta.resync_bytes_skipped += len;
+            if (delta_stats_out != NULL) {
+                *delta_stats_out = delta;
+            }
+            return;
+        }
+    }
+
+    buffer_.insert(buffer_.end(), data, data + len);
+
+    for (;;) {
+        if (optional_short_pad_ && !buffer_.empty()) {
+            optional_short_pad_ = false;
+            const uint8_t b0 = buffer_[0];
+            if (b0 == 0x00U) {
+                buffer_.erase(buffer_.begin());
+            } else if (b0 != static_cast<uint8_t>(kNth16Signature & 0xffU)) {
+                recordErrorAndResync(&delta);
+                if (!resynchronize(&delta)) {
+                    break;
+                }
+                continue;
+            }
+        }
+
+        if (buffer_.size() < kNth16Bytes) {
+            break;
+        }
+
+        const uint32_t sig = readU32Le(&buffer_[0]);
+        const uint16_t hdr_len = readU16Le(&buffer_[4]);
+        const uint16_t block_len = readU16Le(&buffer_[8]);
+        const bool bad_max = (opts_.max_ntb_size > 0U && block_len > opts_.max_ntb_size);
+        if (sig != kNth16Signature || hdr_len != kNth16Bytes ||
+            block_len < kNth16Bytes + kNdp16MinBytes || bad_max) {
+            recordErrorAndResync(&delta);
+            if (!resynchronize(&delta)) {
+                break;
+            }
+            continue;
+        }
+
+        if (buffer_.size() < block_len) {
+            break;
+        }
+
+        Ntb16Frame frame;
+        std::string err;
+        if (!parseNtb16(&buffer_[0], block_len, opts_, frame, &err)) {
+            recordErrorAndResync(&delta);
+            if (!resynchronize(&delta)) {
+                break;
+            }
+            continue;
+        }
+
+        out_frames.push_back(frame);
+        ++stats_.ntbs_parsed;
+        ++delta.ntbs_parsed;
+        buffer_.erase(buffer_.begin(), buffer_.begin() + static_cast<ptrdiff_t>(block_len));
+        optional_short_pad_ = (usb_packet_size_ > 0U && (block_len % usb_packet_size_) == 0U);
+        finishResync();
+    }
+
+    if (delta_stats_out != NULL) {
+        *delta_stats_out = delta;
+    }
 }
 
 }  // namespace ncm

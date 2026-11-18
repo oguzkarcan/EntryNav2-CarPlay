@@ -82,6 +82,7 @@ if [ -d /sys/bus/usb/devices ]; then
             sub=$(read_attr "$d/bDeviceSubClass")
             proto=$(read_attr "$d/bDeviceProtocol")
             spd=$(read_attr "$d/speed")
+            rem=$(read_attr "$d/removable")
             mfg=$(read_attr "$d/manufacturer")
             prod=$(read_attr "$d/product")
             ser=$(read_attr "$d/serial")
@@ -89,7 +90,7 @@ if [ -d /sys/bus/usb/devices ]; then
             if [ -L "$d/driver" ]; then
                 drv=$(ls -ld "$d/driver" 2>/dev/null | sed 's/.*-> //' || true)
             fi
-            echo "DEV $name vid=$vid pid=$pid bus=$bus dev=$dev cfg=$cfg/$ncfg class=$cls/$sub/$proto speed=${spd}M drv=${drv:-none} mfg='$mfg' prod='$prod' ser='$ser'"
+            echo "DEV $name vid=$vid pid=$pid bus=$bus dev=$dev cfg=$cfg/$ncfg class=$cls/$sub/$proto speed=${spd}M rem=${rem:-unknown} drv=${drv:-none} mfg='$mfg' prod='$prod' ser='$ser'"
         elif [ -r "$d/bInterfaceNumber" ]; then
             ifno=$(read_attr "$d/bInterfaceNumber")
             alt=$(read_attr "$d/bAlternateSetting")
@@ -146,6 +147,73 @@ if [ -d /sys/kernel/config/usb_gadget ]; then
     done
 else
     echo "/sys/kernel/config/usb_gadget: not present"
+fi
+
+section "Process Owning /dev/bus/usb/* (read-only proc scan)"
+usb_fd_found=0
+for fdpath in /proc/[0-9]*/fd/*; do
+    [ -e "$fdpath" ] || continue
+    line=$(ls -l "$fdpath" 2>/dev/null || true)
+    case "$line" in
+        */dev/bus/usb/*)
+            usb_fd_found=1
+            pid=$(echo "$fdpath" | cut -d/ -f3)
+            comm=""
+            cmdline=""
+            uid=""
+            exe=""
+            if [ -r "/proc/$pid/comm" ]; then
+                comm=$(read_attr "/proc/$pid/comm")
+            fi
+            if [ -r "/proc/$pid/cmdline" ]; then
+                cmdline=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)
+            fi
+            if [ -r "/proc/$pid/status" ]; then
+                uid=$(grep '^Uid:' "/proc/$pid/status" 2>/dev/null | head -n 1 || true)
+            fi
+            if [ -L "/proc/$pid/exe" ]; then
+                exe=$(ls -ld "/proc/$pid/exe" 2>/dev/null || true)
+            fi
+            echo "$line"
+            echo "  pid=$pid comm=${comm:-unknown} $uid cmdline=$cmdline"
+            if [ -n "$exe" ]; then
+                echo "  $exe"
+            fi
+            ;;
+    esac
+done
+if [ "$usb_fd_found" -eq 0 ]; then
+    echo "no readable /proc/*/fd/* symlinks pointing to /dev/bus/usb/*"
+fi
+
+section "MediaPlayer / CARPLAY Process & Binary Status (read-only)"
+for p in /opt/app/usr/MediaPlayer/bin/CARPLAY /opt/app/usr/MediaPlayer/bin/MediaPlayer /usr/local/lib/libauxin-apple.so.0 /lib/libusb-1.0.so.0; do
+    if [ -e "$p" ] || [ -L "$p" ]; then
+        ls -ld "$p" 2>/dev/null || true
+    else
+        echo "$p: not present"
+    fi
+done
+echo "--- matching processes (/proc scan) ---"
+mp_found=0
+for pdir in /proc/[0-9]*; do
+    [ -d "$pdir" ] || continue
+    pid=${pdir##*/}
+    comm=""
+    cmdline=""
+    if [ -r "$pdir/comm" ]; then
+        comm=$(read_attr "$pdir/comm")
+    fi
+    if [ -r "$pdir/cmdline" ]; then
+        cmdline=$(tr '\0' ' ' < "$pdir/cmdline" 2>/dev/null || true)
+    fi
+    if printf '%s %s\n' "$comm" "$cmdline" | grep -qiE 'mediaplayer|carplay|auxin|apple|ipod|usbmux'; then
+        mp_found=1
+        echo "pid=$pid comm=${comm:-unknown} cmdline=$cmdline"
+    fi
+done
+if [ "$mp_found" -eq 0 ]; then
+    echo "no matching MediaPlayer/CARPLAY processes readable in /proc"
 fi
 
 section "Process Owning /dev/ffs-carlife (read-only proc scan)"
