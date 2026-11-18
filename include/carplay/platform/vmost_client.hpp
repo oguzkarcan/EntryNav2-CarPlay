@@ -28,7 +28,11 @@ namespace platform {
 
 static const uint32_t kMostOpGet = 0x1U;
 static const uint32_t kMostOpStartResultAck = 0x6U;
+static const uint32_t kMostOpError = 0x9U;          // verified: EntryNav2-Android-Auto-0.12.0/platform/evo_wlan.cpp
+static const uint32_t kMostOpProcessingAck = 0xAU;  // verified: EntryNav2-Android-Auto-0.12.0/platform/evo_wlan.cpp
 static const uint32_t kMostOpStatus = 0xCU;
+static const uint32_t kMostOpResultAck = 0xDU;      // verified: EntryNav2-Android-Auto-0.12.0/platform/evo_wlan.cpp
+static const uint32_t kMostOpErrorAck = 0xFU;       // verified: EntryNav2-Android-Auto-0.12.0/platform/evo_wlan.cpp
 
 struct VmostMsgView {
     uint16_t addr;
@@ -66,6 +70,14 @@ void buildVmostGet(VmostMsgOut& m,
                    uint16_t fkt,
                    const uint8_t* data,
                    uint16_t len = 0);
+
+/// Populates a MOST StartResultAck (OpType 6, addr 0xFFFF).
+void buildVmostStartResultAck(VmostMsgOut& m,
+                              uint8_t fblock,
+                              uint8_t inst,
+                              uint16_t fkt,
+                              const uint8_t* data,
+                              uint16_t len);
 
 extern const char kVmostLibrary[];
 extern const char* const kVmostFunctions[];
@@ -134,6 +146,9 @@ private:
     bool has_override_;
     VmostApi override_api_;
 };
+
+/// Returns true if the vmostd UNIX socket (or test socket override) exists.
+bool isVmostDaemonPresent();
 
 /// Host tests: override the vmostd socket path and client .so path (NULL clears).
 void setVmostForTest(const char* socket_path, const char* library_path);

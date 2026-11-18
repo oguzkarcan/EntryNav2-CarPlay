@@ -4,12 +4,14 @@
 // Reactor-integrated mDNS / DNS-SD service advertiser (`_airplay._tcp` for Wireless CarPlay).
 //
 // Zero link-time dependency on Bonjour / mDNSResponder:
-//   * Backend A ("dns_sd"): runtime `dlopen()` of `libdns_sd.so.1` then `libdns_sd.so`,
+//   * Backend A ("dns_sd"): runtime `dlopen()` of `libdns_sd.so.0` (verified on HU_ENTRYNAV2
+//     sysroot `/usr/local/lib/libdns_sd.so.0`), then `libdns_sd.so.1` and `libdns_sd.so` fallbacks,
 //     resolving `DNSServiceRegister`, `DNSServiceRefSockFD`, `DNSServiceProcessResult`,
-//     `DNSServiceRefDeallocate` (plus optional `DNSServiceUpdateRecord`). The underlying fd is
-//     registered on the single-threaded `Reactor` (`kPollIn`).
-//   * Backend B ("unavailable"): reported cleanly when neither library (nor test override) is
-//     available on the host/target.
+//     `DNSServiceRefDeallocate` (plus optional `DNSServiceUpdateRecord`). The sysroot library
+//     does not export `TXTRecord*` helpers, so TXT bytes are built purely in `dnssd_txt`.
+//     The underlying fd is registered on the single-threaded `Reactor` (`kPollIn`).
+//   * Backend B ("unavailable"): reported cleanly when none of the libraries (nor test override)
+//     are available on the host/target.
 //
 // `MdnsAdvertiser` never closes the `DNSServiceRefSockFD` descriptor directly; it removes the fd
 // from `Reactor` and lets `DNSServiceRefDeallocate` close it.
@@ -141,8 +143,9 @@ public:
     /// Injects an in-memory dns_sd table for tests (NULL clears override). Must be stopped.
     void setApiOverride(const DnsSdApi* api);
 
-    /// Probes and loads `libdns_sd.so.1` / `libdns_sd.so` (or uses the test override).
-    /// Returns true if Backend A ("dns_sd") is ready; false with Backend B ("unavailable") otherwise.
+    /// Probes and loads `libdns_sd.so.0` / `libdns_sd.so.1` / `libdns_sd.so` (or uses the test
+    /// override). Returns true if Backend A ("dns_sd") is ready; false with Backend B
+    /// ("unavailable") otherwise.
     bool load(std::string* error_out = NULL);
     void unload();
 
@@ -234,8 +237,13 @@ private:
     AliveState* alive_state_;
 };
 
-/// Host tests: override the two dlopen() candidate paths (NULL resets to defaults).
-void setMdnsLibraryPathsForTest(const char* primary_path, const char* fallback_path);
+/// Returns the default dlopen() candidate order: libdns_sd.so.0, libdns_sd.so.1, libdns_sd.so.
+std::vector<std::string> mdnsDefaultLibraryCandidates();
+
+/// Host tests: override the dlopen() candidate paths (all NULL resets to defaults).
+void setMdnsLibraryPathsForTest(const char* primary_path,
+                                const char* fallback_path,
+                                const char* tertiary_path = NULL);
 
 }  // namespace platform
 }  // namespace carplay

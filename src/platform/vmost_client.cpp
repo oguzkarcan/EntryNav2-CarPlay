@@ -60,6 +60,14 @@ bool resolveSymbol(void* lib, const char* name, Fn& fn) {
 
 }  // namespace
 
+bool isVmostDaemonPresent() {
+#ifdef _WIN32
+    return false;
+#else
+    return daemonPresent();
+#endif
+}
+
 void setVmostForTest(const char* socket_path, const char* library_path) {
     g_test_socket = socket_path != NULL ? socket_path : "";
     g_test_library = library_path != NULL ? library_path : "";
@@ -95,6 +103,23 @@ void buildVmostGet(VmostMsgOut& m,
     m.inst = inst;
     m.fkt = fkt;
     m.op = kMostOpGet;
+    m.len = len;
+    m.data = data;
+    m.channel = 0U;
+}
+
+void buildVmostStartResultAck(VmostMsgOut& m,
+                              uint8_t fblock,
+                              uint8_t inst,
+                              uint16_t fkt,
+                              const uint8_t* data,
+                              uint16_t len) {
+    memset(&m, 0, sizeof(m));
+    m.addr = 0xFFFFU;
+    m.fblock = fblock;
+    m.inst = inst;
+    m.fkt = fkt;
+    m.op = kMostOpStartResultAck;
     m.len = len;
     m.data = data;
     m.channel = 0U;

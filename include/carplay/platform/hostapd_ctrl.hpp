@@ -34,6 +34,7 @@ enum HostapdCommandKind {
     kCmdAttach,
     kCmdDetach,
     kCmdStatus,
+    kCmdGetConfig,
     kCmdAllSta,
     kCmdEnable,
     kCmdDisable,
@@ -132,6 +133,9 @@ public:
     virtual bool sendAttach(int timeout_ms = 1000) = 0;
     virtual bool sendDetach(int timeout_ms = 1000) = 0;
     virtual bool sendStatus(int timeout_ms = 1000) = 0;
+    virtual bool sendGetConfig(int timeout_ms = 1000) {
+        return sendCommand(kCmdGetConfig, "GET_CONFIG", timeout_ms);
+    }
     virtual bool sendAllSta(int timeout_ms = 1000) = 0;
     virtual bool sendEnable(int timeout_ms = 1000) = 0;
     virtual bool sendDisable(int timeout_ms = 1000) = 0;
@@ -161,6 +165,7 @@ public:
     virtual bool sendAttach(int timeout_ms = 1000);
     virtual bool sendDetach(int timeout_ms = 1000);
     virtual bool sendStatus(int timeout_ms = 1000);
+    virtual bool sendGetConfig(int timeout_ms = 1000);
     virtual bool sendAllSta(int timeout_ms = 1000);
     virtual bool sendEnable(int timeout_ms = 1000);
     virtual bool sendDisable(int timeout_ms = 1000);

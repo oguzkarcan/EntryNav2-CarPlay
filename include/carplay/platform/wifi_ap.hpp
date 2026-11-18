@@ -24,7 +24,9 @@
 
 #include "carplay/iap2_wire.hpp"
 #include "carplay/pairing.hpp"
+#include "carplay/platform/evo_ap.hpp"
 #include "carplay/platform/evo_supervisor.hpp"
+#include "carplay/platform/evo_wlan.hpp"
 #include "carplay/platform/hostapd_ctrl.hpp"
 #include "carplay/platform/reactor.hpp"
 
@@ -41,9 +43,22 @@ enum WifiBand {
     kWifiBand5GHz = 2
 };
 
+enum WifiApBackend {
+    /// Prefer the vehicle's car-native Wi-Fi AP (vMOST 0xA0.01 + wland/wlan0) when present;
+    /// otherwise fall back to our own isolated hostapd backend. Never runs both.
+    kWifiApBackendAuto = 0,
+    /// Require the car-native Wi-Fi AP (fails closed if unavailable; never spawns hostapd).
+    kWifiApBackendNative = 1,
+    /// Require our own isolated hostapd (+ optional udhcpd) backend.
+    kWifiApBackendHostapd = 2
+};
+
+const char* wifiApBackendName(WifiApBackend backend);
+
 struct WifiApConfig {
-    /// Target wireless interface. Assumption: TI wl18xx on HU_ENTRYNAV2 exposes `wlan0` and
-    /// `wlan1`; `wlan1` is used as the default CarPlay AP interface (unverified on vehicle).
+    /// Target wireless interface for our own hostapd fallback. Assumption: TI wl18xx on
+    /// HU_ENTRYNAV2 exposes `wlan0` and `wlan1`; `wlan1` is used when running our own hostapd
+    /// fallback (unverified on vehicle). Car-native mode uses `native_interface_name` (`wlan0`).
     std::string interface_name;
     std::string runtime_dir;
     /// Empty -> `<runtime_dir>/hostapd-carplay.conf`. Must never be `/etc/hostapd.conf`.
@@ -95,6 +110,18 @@ struct WifiApConfig {
     int stop_kill_timeout_ms;
     bool cleanup_files_on_stop;
 
+    /// Backend selection & car-native WLAN (`wland` / vMOST 0xA0.01) configuration.
+    WifiApBackend backend;
+    std::string native_interface_name;      // default "wlan0"
+    std::string native_ctrl_interface_dir;  // default "/var/run/hostapd"
+    std::string native_ap_conf_path;        // default "/tmp/wland/ap.conf"
+    std::string native_hostapd_cli_bin;     // default "/usr/sbin/hostapd_cli"
+    uint8_t native_fallback_channel;        // 0 = require real channel from config/STATUS/nl80211
+    int native_wlan_timeout_ms;             // default 2000
+    int native_ready_timeout_ms;            // default 5000
+    int native_poll_interval_ms;            // default 100
+    bool native_restore_on_stop;            // default true: off on stop iff switched on by us
+
     WifiApConfig();
 
     std::string effectiveHostapdConfPath() const;
@@ -102,6 +129,8 @@ struct WifiApConfig {
     std::string effectiveRemoteCtrlSocketPath() const;
     std::string effectiveUdhcpdConfPath() const;
     std::string effectiveUdhcpdLeaseFile() const;
+    std::string effectiveNativeRemoteCtrlSocketPath() const;
+    NativeWlanPaths effectiveNativePaths() const;
 };
 
 struct WifiCredentials {
@@ -180,7 +209,9 @@ public:
 ///   * Destructor `~WifiAp()` detaches the listener and invokes `stopSync()` without firing
 ///     listener callbacks; callers requiring `onWifiApStopped()` must call `stop()`/`stopSync()`
 ///     before destroying `WifiAp`.
-class WifiAp : private TimerHandler, private HostapdCtrlListener {
+class WifiAp : private TimerHandler,
+               private HostapdCtrlListener,
+               private WlanControllerListener {
 public:
     WifiAp(Reactor& reactor, pairing::RandomSource& rng);
     virtual ~WifiAp();
@@ -193,12 +224,22 @@ public:
     void setHostapdProcessForTest(IChildProcess* proc);
     void setUdhcpdProcessForTest(IChildProcess* proc);
     void setHostapdCtrlForTest(IHostapdCtrl* ctrl);
+    void setWlanControllerForTest(IWlanController* wlan);
+    void setAccessPointReaderForTest(IAccessPointReader* reader);
+    /// -1: probe real/injected controller & reader; 0: force native absent; 1: force native present.
+    void setNativeCapabilityForTest(int override_state);
+
+    /// Probes car-native WLAN capability for `cfg` and returns what `start(cfg)` would select.
+    bool isNativeCapable(const WifiApConfig& cfg) const;
+    WifiApBackend resolveBackend(const WifiApConfig& cfg) const;
 
     bool start(const WifiApConfig& cfg, std::string* error_out = NULL);
     void stop();
     void stopSync();
 
     WifiApState state() const { return state_; }
+    WifiApBackend activeBackend() const { return active_backend_; }
+    bool nativeSwitchedOnByUs() const { return native_switched_on_by_us_; }
     const WifiApConfig& config() const { return config_; }
     const WifiCredentials& credentials() const { return credentials_; }
     const std::string& lastError() const { return last_error_; }
@@ -216,16 +257,31 @@ private:
                                        const std::string& reply);
     virtual void onHostapdEvent(const HostapdEvent& event);
     virtual void onHostapdCtrlError(const std::string& error);
+    virtual void onWlanEnableResult(bool ok,
+                                    const WlanRequestResult& result,
+                                    const std::string& error);
+    virtual void onWlanDisableResult(bool ok,
+                                     const WlanRequestResult& result,
+                                     const std::string& error);
 
     IChildProcess* hostapdProc();
     IChildProcess* udhcpdProc();
     IHostapdCtrl* ctrl();
+    IWlanController* wlanCtrl();
+    const IWlanController* wlanCtrl() const;
+    IAccessPointReader* apReader();
+    const IAccessPointReader* apReader() const;
 
     bool prepareRuntimeFiles(std::string* error_out);
     void cleanupRuntimeFiles();
     bool spawnHostapd(std::string* error_out);
     bool spawnUdhcpd(std::string* error_out);
     void tryOpenAndProbeCtrl();
+    void tryPollNativeReadiness();
+    void mergeNativeApInfo(const EvoApInfo& parsed);
+    void refreshNativeCredentials();
+    void maybeCompleteNativeStart();
+    void syncNativeStationsFromReader();
     void handleUnexpectedHostapdExit(const std::string& reason);
     void transitionToFailed(const std::string& reason);
     void finishStop();
@@ -243,13 +299,19 @@ private:
     SupervisedProcess default_hostapd_proc_;
     SupervisedProcess default_udhcpd_proc_;
     HostapdCtrl default_ctrl_;
+    EvoWlanController default_wlan_ctrl_;
+    EvoAccessPointReader default_ap_reader_;
     IChildProcess* hostapd_proc_override_;
     IChildProcess* udhcpd_proc_override_;
     IHostapdCtrl* ctrl_override_;
+    IWlanController* wlan_ctrl_override_;
+    IAccessPointReader* ap_reader_override_;
+    int native_capability_override_;
 
     WifiApConfig config_;
     WifiCredentials credentials_;
     WifiApState state_;
+    WifiApBackend active_backend_;
     std::string last_error_;
     int restart_count_;
     std::vector<std::string> connected_stations_;
@@ -283,6 +345,13 @@ private:
     bool ctrl_attached_;
     bool ctrl_status_ok_;
     bool ctrl_probe_pending_;
+    bool native_wlan_pending_;
+    bool native_wlan_done_;
+    bool native_switched_on_by_us_;
+    bool native_creds_ready_;
+    bool native_got_get_config_;
+    bool native_ap_read_ok_;
+    EvoApInfo native_ap_info_;
     AliveState* alive_state_;
 };
 

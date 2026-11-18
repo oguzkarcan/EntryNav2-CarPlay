@@ -133,6 +133,18 @@ std::string formatMacBytes(const uint8_t mac[6]) {
 
 }  // namespace
 
+const char* wifiApBackendName(WifiApBackend backend) {
+    switch (backend) {
+        case kWifiApBackendAuto:
+            return "auto";
+        case kWifiApBackendNative:
+            return "native";
+        case kWifiApBackendHostapd:
+            return "hostapd";
+    }
+    return "unknown";
+}
+
 WifiApConfig::WifiApConfig()
     : interface_name("wlan1"),
       runtime_dir("/var/run/carplay"),
@@ -161,7 +173,17 @@ WifiApConfig::WifiApConfig()
       restart_backoff_ms(500),
       stop_term_timeout_ms(2000),
       stop_kill_timeout_ms(1000),
-      cleanup_files_on_stop(true) {}
+      cleanup_files_on_stop(true),
+      backend(kWifiApBackendAuto),
+      native_interface_name(kNativeWlanInterface),
+      native_ctrl_interface_dir(kNativeHostapdCtrlDir),
+      native_ap_conf_path(kNativeApConfPath),
+      native_hostapd_cli_bin(kNativeHostapdCliBin),
+      native_fallback_channel(0U),
+      native_wlan_timeout_ms(2000),
+      native_ready_timeout_ms(5000),
+      native_poll_interval_ms(100),
+      native_restore_on_stop(true) {}
 
 std::string WifiApConfig::effectiveHostapdConfPath() const {
     return hostapd_conf_path.empty() ? joinPath(runtime_dir, "hostapd-carplay.conf")
@@ -185,6 +207,20 @@ std::string WifiApConfig::effectiveUdhcpdConfPath() const {
 std::string WifiApConfig::effectiveUdhcpdLeaseFile() const {
     return udhcpd_lease_file.empty() ? joinPath(runtime_dir, "udhcpd-carplay.leases")
                                      : udhcpd_lease_file;
+}
+
+std::string WifiApConfig::effectiveNativeRemoteCtrlSocketPath() const {
+    return joinPath(native_ctrl_interface_dir, native_interface_name);
+}
+
+NativeWlanPaths WifiApConfig::effectiveNativePaths() const {
+    NativeWlanPaths p;
+    p.interface_name = native_interface_name;
+    p.hostapd_ctrl_dir = native_ctrl_interface_dir;
+    p.ap_conf_path = native_ap_conf_path;
+    p.hostapd_cli_bin = native_hostapd_cli_bin;
+    p.cli_timeout_ms = ctrl_cmd_timeout_ms > 0 ? ctrl_cmd_timeout_ms : 1000;
+    return p;
 }
 
 WifiCredentials::WifiCredentials() : channel(36U), security_type(kIap2WifiSecurityWpa2), has_bssid(false) {
@@ -348,6 +384,20 @@ bool validateWifiApConfig(const WifiApConfig& cfg, std::string* error_out) {
         cfg.max_restarts < 0 || cfg.restart_backoff_ms < 0 ||
         cfg.stop_term_timeout_ms < 0 || cfg.stop_kill_timeout_ms < 0) {
         setError(error_out, "timing/supervision parameters must be non-negative (intervals > 0)");
+        return false;
+    }
+    if (cfg.backend != kWifiApBackendAuto && cfg.backend != kWifiApBackendNative &&
+        cfg.backend != kWifiApBackendHostapd) {
+        setError(error_out, "invalid WifiApBackend value");
+        return false;
+    }
+    if (!isValidInterfaceName(cfg.native_interface_name) ||
+        cfg.native_ctrl_interface_dir.empty() || hasControlChars(cfg.native_ctrl_interface_dir) ||
+        cfg.native_ap_conf_path.empty() || hasControlChars(cfg.native_ap_conf_path) ||
+        cfg.native_hostapd_cli_bin.empty() || hasControlChars(cfg.native_hostapd_cli_bin) ||
+        cfg.native_wlan_timeout_ms <= 0 || cfg.native_ready_timeout_ms <= 0 ||
+        cfg.native_poll_interval_ms <= 0) {
+        setError(error_out, "invalid car-native WLAN configuration parameters");
         return false;
     }
     return true;
@@ -519,10 +569,15 @@ WifiAp::WifiAp(Reactor& reactor, pairing::RandomSource& rng)
       rng_(rng),
       listener_(NULL),
       default_ctrl_(reactor),
+      default_wlan_ctrl_(reactor),
       hostapd_proc_override_(NULL),
       udhcpd_proc_override_(NULL),
       ctrl_override_(NULL),
+      wlan_ctrl_override_(NULL),
+      ap_reader_override_(NULL),
+      native_capability_override_(-1),
       state_(kWifiApStopped),
+      active_backend_(kWifiApBackendHostapd),
       restart_count_(0),
       timer_id_(Reactor::kNoTimer),
       ctrl_wait_deadline_ms_(0),
@@ -532,6 +587,12 @@ WifiAp::WifiAp(Reactor& reactor, pairing::RandomSource& rng)
       ctrl_attached_(false),
       ctrl_status_ok_(false),
       ctrl_probe_pending_(false),
+      native_wlan_pending_(false),
+      native_wlan_done_(false),
+      native_switched_on_by_us_(false),
+      native_creds_ready_(false),
+      native_got_get_config_(false),
+      native_ap_read_ok_(false),
       alive_state_(new AliveState()) {}
 
 WifiAp::~WifiAp() {
@@ -543,6 +604,8 @@ WifiAp::~WifiAp() {
     hostapd_proc_override_ = NULL;
     udhcpd_proc_override_ = NULL;
     ctrl_override_ = NULL;
+    wlan_ctrl_override_ = NULL;
+    ap_reader_override_ = NULL;
     if (alive_state_ != NULL) {
         if (--alive_state_->refs == 0) {
             delete alive_state_;
@@ -575,6 +638,30 @@ void WifiAp::setHostapdCtrlForTest(IHostapdCtrl* ctrl_ptr) {
     ctrl_override_ = ctrl_ptr;
 }
 
+void WifiAp::setWlanControllerForTest(IWlanController* wlan) {
+    if (wlan != NULL && state_ != kWifiApStopped && state_ != kWifiApFailed) {
+        CARPLAY_LOG_WARN(kTag, "ignoring setWlanControllerForTest while WifiAp is active");
+        return;
+    }
+    wlan_ctrl_override_ = wlan;
+}
+
+void WifiAp::setAccessPointReaderForTest(IAccessPointReader* reader) {
+    if (reader != NULL && state_ != kWifiApStopped && state_ != kWifiApFailed) {
+        CARPLAY_LOG_WARN(kTag, "ignoring setAccessPointReaderForTest while WifiAp is active");
+        return;
+    }
+    ap_reader_override_ = reader;
+}
+
+void WifiAp::setNativeCapabilityForTest(int override_state) {
+    if (state_ != kWifiApStopped && state_ != kWifiApFailed) {
+        CARPLAY_LOG_WARN(kTag, "ignoring setNativeCapabilityForTest while WifiAp is active");
+        return;
+    }
+    native_capability_override_ = override_state;
+}
+
 IChildProcess* WifiAp::hostapdProc() {
     return hostapd_proc_override_ != NULL ? hostapd_proc_override_ : &default_hostapd_proc_;
 }
@@ -585,6 +672,43 @@ IChildProcess* WifiAp::udhcpdProc() {
 
 IHostapdCtrl* WifiAp::ctrl() {
     return ctrl_override_ != NULL ? ctrl_override_ : &default_ctrl_;
+}
+
+IWlanController* WifiAp::wlanCtrl() {
+    return wlan_ctrl_override_ != NULL ? wlan_ctrl_override_ : &default_wlan_ctrl_;
+}
+
+const IWlanController* WifiAp::wlanCtrl() const {
+    return wlan_ctrl_override_ != NULL ? wlan_ctrl_override_ : &default_wlan_ctrl_;
+}
+
+IAccessPointReader* WifiAp::apReader() {
+    return ap_reader_override_ != NULL ? ap_reader_override_ : &default_ap_reader_;
+}
+
+const IAccessPointReader* WifiAp::apReader() const {
+    return ap_reader_override_ != NULL ? ap_reader_override_ : &default_ap_reader_;
+}
+
+bool WifiAp::isNativeCapable(const WifiApConfig& cfg) const {
+    if (native_capability_override_ == 0) {
+        return false;
+    }
+    if (native_capability_override_ > 0) {
+        return true;
+    }
+    return wlanCtrl()->isAvailable() ||
+           apReader()->isNativeEnvironmentPresent(cfg.effectiveNativePaths());
+}
+
+WifiApBackend WifiAp::resolveBackend(const WifiApConfig& cfg) const {
+    if (cfg.backend == kWifiApBackendNative) {
+        return kWifiApBackendNative;
+    }
+    if (cfg.backend == kWifiApBackendHostapd) {
+        return kWifiApBackendHostapd;
+    }
+    return isNativeCapable(cfg) ? kWifiApBackendNative : kWifiApBackendHostapd;
 }
 
 int64_t WifiAp::nowMs() const {
@@ -645,7 +769,7 @@ bool WifiAp::prepareRuntimeFiles(std::string* error_out) {
 }
 
 void WifiAp::cleanupRuntimeFiles() {
-    if (!config_.cleanup_files_on_stop) {
+    if (active_backend_ == kWifiApBackendNative || !config_.cleanup_files_on_stop) {
         return;
     }
     if (!config_.runtime_dir.empty()) {
@@ -679,6 +803,48 @@ bool WifiAp::start(const WifiApConfig& cfg, std::string* error_out) {
         return false;
     }
 
+    if (!validateWifiApConfig(cfg, error_out)) {
+        return false;
+    }
+
+    const WifiApBackend resolved = resolveBackend(cfg);
+
+    if (resolved == kWifiApBackendNative) {
+        config_ = cfg;
+        active_backend_ = kWifiApBackendNative;
+        credentials_ = WifiCredentials();
+        last_error_.clear();
+        restart_count_ = 0;
+        connected_stations_.clear();
+        ctrl_attached_ = false;
+        ctrl_status_ok_ = false;
+        ctrl_probe_pending_ = false;
+        native_wlan_pending_ = true;
+        native_wlan_done_ = false;
+        native_switched_on_by_us_ = false;
+        native_creds_ready_ = false;
+        native_got_get_config_ = false;
+        native_ap_read_ok_ = false;
+        native_ap_info_ = EvoApInfo();
+
+        CARPLAY_LOG_INFO(kTag, "starting car-native Wi-Fi AP backend on %s (requested=%s)",
+                         config_.native_interface_name.c_str(),
+                         wifiApBackendName(config_.backend));
+
+        state_ = kWifiApStartingWaitCtrl;
+        wlanCtrl()->setListener(this);
+        std::string err;
+        if (!wlanCtrl()->beginEnable(static_cast<unsigned>(config_.native_wlan_timeout_ms), &err)) {
+            wlanCtrl()->setListener(NULL);
+            native_wlan_pending_ = false;
+            last_error_ = err.empty() ? "car-native Wi-Fi AP unavailable" : err;
+            setError(error_out, last_error_);
+            state_ = kWifiApFailed;
+            return false;
+        }
+        return true;
+    }
+
     WifiCredentials creds;
     if (!generateWifiCredentials(cfg, rng_, creds, error_out)) {
         return false;
@@ -692,6 +858,7 @@ bool WifiAp::start(const WifiApConfig& cfg, std::string* error_out) {
     }
 
     config_ = cfg;
+    active_backend_ = kWifiApBackendHostapd;
     credentials_ = creds;
     last_error_.clear();
     restart_count_ = 0;
@@ -699,6 +866,13 @@ bool WifiAp::start(const WifiApConfig& cfg, std::string* error_out) {
     ctrl_attached_ = false;
     ctrl_status_ok_ = false;
     ctrl_probe_pending_ = false;
+    native_wlan_pending_ = false;
+    native_wlan_done_ = false;
+    native_switched_on_by_us_ = false;
+    native_creds_ready_ = false;
+    native_got_get_config_ = false;
+    native_ap_read_ok_ = false;
+    native_ap_info_ = EvoApInfo();
 
     if (!prepareRuntimeFiles(error_out)) {
         last_error_ = error_out != NULL ? *error_out : "failed to prepare Wi-Fi runtime files";
@@ -725,7 +899,229 @@ bool WifiAp::start(const WifiApConfig& cfg, std::string* error_out) {
     return true;
 }
 
+void WifiAp::mergeNativeApInfo(const EvoApInfo& parsed) {
+    if (!parsed.ssid.empty()) {
+        native_ap_info_.ssid = parsed.ssid;
+    }
+    if (!parsed.passphrase.empty()) {
+        native_ap_info_.passphrase = parsed.passphrase;
+    }
+    if (!parsed.bssid.empty()) {
+        native_ap_info_.bssid = parsed.bssid;
+    }
+    if (!parsed.ip.empty()) {
+        native_ap_info_.ip = parsed.ip;
+    }
+    if (parsed.channel > 0) {
+        native_ap_info_.channel = parsed.channel;
+    }
+    if (parsed.freq_mhz > 0) {
+        native_ap_info_.freq_mhz = parsed.freq_mhz;
+    }
+    if (!parsed.key_mgmt.empty()) {
+        native_ap_info_.key_mgmt = parsed.key_mgmt;
+    }
+    if (!parsed.wpa.empty()) {
+        native_ap_info_.wpa = parsed.wpa;
+    }
+    if (parsed.security_type != 0U) {
+        native_ap_info_.security_type = parsed.security_type;
+    }
+}
+
+void WifiAp::refreshNativeCredentials() {
+    if (native_ap_info_.bssid.empty()) {
+        uint8_t sys_mac[6];
+        if (tryReadSysfsMac(config_.native_interface_name, sys_mac)) {
+            native_ap_info_.bssid = formatMacBytes(sys_mac);
+        }
+    }
+    if (native_ap_info_.channel <= 0 && native_ap_info_.freq_mhz <= 0) {
+        unsigned mhz = 0U;
+        if (apReader()->readFrequencyMhz(config_.native_interface_name, mhz) && mhz > 0U) {
+            native_ap_info_.freq_mhz = static_cast<int>(mhz);
+            native_ap_info_.channel = frequencyMhzToChannel(native_ap_info_.freq_mhz);
+        }
+    }
+    WifiCredentials creds;
+    if (native_ap_info_.toWifiCredentials(creds, config_.native_fallback_channel, NULL)) {
+        credentials_ = creds;
+        native_creds_ready_ = true;
+    }
+}
+
+void WifiAp::maybeCompleteNativeStart() {
+    if (active_backend_ != kWifiApBackendNative || state_ != kWifiApStartingWaitCtrl ||
+        !native_wlan_done_) {
+        return;
+    }
+    refreshNativeCredentials();
+    if (!native_creds_ready_) {
+        return;
+    }
+
+    const bool ready_via_ctrl = ctrl()->isOpen() && ctrl_status_ok_;
+    const bool ready_via_reader = !ctrl()->isOpen() && native_ap_read_ok_;
+    if (!ready_via_ctrl && !ready_via_reader) {
+        return;
+    }
+
+    if (ready_via_reader || !ctrl_attached_) {
+        syncNativeStationsFromReader();
+        if (state_ != kWifiApStartingWaitCtrl) {
+            return;
+        }
+    }
+
+    state_ = kWifiApRunning;
+    armTimer(config_.health_check_interval_ms, config_.health_check_interval_ms);
+    CARPLAY_LOG_INFO(kTag, "car-native Wi-Fi AP ready on %s (bssid=%s, channel=%u)",
+                     config_.native_interface_name.c_str(),
+                     credentials_.has_bssid ? formatMacBytes(credentials_.bssid).c_str() : "unknown",
+                     static_cast<unsigned int>(credentials_.channel));
+
+    AliveGuard guard(alive_state_);
+    if (listener_ != NULL) {
+        listener_->onWifiApStarted(credentials_);
+    }
+    if (!guard.alive()) {
+        return;
+    }
+}
+
+void WifiAp::tryPollNativeReadiness() {
+    if (active_backend_ != kWifiApBackendNative || state_ != kWifiApStartingWaitCtrl ||
+        !native_wlan_done_) {
+        return;
+    }
+    if (nowMs() >= ctrl_wait_deadline_ms_) {
+        transitionToFailed("timed out waiting for car-native Wi-Fi AP readiness");
+        return;
+    }
+
+    IHostapdCtrl* c = ctrl();
+    if (!c->isOpen()) {
+        if (!config_.runtime_dir.empty()) {
+            ensurePrivateDirectory(config_.runtime_dir);
+        }
+        std::string err;
+        if (c->open(config_.effectiveNativeRemoteCtrlSocketPath(), config_.runtime_dir, &err)) {
+            ctrl_attached_ = false;
+            ctrl_status_ok_ = false;
+            ctrl_probe_pending_ = true;
+            c->sendPing(config_.ctrl_cmd_timeout_ms);
+            c->sendAttach(config_.ctrl_cmd_timeout_ms);
+            c->sendStatus(config_.ctrl_cmd_timeout_ms);
+            c->sendGetConfig(config_.ctrl_cmd_timeout_ms);
+            c->sendAllSta(config_.ctrl_cmd_timeout_ms);
+        }
+    } else if (!ctrl_probe_pending_ && (!ctrl_status_ok_ || !native_got_get_config_)) {
+        ctrl_probe_pending_ = true;
+        if (!ctrl_attached_) {
+            c->sendAttach(config_.ctrl_cmd_timeout_ms);
+        }
+        c->sendStatus(config_.ctrl_cmd_timeout_ms);
+        if (!native_got_get_config_) {
+            c->sendGetConfig(config_.ctrl_cmd_timeout_ms);
+        }
+        c->sendAllSta(config_.ctrl_cmd_timeout_ms);
+    }
+
+    if (!native_creds_ready_ || !c->isOpen()) {
+        EvoApInfo read_ap;
+        std::string source;
+        std::string err;
+        if (apReader()->readAccessPoint(config_.effectiveNativePaths(), read_ap, source, &err)) {
+            native_ap_read_ok_ = true;
+            mergeNativeApInfo(read_ap);
+        }
+    }
+
+    maybeCompleteNativeStart();
+}
+
+void WifiAp::syncNativeStationsFromReader() {
+    std::vector<std::string> raw_macs;
+    if (!apReader()->readConnectedStations(config_.native_interface_name, raw_macs)) {
+        return;
+    }
+    std::vector<std::string> norm_macs;
+    for (size_t i = 0U; i < raw_macs.size(); ++i) {
+        std::string norm;
+        if (normalizeMacAddress(raw_macs[i], norm)) {
+            norm_macs.push_back(norm);
+        }
+    }
+
+    AliveGuard guard(alive_state_);
+    std::vector<std::string> existing = connected_stations_;
+    for (size_t i = 0U; i < existing.size(); ++i) {
+        bool still_here = false;
+        for (size_t j = 0U; j < norm_macs.size(); ++j) {
+            if (existing[i] == norm_macs[j]) {
+                still_here = true;
+                break;
+            }
+        }
+        if (!still_here) {
+            removeConnectedStation(existing[i]);
+            if (!guard.alive() || state_ != kWifiApRunning) {
+                return;
+            }
+        }
+    }
+
+    for (size_t i = 0U; i < norm_macs.size(); ++i) {
+        addConnectedStation(norm_macs[i]);
+        if (!guard.alive() || state_ != kWifiApRunning) {
+            return;
+        }
+    }
+}
+
+void WifiAp::onWlanEnableResult(bool ok,
+                                const WlanRequestResult& result,
+                                const std::string& error) {
+    if (active_backend_ != kWifiApBackendNative || state_ != kWifiApStartingWaitCtrl) {
+        return;
+    }
+    native_wlan_pending_ = false;
+    native_switched_on_by_us_ = result.switched_on_by_us;
+
+    if (!ok) {
+        transitionToFailed(error.empty() ? "failed to enable car-native Wi-Fi AP via vMOST" : error);
+        return;
+    }
+
+    native_wlan_done_ = true;
+    ctrl_wait_deadline_ms_ = nowMs() + static_cast<int64_t>(config_.native_ready_timeout_ms);
+    ctrl()->setListener(this);
+    armTimer(config_.native_poll_interval_ms, config_.native_poll_interval_ms);
+    tryPollNativeReadiness();
+}
+
+void WifiAp::onWlanDisableResult(bool ok,
+                                 const WlanRequestResult& result,
+                                 const std::string& error) {
+    (void)result;
+    if (active_backend_ != kWifiApBackendNative || state_ != kWifiApStopping) {
+        return;
+    }
+    if (!ok) {
+        CARPLAY_LOG_WARN(kTag, "car-native Wi-Fi AP restore off returned error: %s",
+                         error.c_str());
+    }
+    native_wlan_pending_ = false;
+    native_switched_on_by_us_ = false;
+    wlanCtrl()->setListener(NULL);
+    finishStop();
+}
+
 void WifiAp::tryOpenAndProbeCtrl() {
+    if (active_backend_ == kWifiApBackendNative) {
+        tryPollNativeReadiness();
+        return;
+    }
     if (state_ != kWifiApStartingWaitCtrl) {
         return;
     }
@@ -775,6 +1171,9 @@ void WifiAp::stop() {
         ctrl_attached_ = false;
         ctrl_status_ok_ = false;
         ctrl_probe_pending_ = false;
+        native_wlan_pending_ = false;
+        native_wlan_done_ = false;
+        native_switched_on_by_us_ = false;
         return;
     }
     if (state_ == kWifiApStopping) {
@@ -787,6 +1186,31 @@ void WifiAp::stop() {
     ctrl()->close();
     clearConnectedStations();
     if (!guard.alive()) {
+        return;
+    }
+
+    if (active_backend_ == kWifiApBackendNative) {
+        if (native_wlan_pending_) {
+            wlanCtrl()->cancel();
+            native_wlan_pending_ = false;
+        }
+        if (native_switched_on_by_us_ && config_.native_restore_on_stop) {
+            state_ = kWifiApStopping;
+            wlanCtrl()->setListener(this);
+            native_wlan_pending_ = true;
+            std::string err;
+            if (!wlanCtrl()->beginDisable(static_cast<unsigned>(config_.native_wlan_timeout_ms),
+                                          &err)) {
+                CARPLAY_LOG_WARN(kTag, "car-native Wi-Fi AP restore failed: %s", err.c_str());
+                wlanCtrl()->setListener(NULL);
+                native_wlan_pending_ = false;
+                native_switched_on_by_us_ = false;
+                finishStop();
+            }
+            return;
+        }
+        wlanCtrl()->setListener(NULL);
+        finishStop();
         return;
     }
 
@@ -821,6 +1245,9 @@ void WifiAp::stopSync() {
         ctrl_attached_ = false;
         ctrl_status_ok_ = false;
         ctrl_probe_pending_ = false;
+        native_wlan_pending_ = false;
+        native_wlan_done_ = false;
+        native_switched_on_by_us_ = false;
         return;
     }
     const bool already_destroying = (alive_state_ != NULL && !alive_state_->alive);
@@ -830,6 +1257,22 @@ void WifiAp::stopSync() {
     ctrl()->close();
     clearConnectedStations();
     if (!already_destroying && !guard.alive()) {
+        return;
+    }
+
+    if (active_backend_ == kWifiApBackendNative) {
+        wlanCtrl()->setListener(NULL);
+        wlanCtrl()->cancel();
+        native_wlan_pending_ = false;
+        if (native_switched_on_by_us_ && config_.native_restore_on_stop) {
+            std::string err;
+            if (!wlanCtrl()->restoreSync(static_cast<unsigned>(config_.native_wlan_timeout_ms),
+                                         &err)) {
+                CARPLAY_LOG_WARN(kTag, "car-native Wi-Fi AP sync restore failed: %s", err.c_str());
+            }
+            native_switched_on_by_us_ = false;
+        }
+        finishStop();
         return;
     }
 
@@ -851,6 +1294,8 @@ void WifiAp::finishStop() {
     ctrl_attached_ = false;
     ctrl_status_ok_ = false;
     ctrl_probe_pending_ = false;
+    native_wlan_pending_ = false;
+    native_wlan_done_ = false;
 
     AliveGuard guard(alive_state_);
     if (listener_ != NULL) {
@@ -876,7 +1321,8 @@ void WifiAp::handleUnexpectedHostapdExit(const std::string& reason) {
         return;
     }
 
-    if (config_.auto_restart && restart_count_ < config_.max_restarts) {
+    if (active_backend_ == kWifiApBackendHostapd && config_.auto_restart &&
+        restart_count_ < config_.max_restarts) {
         ++restart_count_;
         last_error_ = reason;
         state_ = kWifiApRestarting;
@@ -904,13 +1350,28 @@ void WifiAp::transitionToFailed(const std::string& reason) {
     ctrl()->setListener(NULL);
     ctrl()->close();
 
-    if (udhcpdProc()->isRunning()) {
-        udhcpdProc()->stop(500, 500);
+    if (active_backend_ == kWifiApBackendNative) {
+        wlanCtrl()->setListener(NULL);
+        wlanCtrl()->cancel();
+        native_wlan_pending_ = false;
+        if (native_switched_on_by_us_ && config_.native_restore_on_stop) {
+            std::string err;
+            if (!wlanCtrl()->restoreSync(static_cast<unsigned>(config_.native_wlan_timeout_ms),
+                                         &err)) {
+                CARPLAY_LOG_WARN(kTag, "car-native Wi-Fi AP restore on failure failed: %s",
+                                 err.c_str());
+            }
+            native_switched_on_by_us_ = false;
+        }
+    } else {
+        if (udhcpdProc()->isRunning()) {
+            udhcpdProc()->stop(500, 500);
+        }
+        if (hostapdProc()->isRunning()) {
+            hostapdProc()->stop(500, 500);
+        }
+        cleanupRuntimeFiles();
     }
-    if (hostapdProc()->isRunning()) {
-        hostapdProc()->stop(500, 500);
-    }
-    cleanupRuntimeFiles();
 
     last_error_ = reason;
     state_ = kWifiApFailed;
@@ -927,6 +1388,20 @@ void WifiAp::transitionToFailed(const std::string& reason) {
 
 void WifiAp::onTimer(uint32_t timer_id) {
     if (timer_id != timer_id_) {
+        return;
+    }
+
+    if (active_backend_ == kWifiApBackendNative) {
+        if (state_ == kWifiApStartingWaitCtrl) {
+            tryPollNativeReadiness();
+            return;
+        }
+        if (state_ == kWifiApRunning) {
+            if (!ctrl_attached_) {
+                syncNativeStationsFromReader();
+            }
+            return;
+        }
         return;
     }
 
@@ -1015,8 +1490,19 @@ void WifiAp::onHostapdCommandReply(HostapdCommandKind cmd,
     if (cmd == kCmdAttach) {
         if (ok) {
             ctrl_attached_ = true;
-        } else {
+        } else if (active_backend_ == kWifiApBackendHostapd) {
             ctrl_probe_pending_ = false;
+        }
+        return;
+    }
+
+    if (cmd == kCmdGetConfig) {
+        if (active_backend_ == kWifiApBackendNative && ok) {
+            EvoApInfo parsed;
+            if (parseHostapdConfig(reply, parsed)) {
+                native_got_get_config_ = true;
+                mergeNativeApInfo(parsed);
+            }
         }
         return;
     }
@@ -1024,11 +1510,29 @@ void WifiAp::onHostapdCommandReply(HostapdCommandKind cmd,
     if (cmd == kCmdStatus) {
         HostapdStatus st;
         if (ok && parseHostapdStatus(reply, st)) {
-            if (!st.bssid.empty() && !credentials_.has_bssid) {
-                uint8_t mac_bytes[6];
-                if (parseMacAddressBytes(st.bssid, mac_bytes)) {
-                    credentials_.has_bssid = true;
-                    memcpy(credentials_.bssid, mac_bytes, 6U);
+            if (active_backend_ == kWifiApBackendNative) {
+                if (!st.bssid.empty()) {
+                    native_ap_info_.bssid = st.bssid;
+                }
+                if (st.channel > 0) {
+                    native_ap_info_.channel = st.channel;
+                }
+                if (st.freq > 0) {
+                    native_ap_info_.freq_mhz = st.freq;
+                    if (native_ap_info_.channel <= 0) {
+                        native_ap_info_.channel = frequencyMhzToChannel(st.freq);
+                    }
+                }
+                if (!st.ssid.empty() && native_ap_info_.ssid.empty()) {
+                    native_ap_info_.ssid = st.ssid;
+                }
+            } else {
+                if (!st.bssid.empty() && !credentials_.has_bssid) {
+                    uint8_t mac_bytes[6];
+                    if (parseMacAddressBytes(st.bssid, mac_bytes)) {
+                        credentials_.has_bssid = true;
+                        memcpy(credentials_.bssid, mac_bytes, 6U);
+                    }
                 }
             }
             if (st.state == "ENABLED") {
@@ -1050,6 +1554,22 @@ void WifiAp::onHostapdCommandReply(HostapdCommandKind cmd,
                     }
                 }
             }
+        }
+
+        if (active_backend_ == kWifiApBackendNative) {
+            if (state_ == kWifiApStartingWaitCtrl && ctrl_status_ok_) {
+                if (!native_creds_ready_) {
+                    EvoApInfo read_ap;
+                    std::string source;
+                    if (apReader()->readAccessPoint(config_.effectiveNativePaths(), read_ap, source,
+                                                    NULL)) {
+                        native_ap_read_ok_ = true;
+                        mergeNativeApInfo(read_ap);
+                    }
+                }
+                maybeCompleteNativeStart();
+            }
+            return;
         }
 
         if (state_ == kWifiApStartingWaitCtrl && ctrl_attached_ && ctrl_status_ok_) {
@@ -1092,16 +1612,25 @@ void WifiAp::onHostapdEvent(const HostapdEvent& event) {
         case kHostapdEventApEnabled:
             if (state_ == kWifiApStartingWaitCtrl && ctrl()->isOpen() && !ctrl_status_ok_) {
                 ctrl()->sendStatus(config_.ctrl_cmd_timeout_ms);
+                if (active_backend_ == kWifiApBackendNative && !native_got_get_config_) {
+                    ctrl()->sendGetConfig(config_.ctrl_cmd_timeout_ms);
+                }
                 ctrl()->sendAllSta(config_.ctrl_cmd_timeout_ms);
             }
             break;
         case kHostapdEventTerminating:
-            if (!hostapdProc()->isRunning()) {
+            if (active_backend_ == kWifiApBackendNative) {
+                transitionToFailed("car-native hostapd terminating");
+            } else if (!hostapdProc()->isRunning()) {
                 handleUnexpectedHostapdExit("hostapd signaled CTRL-EVENT-TERMINATING");
             }
             break;
         case kHostapdEventApDisabled:
         case kHostapdEventInterfaceDisabled:
+            if (active_backend_ == kWifiApBackendNative && state_ == kWifiApRunning) {
+                transitionToFailed("car-native Wi-Fi AP disabled");
+            }
+            break;
         case kHostapdEventUnknown:
             break;
     }
@@ -1109,6 +1638,18 @@ void WifiAp::onHostapdEvent(const HostapdEvent& event) {
 
 void WifiAp::onHostapdCtrlError(const std::string& error) {
     if (state_ != kWifiApStartingWaitCtrl && state_ != kWifiApRunning) {
+        return;
+    }
+    if (active_backend_ == kWifiApBackendNative) {
+        ctrl_attached_ = false;
+        ctrl_status_ok_ = false;
+        ctrl_probe_pending_ = false;
+        if (state_ == kWifiApRunning) {
+            unsigned mhz = 0U;
+            if (!apReader()->readFrequencyMhz(config_.native_interface_name, mhz) || mhz == 0U) {
+                transitionToFailed("car-native hostapd control socket closed (" + error + ")");
+            }
+        }
         return;
     }
     if (!hostapdProc()->isRunning()) {
