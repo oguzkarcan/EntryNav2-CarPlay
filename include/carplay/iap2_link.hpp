@@ -1,6 +1,11 @@
 #ifndef CARPLAY_IAP2_LINK_HPP
 #define CARPLAY_IAP2_LINK_HPP
 
+// Derived from DiPlay
+// (shared/src/main/java/com/shilapi/xcertplay/transport/Iap2LinkEngine.kt,
+//  shared/src/main/java/com/shilapi/xcertplay/transport/Iap2LinkChannel.kt),
+// GPL-3.0, Copyright (c) DiPlay contributors.
+//
 // Transport-agnostic iAP2 Link Layer (detect, packet codec, SYN negotiation,
 // reliable sequenced delivery with sliding window, retransmission, EAK, and RST).
 //
@@ -21,7 +26,7 @@
 namespace carplay {
 namespace iap2 {
 
-// iAP2 detect sequence (6 bytes): FF 55 02 00 EE 10
+// iAP2 detect sequence (6 bytes): FF 55 02 00 EE 10 (verified: DiPlay Iap2LinkEngine.kt:644)
 static const size_t kDetectSequenceBytes = 6U;
 extern const uint8_t kDetectSequence[kDetectSequenceBytes];
 
@@ -29,7 +34,7 @@ extern const uint8_t kDetectSequence[kDetectSequenceBytes];
 static const size_t kDetectBadSequenceBytes = 8U;
 extern const uint8_t kDetectBadSequence[kDetectBadSequenceBytes];
 
-// iAP2 Link packet constants.
+// iAP2 Link packet constants (verified: DiPlay Iap2LinkEngine.kt:646-649, 653-654).
 static const uint16_t kLinkStartMarker = 0xff5aU;
 static const size_t kLinkHeaderBytes = 9U;
 static const size_t kLinkPayloadChecksumBytes = 1U;
@@ -38,13 +43,13 @@ static const size_t kLinkMinPacketWithPayloadBytes = kLinkPacketOverheadBytes + 
 static const size_t kLinkMaxPacketBytes = 0xffffU;
 
 // Link control flags (byte 4 of header).
-static const uint8_t kCtrlSyn = 0x80U;
-static const uint8_t kCtrlAck = 0x40U;
-static const uint8_t kCtrlEak = 0x20U;
-static const uint8_t kCtrlRst = 0x10U;
-static const uint8_t kCtrlSlp = 0x08U;
+static const uint8_t kCtrlSyn = 0x80U;  // verified: DiPlay Iap2LinkEngine.kt:655
+static const uint8_t kCtrlAck = 0x40U;  // verified: DiPlay Iap2LinkEngine.kt:656
+static const uint8_t kCtrlEak = 0x20U;  // verified: DiPlay Iap2LinkEngine.kt:657
+static const uint8_t kCtrlRst = 0x10U;  // verified: DiPlay Iap2LinkEngine.kt:658
+static const uint8_t kCtrlSlp = 0x08U;  // unverified (not used in DiPlay)
 
-// Link version & SYN session types.
+// Link version & SYN session types (verified: DiPlay Iap2LinkEngine.kt:588-592, 650-652).
 static const uint8_t kLinkVersion = 1U;
 static const uint8_t kSessionTypeControl = 0U;
 static const uint8_t kSessionTypeFileTransfer = 1U;
@@ -52,6 +57,14 @@ static const uint8_t kSessionTypeExternalAccessory = 2U;
 
 static const size_t kSynFixedPayloadBytes = 10U;
 static const size_t kSynSessionEntryBytes = 3U;
+
+// Default SYN session IDs & versions (verified: DiPlay Iap2LinkEngine.kt:588-592,640-642; Iap2LinkChannel.kt:363,368).
+static const uint8_t kDefaultControlSessionId = 10U;
+static const uint8_t kDefaultEaSessionId = 11U;
+static const uint8_t kDefaultFileTransferSessionId = 12U;
+static const uint8_t kDefaultControlSessionVersion = 2U;
+static const uint8_t kDefaultEaSessionVersion = 1U;
+static const uint8_t kDefaultFileTransferSessionVersion = 2U;
 
 /// Computes the 8-bit two's complement checksum: -(sum(data[0..len-1])) mod 256.
 uint8_t computeChecksum(const uint8_t* data, size_t len);
@@ -100,14 +113,15 @@ struct SynPayload {
     uint8_t max_cumulative_acks;
     std::vector<SynSession> sessions;
 
+    // Defaults verified against DiPlay Iap2LinkEngine.kt:581-593, 662-664 & Iap2LinkChannel.kt:361-369.
     SynPayload()
         : version(kLinkVersion),
           max_outstanding(4),
-          max_packet_length(2048),
-          retransmission_timeout_ms(1500),
-          cumulative_ack_timeout_ms(75),
-          max_retransmissions(10),
-          max_cumulative_acks(3) {}
+          max_packet_length(kLinkMaxPacketBytes),
+          retransmission_timeout_ms(4000U),
+          cumulative_ack_timeout_ms(500U),
+          max_retransmissions(4U),
+          max_cumulative_acks(3U) {}
 
     bool encode(std::vector<uint8_t>& out, std::string* error_out = NULL) const;
 
@@ -137,7 +151,10 @@ struct LinkConfig {
     uint16_t detect_interval_ms;
     uint8_t max_detect_attempts;
     bool send_detect_on_start;
+    bool send_syn_with_detect;   // True on wired USB & Wi-Fi tunnel (DiPlay wiredInitiator)
     bool echo_detect_if_unstarted;
+    uint16_t syn_retry_interval_ms;  // 0 = fall back to local_syn.retransmission_timeout_ms
+    uint8_t max_syn_retries;         // 0 = fall back to local_syn.max_retransmissions (when syn_retry_interval_ms == 0)
     size_t max_tx_queue;
     size_t max_rx_buffer_bytes;
 
@@ -146,11 +163,27 @@ struct LinkConfig {
           detect_interval_ms(1000),
           max_detect_attempts(5),
           send_detect_on_start(true),
+          send_syn_with_detect(false),
           echo_detect_if_unstarted(true),
+          syn_retry_interval_ms(0),
+          max_syn_retries(0),
           max_tx_queue(64),
           max_rx_buffer_bytes(131072U) {
-        local_syn.sessions.push_back(SynSession(10, kSessionTypeControl, 1));
+        local_syn.sessions.push_back(SynSession(
+            kDefaultControlSessionId, kSessionTypeControl, kDefaultControlSessionVersion));
     }
+
+    /// Wired USB CarPlay preset (verified: DiPlay Iap2LinkChannel.kt:361-377).
+    /// Initiates SYN immediately alongside detect and uses zero-acknowledgement mode.
+    static LinkConfig wiredUsb();
+
+    /// Wireless Bluetooth RFCOMM preset (verified: DiPlay Iap2LinkChannel.kt:366-388).
+    /// Waits for peer detect before sending SYN and keeps reliable ACKs/retransmissions enabled.
+    static LinkConfig wirelessBluetooth();
+
+    /// Wireless Wi-Fi AirPlay Type-130 tunnel preset (verified: DiPlay Iap2LinkChannel.kt:394-399).
+    /// Initiates SYN alongside detect and uses zero-acknowledgement mode over reliable TCP/AirPlay.
+    static LinkConfig wirelessTunnel();
 };
 
 struct LinkStats {

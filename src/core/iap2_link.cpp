@@ -1,3 +1,8 @@
+// Derived from DiPlay
+// (shared/src/main/java/com/shilapi/xcertplay/transport/Iap2LinkEngine.kt,
+//  shared/src/main/java/com/shilapi/xcertplay/transport/Iap2LinkChannel.kt),
+// GPL-3.0, Copyright (c) DiPlay contributors.
+
 #include "carplay/iap2_link.hpp"
 
 #include <cstring>
@@ -218,6 +223,65 @@ const SynSession* SynPayload::findSessionById(uint8_t id) const {
     return NULL;
 }
 
+LinkConfig LinkConfig::wiredUsb() {
+    LinkConfig cfg;
+    cfg.initial_seq = 99U;  // DiPlay Iap2LinkEngine.kt:659
+    cfg.detect_interval_ms = 1000U;
+    cfg.max_detect_attempts = 5U;
+    cfg.send_detect_on_start = true;
+    cfg.send_syn_with_detect = true;
+    cfg.echo_detect_if_unstarted = true;
+    cfg.syn_retry_interval_ms = 500U;  // DiPlay Iap2LinkEngine.kt:661
+    cfg.max_syn_retries = 10U;
+    cfg.local_syn.version = kLinkVersion;
+    cfg.local_syn.max_outstanding = 4U;
+    cfg.local_syn.max_packet_length = kLinkMaxPacketBytes;
+    cfg.local_syn.retransmission_timeout_ms = 0U;   // zeroAcknowledgements (Iap2LinkChannel.kt:364)
+    cfg.local_syn.cumulative_ack_timeout_ms = 0U;
+    cfg.local_syn.max_retransmissions = 0U;
+    cfg.local_syn.max_cumulative_acks = 0U;
+    cfg.local_syn.sessions.clear();
+    cfg.local_syn.sessions.push_back(SynSession(
+        kDefaultControlSessionId, kSessionTypeControl, kDefaultControlSessionVersion));
+    cfg.local_syn.sessions.push_back(SynSession(
+        kDefaultEaSessionId, kSessionTypeExternalAccessory, kDefaultEaSessionVersion));
+    cfg.local_syn.sessions.push_back(SynSession(
+        kDefaultFileTransferSessionId, kSessionTypeFileTransfer, kDefaultFileTransferSessionVersion));
+    return cfg;
+}
+
+LinkConfig LinkConfig::wirelessBluetooth() {
+    LinkConfig cfg;
+    cfg.initial_seq = 99U;
+    cfg.detect_interval_ms = 1000U;
+    cfg.max_detect_attempts = 5U;
+    cfg.send_detect_on_start = true;
+    cfg.send_syn_with_detect = false;  // Waits for peer detect (Iap2LinkChannel.kt:380-388)
+    cfg.echo_detect_if_unstarted = true;
+    cfg.syn_retry_interval_ms = 500U;
+    cfg.max_syn_retries = 10U;
+    cfg.local_syn.version = kLinkVersion;
+    cfg.local_syn.max_outstanding = 4U;
+    cfg.local_syn.max_packet_length = kLinkMaxPacketBytes;
+    cfg.local_syn.retransmission_timeout_ms = 4000U;
+    cfg.local_syn.cumulative_ack_timeout_ms = 500U;
+    cfg.local_syn.max_retransmissions = 4U;
+    cfg.local_syn.max_cumulative_acks = 3U;
+    cfg.local_syn.sessions.clear();
+    cfg.local_syn.sessions.push_back(SynSession(
+        kDefaultControlSessionId, kSessionTypeControl, kDefaultControlSessionVersion));
+    cfg.local_syn.sessions.push_back(SynSession(
+        kDefaultEaSessionId, kSessionTypeExternalAccessory, kDefaultEaSessionVersion));
+    cfg.local_syn.sessions.push_back(SynSession(
+        kDefaultFileTransferSessionId, kSessionTypeFileTransfer, kDefaultFileTransferSessionVersion));
+    return cfg;
+}
+
+LinkConfig LinkConfig::wirelessTunnel() {
+    // Type-130 AirPlay tunnel matches wired initiator + zero-ack (Iap2LinkChannel.kt:394-399).
+    return wiredUsb();
+}
+
 Link::Link(ByteSink& sink, LinkListener& listener, const LinkConfig& config)
     : sink_(sink),
       listener_(listener),
@@ -285,6 +349,10 @@ void Link::start() {
     setState(kLinkDetecting);
     if (config_.send_detect_on_start) {
         sendDetect();
+    }
+    if (config_.send_syn_with_detect && state_ == kLinkDetecting) {
+        setState(kLinkSynSent);
+        sendSyn();
     }
 }
 
@@ -431,30 +499,42 @@ void Link::drainTxPending() {
     const size_t window = negotiated_syn_.max_outstanding > 0U
         ? static_cast<size_t>(negotiated_syn_.max_outstanding)
         : 1U;
-    while (!tx_pending_.empty() && tx_inflight_.size() < window) {
+    const bool zero_retx = (negotiated_syn_.max_retransmissions == 0U &&
+                            negotiated_syn_.retransmission_timeout_ms == 0U);
+    while (!tx_pending_.empty() && (zero_retx || tx_inflight_.size() < window)) {
         const PendingPayload& front = tx_pending_.front();
-        InFlightPacket inflight;
-        inflight.seq = tx_next_seq_;
-        inflight.session_id = front.session_id;
-        inflight.payload = front.payload;
-        inflight.last_tx_ms = last_now_ms_;
-        inflight.has_tx_time = has_time_;
-        inflight.retries = 0;
-        inflight.selectively_acked = false;
+        const uint8_t seq = tx_next_seq_;
+        const uint8_t session_id = front.session_id;
+        const std::vector<uint8_t> payload = front.payload;
 
-        last_tx_seq_ = tx_next_seq_;
+        last_tx_seq_ = seq;
         tx_next_seq_ = static_cast<uint8_t>(tx_next_seq_ + 1U);
-
-        tx_inflight_.push_back(inflight);
-        tx_pending_.pop_front();
 
         // Outbound data carries ACK = last_rx_in_order_, satisfying any pending cumulative ACK.
         unacked_rx_count_ = 0;
         cum_ack_pending_ = false;
         has_cum_ack_time_ = false;
 
-        const InFlightPacket& sent = tx_inflight_.back();
-        sendControlPacket(kCtrlAck, sent.seq, last_rx_in_order_, sent.session_id, &sent.payload);
+        if (zero_retx) {
+            tx_unacked_seq_ = tx_next_seq_;
+            tx_pending_.pop_front();
+            sendControlPacket(kCtrlAck, seq, last_rx_in_order_, session_id, &payload);
+        } else {
+            InFlightPacket inflight;
+            inflight.seq = seq;
+            inflight.session_id = session_id;
+            inflight.payload = payload;
+            inflight.last_tx_ms = last_now_ms_;
+            inflight.has_tx_time = has_time_;
+            inflight.retries = 0;
+            inflight.selectively_acked = false;
+
+            tx_inflight_.push_back(inflight);
+            tx_pending_.pop_front();
+
+            const InFlightPacket& sent = tx_inflight_.back();
+            sendControlPacket(kCtrlAck, sent.seq, last_rx_in_order_, sent.session_id, &sent.payload);
+        }
     }
 }
 
@@ -698,7 +778,7 @@ bool Link::negotiateSyn(const SynPayload& peer,
         setError(error_out, "invalid SYN max_packet_length");
         return false;
     }
-    if (peer.retransmission_timeout_ms == 0U) {
+    if (peer.retransmission_timeout_ms == 0U && peer.max_retransmissions > 0U) {
         setError(error_out, "invalid SYN retransmission_timeout_ms == 0");
         return false;
     }
@@ -967,6 +1047,9 @@ void Link::handleDataPacket(const LinkPacket& pkt) {
             unacked_rx_count_ = 0;
             cum_ack_pending_ = false;
             has_cum_ack_time_ = false;
+        } else if (negotiated_syn_.max_cumulative_acks == 0U &&
+                   negotiated_syn_.cumulative_ack_timeout_ms == 0U) {
+            unacked_rx_count_ = 0;
         } else if (!cum_ack_pending_) {
             cum_ack_pending_ = true;
             cum_ack_since_ms_ = last_now_ms_;
@@ -1016,9 +1099,15 @@ void Link::tick(int64_t now_ms) {
             has_syn_time_ = true;
             return;
         }
-        if (config_.local_syn.retransmission_timeout_ms > 0U &&
-            now_ms - syn_last_tx_ms_ >= static_cast<int64_t>(config_.local_syn.retransmission_timeout_ms)) {
-            if (syn_retries_ >= config_.local_syn.max_retransmissions) {
+        const uint16_t syn_rto = (config_.syn_retry_interval_ms > 0U)
+            ? config_.syn_retry_interval_ms
+            : config_.local_syn.retransmission_timeout_ms;
+        const uint8_t syn_max = (config_.syn_retry_interval_ms > 0U && config_.max_syn_retries > 0U)
+            ? config_.max_syn_retries
+            : config_.local_syn.max_retransmissions;
+        if (syn_rto > 0U &&
+            now_ms - syn_last_tx_ms_ >= static_cast<int64_t>(syn_rto)) {
+            if (syn_retries_ >= syn_max) {
                 failLink("iAP2 SYN max retransmissions exceeded", true);
                 return;
             }

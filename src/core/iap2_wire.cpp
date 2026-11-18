@@ -1,3 +1,10 @@
+// Derived from DiPlay
+// (shared/src/main/java/com/shilapi/xcertplay/iap2/catalog/Iap2Endpoint.kt,
+//  shared/src/main/java/com/shilapi/xcertplay/iap2/message/Iap2Messages.kt,
+//  shared/src/main/java/com/shilapi/xcertplay/iap2/wire/Iap2CsmFramer.kt,
+//  shared/src/main/java/com/shilapi/xcertplay/iap2/wire/Iap2WireCodec.kt),
+// GPL-3.0, Copyright (c) DiPlay contributors.
+
 #include "carplay/iap2_wire.hpp"
 
 #include <sstream>
@@ -504,13 +511,17 @@ bool buildStartCarPlaySession(const StartSessionConfig& cfg,
     }
 
     if (!cfg.wireless_ssid.empty() || !cfg.wireless_passphrase.empty() ||
-        cfg.has_wireless_channel || !cfg.wireless_ips.empty() ||
-        cfg.has_wireless_security_type) {
+        cfg.has_wireless_passphrase || cfg.has_wireless_channel ||
+        !cfg.wireless_ips.empty() || cfg.has_wireless_security_type) {
         ParameterList wireless;
         if (!cfg.wireless_ssid.empty()) {
             wireless.addString(0, cfg.wireless_ssid);
         }
-        if (!cfg.wireless_passphrase.empty()) {
+        const bool emit_empty_open_pass =
+            cfg.has_wireless_security_type &&
+            cfg.wireless_security_type == kWirelessSecurityNone &&
+            !cfg.wireless_ssid.empty();
+        if (!cfg.wireless_passphrase.empty() || cfg.has_wireless_passphrase || emit_empty_open_pass) {
             wireless.addString(1, cfg.wireless_passphrase);
         }
         if (cfg.has_wireless_channel) {
@@ -710,6 +721,78 @@ bool buildLocationInformation(const std::string& nmea_sentence,
     ParameterList root;
     root.addString(0, nmea_sentence);
     return Frame::build(msg::kLocationInformation, root, frame_out, error_out);
+}
+
+bool buildStartNowPlayingUpdates(Frame& frame_out, std::string* error_out) {
+    ParameterList media_attrs;
+    media_attrs.addVoid(1);
+    media_attrs.addVoid(4);
+    media_attrs.addVoid(6);
+    media_attrs.addVoid(12);
+    media_attrs.addVoid(26);
+
+    ParameterList playback_attrs;
+    playback_attrs.addVoid(0);
+    playback_attrs.addVoid(1);
+    playback_attrs.addVoid(7);
+
+    ParameterList root;
+    root.addGroup(0, media_attrs);
+    root.addGroup(1, playback_attrs);
+    return Frame::build(msg::kStartNowPlayingUpdates, root, frame_out, error_out);
+}
+
+bool buildStartRouteGuidanceUpdates(uint16_t component_id,
+                                    Frame& frame_out,
+                                    std::string* error_out) {
+    ParameterList root;
+    root.addU16(0, component_id);
+    root.addVoid(1);
+    root.addVoid(2);
+    return Frame::build(msg::kStartRouteGuidanceUpdates, root, frame_out, error_out);
+}
+
+bool buildStartPowerUpdates(Frame& frame_out, std::string* error_out) {
+    ParameterList root;
+    root.addVoid(4);
+    root.addVoid(5);
+    root.addVoid(6);
+    return Frame::build(msg::kStartPowerUpdates, root, frame_out, error_out);
+}
+
+bool buildStartCommunicationsUpdates(Frame& frame_out, std::string* error_out) {
+    ParameterList root;
+    root.addVoid(0);
+    root.addVoid(4);
+    root.addVoid(5);
+    return Frame::build(msg::kStartCommunicationsUpdates, root, frame_out, error_out);
+}
+
+bool buildStartCallStateUpdates(Frame& frame_out, std::string* error_out) {
+    ParameterList root;
+    root.addVoid(0);
+    root.addVoid(1);
+    root.addVoid(2);
+    root.addVoid(3);
+    root.addVoid(4);
+    root.addVoid(11);
+    return Frame::build(msg::kStartCallStateUpdates, root, frame_out, error_out);
+}
+
+bool buildStandardSubscriptions(std::vector<Frame>& frames_out, std::string* error_out) {
+    frames_out.clear();
+    Frame f;
+    if (!buildStartNowPlayingUpdates(f, error_out)) return false;
+    frames_out.push_back(f);
+    if (!buildStartRouteGuidanceUpdates(42U, f, error_out)) return false;
+    frames_out.push_back(f);
+    if (!buildStartPowerUpdates(f, error_out)) return false;
+    frames_out.push_back(f);
+    if (!buildStartCommunicationsUpdates(f, error_out)) return false;
+    frames_out.push_back(f);
+    if (!buildStartCallStateUpdates(f, error_out)) return false;
+    frames_out.push_back(f);
+    return true;
 }
 
 }  // namespace iap2
