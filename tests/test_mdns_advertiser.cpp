@@ -366,15 +366,27 @@ TEST_CASE(airplayTxtBuilderFromRepoIdentity) {
 }
 
 TEST_CASE(mdnsUnavailableBackendWhenLibraryMissing) {
+    // Verified HU_ENTRYNAV2 sysroot order: libdns_sd.so.0 first, then .1, then unversioned .so.
+    const std::vector<std::string> defaults = plat::mdnsDefaultLibraryCandidates();
+    REQUIRE(defaults.size() == 3U);
+    CHECK_EQ(std::string("libdns_sd.so.0"), defaults[0]);
+    CHECK_EQ(std::string("libdns_sd.so.1"), defaults[1]);
+    CHECK_EQ(std::string("libdns_sd.so"), defaults[2]);
+
     plat::Reactor reactor;
     REQUIRE(reactor.init());
 
     // Deterministic dlopen failure test (even on hosts that happen to have libavahi-compat-libdnssd).
-    plat::setMdnsLibraryPathsForTest("/nonexistent/libdns_sd.so.1", "/nonexistent/libdns_sd.so");
+    plat::setMdnsLibraryPathsForTest("/nonexistent/libdns_sd.so.0",
+                                    "/nonexistent/libdns_sd.so.1",
+                                    "/nonexistent/libdns_sd.so");
 
     plat::MdnsAdvertiser adv(reactor);
     std::string err;
     CHECK(!adv.load(&err));
+    CHECK(err.find("libdns_sd.so.0") != std::string::npos);
+    CHECK(err.find("libdns_sd.so.1") != std::string::npos);
+    CHECK(err.find("/nonexistent/libdns_sd.so") != std::string::npos);
     CHECK_EQ(plat::kMdnsBackendUnavailable, adv.backend());
     CHECK_EQ(std::string("unavailable"), std::string(adv.backendName()));
     CHECK(!adv.available());
@@ -392,7 +404,7 @@ TEST_CASE(mdnsUnavailableBackendWhenLibraryMissing) {
     CHECK_EQ(plat::kMdnsBackendUnavailable, adv.backend());
     CHECK_EQ(std::string("unavailable"), std::string(adv.backendName()));
 
-    plat::setMdnsLibraryPathsForTest(NULL, NULL);
+    plat::setMdnsLibraryPathsForTest(NULL, NULL, NULL);
 }
 
 TEST_CASE(mdnsAdvertiserRegisterProcessConflictUpdateDeallocate) {

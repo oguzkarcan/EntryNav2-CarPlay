@@ -4,7 +4,9 @@
 
 #include "carplay/iap2_wire.hpp"
 #include "carplay/pairing.hpp"
+#include "carplay/platform/evo_ap.hpp"
 #include "carplay/platform/evo_supervisor.hpp"
+#include "carplay/platform/evo_wlan.hpp"
 #include "carplay/platform/file_util.hpp"
 #include "carplay/platform/hostapd_ctrl.hpp"
 #include "carplay/platform/net_compat.hpp"
@@ -251,6 +253,9 @@ public:
     virtual bool sendStatus(int timeout_ms) {
         return sendCommand(plat::kCmdStatus, "STATUS", timeout_ms);
     }
+    virtual bool sendGetConfig(int timeout_ms) {
+        return sendCommand(plat::kCmdGetConfig, "GET_CONFIG", timeout_ms);
+    }
     virtual bool sendAllSta(int timeout_ms) {
         return sendCommand(plat::kCmdAllSta, "ALL_STA", timeout_ms);
     }
@@ -287,6 +292,11 @@ public:
                 reply = "state=" + status_state_ + "\nphy=phy1\nfreq=5180\nchannel=36\n"
                         "bss[0]=wlan1\nbssid[0]=" + status_bssid_ +
                         "\nssid[0]=test\nnum_sta[0]=0\n";
+            } else if (kind == plat::kCmdGetConfig) {
+                reply = get_config_reply_.empty()
+                            ? "bssid=" + status_bssid_ +
+                                  "\nssid=BMW-DIRECT\npassphrase=NativePass99\nwpa=2\nkey_mgmt=WPA-PSK\n"
+                            : get_config_reply_;
             } else if (kind == plat::kCmdAllSta) {
                 reply = all_sta_reply_;
             }
@@ -312,9 +322,175 @@ public:
     std::string last_local_dir_;
     std::string status_state_;
     std::string status_bssid_;
+    std::string get_config_reply_;
     std::string all_sta_reply_;
     std::vector<std::string> sent_commands_;
     std::vector<plat::HostapdCommandKind> pending_;
+};
+
+class FakeWlanController : public plat::IWlanController {
+public:
+    FakeWlanController()
+        : listener_(NULL),
+          available_(true),
+          busy_(false),
+          begin_enable_fail_(false),
+          begin_disable_fail_(false),
+          begin_enable_count_(0),
+          begin_disable_count_(0),
+          cancel_count_(0),
+          restore_sync_count_(0),
+          auto_complete_enable_(false),
+          next_enable_ok_(true),
+          next_switched_on_by_us_(true),
+          next_disable_ok_(true),
+          restore_sync_ok_(true) {}
+
+    virtual void setListener(plat::WlanControllerListener* listener) { listener_ = listener; }
+    virtual bool isAvailable() const { return available_; }
+    virtual bool isBusy() const { return busy_; }
+
+    virtual bool beginEnable(unsigned timeout_ms, std::string* error_out) {
+        last_timeout_ms_ = timeout_ms;
+        ++begin_enable_count_;
+        if (begin_enable_fail_) {
+            if (error_out != NULL) {
+                *error_out = "fake wlan beginEnable failure";
+            }
+            return false;
+        }
+        busy_ = true;
+        if (auto_complete_enable_) {
+            completeEnable(next_enable_ok_, next_switched_on_by_us_,
+                           next_enable_ok_ ? "" : "fake enable error");
+        }
+        return true;
+    }
+
+    virtual bool beginDisable(unsigned timeout_ms, std::string* error_out) {
+        last_timeout_ms_ = timeout_ms;
+        ++begin_disable_count_;
+        if (begin_disable_fail_) {
+            if (error_out != NULL) {
+                *error_out = "fake wlan beginDisable failure";
+            }
+            return false;
+        }
+        busy_ = true;
+        return true;
+    }
+
+    virtual void cancel() {
+        if (busy_) {
+            busy_ = false;
+            ++cancel_count_;
+        }
+    }
+
+    virtual bool restoreSync(unsigned timeout_ms, std::string* error_out) {
+        last_timeout_ms_ = timeout_ms;
+        ++restore_sync_count_;
+        busy_ = false;
+        if (!restore_sync_ok_ && error_out != NULL) {
+            *error_out = "fake restoreSync failure";
+        }
+        return restore_sync_ok_;
+    }
+
+    void completeEnable(bool ok, bool switched_on_by_us, const std::string& error = "") {
+        busy_ = false;
+        plat::WlanRequestResult res;
+        res.connected = true;
+        res.state_before = switched_on_by_us ? 0 : 1;
+        res.sent = switched_on_by_us;
+        res.state_after = ok ? 1 : 0;
+        res.switched_on_by_us = switched_on_by_us;
+        if (listener_ != NULL) {
+            listener_->onWlanEnableResult(ok, res, error);
+        }
+    }
+
+    void completeDisable(bool ok, const std::string& error = "") {
+        busy_ = false;
+        plat::WlanRequestResult res;
+        res.connected = true;
+        res.sent = true;
+        res.state_after = ok ? 0 : 1;
+        if (listener_ != NULL) {
+            listener_->onWlanDisableResult(ok, res, error);
+        }
+    }
+
+    plat::WlanControllerListener* listener_;
+    bool available_;
+    bool busy_;
+    bool begin_enable_fail_;
+    bool begin_disable_fail_;
+    int begin_enable_count_;
+    int begin_disable_count_;
+    int cancel_count_;
+    int restore_sync_count_;
+    unsigned last_timeout_ms_;
+    bool auto_complete_enable_;
+    bool next_enable_ok_;
+    bool next_switched_on_by_us_;
+    bool next_disable_ok_;
+    bool restore_sync_ok_;
+};
+
+class FakeAccessPointReader : public plat::IAccessPointReader {
+public:
+    FakeAccessPointReader()
+        : native_present_(true),
+          read_ok_(false),
+          read_count_(0),
+          freq_mhz_(5180U) {}
+
+    virtual bool isNativeEnvironmentPresent(const plat::NativeWlanPaths& paths) const {
+        (void)paths;
+        return native_present_;
+    }
+
+    virtual bool readAccessPoint(const plat::NativeWlanPaths& paths,
+                                 plat::EvoApInfo& out,
+                                 std::string& source_out,
+                                 std::string* error_out) {
+        last_paths_ = paths;
+        ++read_count_;
+        if (!read_ok_) {
+            if (error_out != NULL) {
+                *error_out = "fake ap not ready";
+            }
+            return false;
+        }
+        out = ap_info_;
+        source_out = "fake";
+        return true;
+    }
+
+    virtual bool readFrequencyMhz(const std::string& interface_name, unsigned& mhz_out) {
+        (void)interface_name;
+        if (freq_mhz_ == 0U) {
+            return false;
+        }
+        mhz_out = freq_mhz_;
+        return true;
+    }
+
+    virtual bool readConnectedStations(const std::string& interface_name,
+                                       std::vector<std::string>& macs_out) {
+        (void)interface_name;
+        macs_out = stations_;
+        return true;
+    }
+
+    bool native_present_;
+    bool read_ok_;
+    int read_count_;
+    unsigned freq_mhz_;
+    plat::NativeWlanPaths last_paths_;
+    plat::EvoApInfo ap_info_;
+    std::vector<std::string> stations_;
 };
 
 class RecordingApListener : public plat::WifiApListener {
@@ -695,6 +871,7 @@ TEST_CASE(hostapdCtrlRealFakeUnixSocket) {
     REQUIRE(ctrl.sendPing(1000));
     REQUIRE(ctrl.sendAttach(1000));
     REQUIRE(ctrl.sendStatus(1000));
+    REQUIRE(ctrl.sendGetConfig(1000));
     REQUIRE(ctrl.sendEnable(1000));
     REQUIRE(ctrl.sendDisable(1000));
 
@@ -703,7 +880,7 @@ TEST_CASE(hostapdCtrlRealFakeUnixSocket) {
     socklen_t client_len = sizeof(client_addr);
     char buf[512];
 
-    for (int step = 0; step < 5; ++step) {
+    for (int step = 0; step < 6; ++step) {
         ssize_t n = -1;
         for (int tries = 0; tries < 20; ++tries) {
             client_len = sizeof(client_addr);
@@ -730,6 +907,8 @@ TEST_CASE(hostapdCtrlRealFakeUnixSocket) {
             reply = "OK\n";
         } else if (cmd == "STATUS") {
             reply = "state=ENABLED\nbssid[0]=02:00:00:00:00:99\n";
+        } else if (cmd == "GET_CONFIG") {
+            reply = "bssid=02:00:00:00:00:99\nssid=BMW-TEST\npassphrase=Passphrase99\nwpa=2\nkey_mgmt=WPA-PSK\n";
         }
         sendto(srv_fd, reply.data(), reply.size(), 0,
                reinterpret_cast<struct sockaddr*>(&client_addr), client_len);
@@ -739,17 +918,19 @@ TEST_CASE(hostapdCtrlRealFakeUnixSocket) {
         }
     }
 
-    REQUIRE(listener.replies.size() == 5U);
+    REQUIRE(listener.replies.size() == 6U);
     CHECK_EQ(plat::kCmdPing, listener.replies[0].cmd);
     CHECK(listener.replies[0].ok);
     CHECK_EQ(plat::kCmdAttach, listener.replies[1].cmd);
     CHECK(listener.replies[1].ok);
     CHECK_EQ(plat::kCmdStatus, listener.replies[2].cmd);
     CHECK(listener.replies[2].ok);
-    CHECK_EQ(plat::kCmdEnable, listener.replies[3].cmd);
+    CHECK_EQ(plat::kCmdGetConfig, listener.replies[3].cmd);
     CHECK(listener.replies[3].ok);
-    CHECK_EQ(plat::kCmdDisable, listener.replies[4].cmd);
+    CHECK_EQ(plat::kCmdEnable, listener.replies[4].cmd);
     CHECK(listener.replies[4].ok);
+    CHECK_EQ(plat::kCmdDisable, listener.replies[5].cmd);
+    CHECK(listener.replies[5].ok);
 
     REQUIRE(listener.events.size() == 1U);
     CHECK_EQ(plat::kHostapdEventStaConnected, listener.events[0].type);
@@ -757,12 +938,12 @@ TEST_CASE(hostapdCtrlRealFakeUnixSocket) {
 
     // Timeout test using a silent server.
     REQUIRE(ctrl.sendPing(30));
-    for (int i = 0; i < 10 && listener.replies.size() < 6U; ++i) {
+    for (int i = 0; i < 10 && listener.replies.size() < 7U; ++i) {
         reactor.runOnce(20);
     }
-    REQUIRE(listener.replies.size() == 6U);
-    CHECK_EQ(plat::kCmdPing, listener.replies[5].cmd);
-    CHECK(!listener.replies[5].ok);
+    REQUIRE(listener.replies.size() == 7U);
+    CHECK_EQ(plat::kCmdPing, listener.replies[6].cmd);
+    CHECK(!listener.replies[6].ok);
 
     ctrl.close();
     CHECK(!plat::pathExists(local_sock));
@@ -1063,6 +1244,304 @@ TEST_CASE(supervisedProcessRealPosixChild) {
         CHECK(proc.exitStatus().exited);
     }
 #endif
+}
+
+TEST_CASE(wifiApBackendSelection) {
+    TempDirGuard tmp("wifiap_sel");
+    g_fake_clock_ns = 1000000000LL;
+    plat::Reactor reactor(&fakeClockNs);
+    REQUIRE(reactor.init());
+
+    DeterministicRng rng(0x41U);
+    FakeChildProcess fake_hostapd;
+    FakeChildProcess fake_udhcpd;
+    FakeHostapdCtrl fake_ctrl;
+    FakeWlanController fake_wlan;
+    FakeAccessPointReader fake_reader;
+    plat::WifiAp ap(reactor, rng);
+    ap.setHostapdProcessForTest(&fake_hostapd);
+    ap.setUdhcpdProcessForTest(&fake_udhcpd);
+    ap.setHostapdCtrlForTest(&fake_ctrl);
+    ap.setWlanControllerForTest(&fake_wlan);
+    ap.setAccessPointReaderForTest(&fake_reader);
+
+    plat::WifiApConfig cfg;
+    cfg.runtime_dir = tmp.path();
+    CHECK_EQ(plat::kWifiApBackendAuto, cfg.backend);
+    CHECK_EQ(std::string("wlan1"), cfg.interface_name);
+    CHECK_EQ(std::string("wlan0"), cfg.native_interface_name);
+    CHECK_EQ(std::string("/var/run/hostapd/wlan0"), cfg.effectiveNativeRemoteCtrlSocketPath());
+
+    // Auto picks Native when wlan controller or native artifacts report present.
+    fake_wlan.available_ = true;
+    fake_reader.native_present_ = false;
+    CHECK(ap.isNativeCapable(cfg));
+    CHECK_EQ(plat::kWifiApBackendNative, ap.resolveBackend(cfg));
+
+    // Auto falls back to Hostapd when both controller and native artifacts are absent.
+    fake_wlan.available_ = false;
+    fake_reader.native_present_ = false;
+    CHECK(!ap.isNativeCapable(cfg));
+    CHECK_EQ(plat::kWifiApBackendHostapd, ap.resolveBackend(cfg));
+
+    // Capability override 0/1 works deterministically.
+    ap.setNativeCapabilityForTest(1);
+    CHECK(ap.isNativeCapable(cfg));
+    CHECK_EQ(plat::kWifiApBackendNative, ap.resolveBackend(cfg));
+    ap.setNativeCapabilityForTest(0);
+    CHECK(!ap.isNativeCapable(cfg));
+    CHECK_EQ(plat::kWifiApBackendHostapd, ap.resolveBackend(cfg));
+    ap.setNativeCapabilityForTest(-1);
+
+    // Explicit kWifiApBackendNative fails closed without ever spawning hostapd.
+    cfg.backend = plat::kWifiApBackendNative;
+    fake_wlan.begin_enable_fail_ = true;
+    std::string err;
+    CHECK(!ap.start(cfg, &err));
+    CHECK_EQ(plat::kWifiApFailed, ap.state());
+    CHECK_EQ(0, fake_hostapd.start_count_);
+    CHECK_EQ(0, fake_udhcpd.start_count_);
+    CHECK_EQ(1, fake_wlan.begin_enable_count_);
+    ap.stop();
+
+    // Explicit kWifiApBackendHostapd never calls IWlanController even when native is capable.
+    cfg.backend = plat::kWifiApBackendHostapd;
+    fake_wlan.available_ = true;
+    fake_wlan.begin_enable_fail_ = false;
+    fake_wlan.begin_enable_count_ = 0;
+    tmp.trackFile(cfg.effectiveHostapdConfPath());
+    tmp.trackDir(cfg.effectiveCtrlInterfaceDir());
+    REQUIRE(ap.start(cfg, &err));
+    CHECK_EQ(plat::kWifiApBackendHostapd, ap.activeBackend());
+    CHECK_EQ(0, fake_wlan.begin_enable_count_);
+    CHECK_EQ(1, fake_hostapd.start_count_);
+    ap.stopSync();
+}
+
+TEST_CASE(wifiApNativeBackendOffOnAndRestore) {
+    TempDirGuard tmp("wifiap_nat_on");
+    g_fake_clock_ns = 1000000000LL;
+    plat::Reactor reactor(&fakeClockNs);
+    REQUIRE(reactor.init());
+
+    DeterministicRng rng(0x42U);
+    FakeChildProcess fake_hostapd;
+    FakeChildProcess fake_udhcpd;
+    FakeHostapdCtrl fake_ctrl;
+    FakeWlanController fake_wlan;
+    FakeAccessPointReader fake_reader;
+    RecordingApListener listener;
+
+    plat::WifiAp ap(reactor, rng);
+    ap.setHostapdProcessForTest(&fake_hostapd);
+    ap.setUdhcpdProcessForTest(&fake_udhcpd);
+    ap.setHostapdCtrlForTest(&fake_ctrl);
+    ap.setWlanControllerForTest(&fake_wlan);
+    ap.setAccessPointReaderForTest(&fake_reader);
+    ap.setListener(&listener);
+
+    plat::WifiApConfig cfg;
+    cfg.runtime_dir = tmp.path();
+    cfg.backend = plat::kWifiApBackendAuto;
+    cfg.native_poll_interval_ms = 20;
+    cfg.native_ready_timeout_ms = 500;
+    cfg.health_check_interval_ms = 25;
+
+    std::string err;
+    REQUIRE(ap.start(cfg, &err));
+    CHECK_EQ(plat::kWifiApBackendNative, ap.activeBackend());
+    CHECK_EQ(plat::kWifiApStartingWaitCtrl, ap.state());
+    CHECK_EQ(1, fake_wlan.begin_enable_count_);
+    CHECK_EQ(0, fake_hostapd.start_count_);
+    CHECK_EQ(0, fake_udhcpd.start_count_);
+
+    // vMOST finishes switching car AP from OFF (0) -> ON (1); control socket not ready on first poll.
+    fake_ctrl.socket_ready_ = false;
+    fake_wlan.completeEnable(true, true);
+    CHECK(ap.nativeSwitchedOnByUs());
+    CHECK_EQ(plat::kWifiApStartingWaitCtrl, ap.state());
+    CHECK_EQ(std::string("/var/run/hostapd/wlan0"), fake_ctrl.last_remote_);
+
+    // Next timer tick finds control socket ready and probes PING/ATTACH/STATUS/GET_CONFIG/ALL_STA.
+    fake_ctrl.socket_ready_ = true;
+    fake_ctrl.status_bssid_ = "02:aa:bb:cc:dd:99";
+    fake_ctrl.get_config_reply_ =
+        "bssid=02:aa:bb:cc:dd:99\nssid=BMW-DIRECT-77889\npassphrase=CarPlaySecret88\n"
+        "wpa=2\nkey_mgmt=WPA-PSK\n";
+    advanceFakeClockMs(20);
+    reactor.runOnce(0);
+    CHECK(fake_ctrl.isOpen());
+    fake_ctrl.flushReplies();
+
+    CHECK_EQ(plat::kWifiApRunning, ap.state());
+    CHECK_EQ(1, listener.started_count);
+    CHECK_EQ(std::string("BMW-DIRECT-77889"), ap.credentials().ssid);
+    CHECK_EQ(std::string("CarPlaySecret88"), ap.credentials().passphrase);
+    CHECK_EQ(static_cast<uint8_t>(36U), ap.credentials().channel);
+    CHECK(ap.credentials().has_bssid);
+    CHECK_EQ(0, fake_hostapd.start_count_);
+    CHECK_EQ(0, fake_udhcpd.start_count_);
+
+    // Resulting credentials encode valid iAP2 0x5703 frame.
+    iap2::Frame frame;
+    REQUIRE(plat::buildAccessoryWiFiConfigFrame(ap.credentials(), frame, &err));
+    CHECK_EQ(iap2::msg::kAccessoryWiFiConfiguration, frame.message_id);
+
+    // Station events via HostapdCtrl on native AP.
+    fake_ctrl.emitEvent("<3>AP-STA-CONNECTED 00:11:22:33:44:55");
+    CHECK(ap.isStationConnected("00:11:22:33:44:55"));
+    CHECK_EQ(static_cast<size_t>(1U), listener.connected_events.size());
+    fake_ctrl.emitEvent("<3>AP-STA-DISCONNECTED 00:11:22:33:44:55");
+    CHECK(!ap.isStationConnected("00:11:22:33:44:55"));
+    CHECK_EQ(static_cast<size_t>(1U), listener.disconnected_events.size());
+
+    // Async stop() MUST restore AP OFF via beginDisable because we switched it ON.
+    ap.stop();
+    CHECK_EQ(plat::kWifiApStopping, ap.state());
+    CHECK_EQ(1, fake_wlan.begin_disable_count_);
+    CHECK_EQ(0, listener.stopped_count);
+    fake_wlan.completeDisable(true);
+    CHECK_EQ(plat::kWifiApStopped, ap.state());
+    CHECK(!ap.nativeSwitchedOnByUs());
+    CHECK_EQ(1, listener.stopped_count);
+
+    // stopSync() / ~WifiAp() when switched_on_by_us == true calls restoreSync() synchronously.
+    REQUIRE(ap.start(cfg, &err));
+    fake_wlan.completeEnable(true, true);
+    fake_ctrl.flushReplies();
+    REQUIRE(ap.state() == plat::kWifiApRunning);
+    ap.stopSync();
+    CHECK_EQ(1, fake_wlan.restore_sync_count_);
+    CHECK_EQ(plat::kWifiApStopped, ap.state());
+    CHECK(!ap.nativeSwitchedOnByUs());
+}
+
+TEST_CASE(wifiApNativeAlreadyOnLeavesApOn) {
+    TempDirGuard tmp("wifiap_nat_keep");
+    g_fake_clock_ns = 1000000000LL;
+    plat::Reactor reactor(&fakeClockNs);
+    REQUIRE(reactor.init());
+
+    DeterministicRng rng(0x43U);
+    FakeChildProcess fake_hostapd;
+    FakeHostapdCtrl fake_ctrl;  // Leave ctrl socket unavailable to test IAccessPointReader fallback
+    FakeWlanController fake_wlan;
+    FakeAccessPointReader fake_reader;
+    RecordingApListener listener;
+
+    fake_reader.read_ok_ = true;
+    fake_reader.ap_info_.ssid = "BMW-ALREADY-ON";
+    fake_reader.ap_info_.passphrase = "ExistingPass42";
+    fake_reader.ap_info_.bssid = "02:11:22:33:44:55";
+    fake_reader.ap_info_.freq_mhz = 2437;
+    fake_reader.ap_info_.channel = 6;
+    fake_reader.freq_mhz_ = 2437U;
+    fake_reader.stations_.push_back("aa:bb:cc:dd:ee:01");
+
+    {
+        plat::WifiAp ap(reactor, rng);
+        ap.setHostapdProcessForTest(&fake_hostapd);
+        ap.setHostapdCtrlForTest(&fake_ctrl);
+        ap.setWlanControllerForTest(&fake_wlan);
+        ap.setAccessPointReaderForTest(&fake_reader);
+        ap.setListener(&listener);
+
+        plat::WifiApConfig cfg;
+        cfg.runtime_dir = tmp.path();
+        cfg.backend = plat::kWifiApBackendNative;
+        cfg.health_check_interval_ms = 25;
+
+        std::string err;
+        REQUIRE(ap.start(cfg, &err));
+        // state_before == 1 -> switched_on_by_us == false.
+        fake_wlan.completeEnable(true, false);
+        CHECK(!ap.nativeSwitchedOnByUs());
+        CHECK_EQ(plat::kWifiApRunning, ap.state());
+        CHECK_EQ(1, listener.started_count);
+        CHECK_EQ(std::string("BMW-ALREADY-ON"), ap.credentials().ssid);
+        CHECK_EQ(static_cast<uint8_t>(6U), ap.credentials().channel);
+        CHECK(ap.isStationConnected("aa:bb:cc:dd:ee:01"));
+        CHECK_EQ(static_cast<size_t>(1U), listener.connected_events.size());
+
+        // Station diff polling via nl80211/IAccessPointReader when hostapd ctrl socket is absent.
+        fake_reader.stations_.clear();
+        fake_reader.stations_.push_back("11:22:33:44:55:66");
+        advanceFakeClockMs(25);
+        reactor.runOnce(0);
+        CHECK(!ap.isStationConnected("aa:bb:cc:dd:ee:01"));
+        CHECK(ap.isStationConnected("11:22:33:44:55:66"));
+        CHECK_EQ(static_cast<size_t>(1U), listener.disconnected_events.size());
+        CHECK_EQ(static_cast<size_t>(2U), listener.connected_events.size());
+
+        // stop() must NOT send SelectWLANState3(0) because AP was already ON before we started.
+        ap.stop();
+        CHECK_EQ(plat::kWifiApStopped, ap.state());
+        CHECK_EQ(0, fake_wlan.begin_disable_count_);
+        CHECK_EQ(0, fake_wlan.restore_sync_count_);
+        CHECK_EQ(1, listener.stopped_count);
+
+        // Also verify ~WifiAp() leaves car AP ON when switched_on_by_us == false.
+        REQUIRE(ap.start(cfg, &err));
+        fake_wlan.completeEnable(true, false);
+        REQUIRE(ap.state() == plat::kWifiApRunning);
+    }
+    CHECK_EQ(0, fake_wlan.begin_disable_count_);
+    CHECK_EQ(0, fake_wlan.restore_sync_count_);
+}
+
+TEST_CASE(wifiApNativeFailuresAndTimeout) {
+    TempDirGuard tmp("wifiap_nat_fail");
+    g_fake_clock_ns = 1000000000LL;
+    plat::Reactor reactor(&fakeClockNs);
+    REQUIRE(reactor.init());
+
+    DeterministicRng rng(0x44U);
+    FakeHostapdCtrl fake_ctrl;
+    FakeWlanController fake_wlan;
+    FakeAccessPointReader fake_reader;
+    RecordingApListener listener;
+
+    plat::WifiAp ap(reactor, rng);
+    ap.setHostapdCtrlForTest(&fake_ctrl);
+    ap.setWlanControllerForTest(&fake_wlan);
+    ap.setAccessPointReaderForTest(&fake_reader);
+    ap.setListener(&listener);
+
+    plat::WifiApConfig cfg;
+    cfg.runtime_dir = tmp.path();
+    cfg.backend = plat::kWifiApBackendNative;
+    cfg.native_poll_interval_ms = 20;
+    cfg.native_ready_timeout_ms = 100;
+
+    // 1. vMOST enable rejection -> kWifiApFailed.
+    std::string err;
+    REQUIRE(ap.start(cfg, &err));
+    fake_wlan.completeEnable(false, false, "vmostd rejected switch-on");
+    CHECK_EQ(plat::kWifiApFailed, ap.state());
+    CHECK_EQ(1, listener.failed_count);
+    CHECK_EQ(0, fake_wlan.restore_sync_count_);
+    ap.stop();
+
+    // 2. Timeout waiting for credentials -> kWifiApFailed + restores AP off since we switched it on.
+    REQUIRE(ap.start(cfg, &err));
+    fake_wlan.completeEnable(true, true);
+    advanceFakeClockMs(120);
+    reactor.runOnce(0);
+    CHECK_EQ(plat::kWifiApFailed, ap.state());
+    CHECK_EQ(2, listener.failed_count);
+    CHECK_EQ(1, fake_wlan.restore_sync_count_);
+    ap.stop();
+
+    // 3. AP-DISABLED during running -> kWifiApFailed + restores AP off.
+    fake_ctrl.socket_ready_ = true;
+    REQUIRE(ap.start(cfg, &err));
+    fake_wlan.completeEnable(true, true);
+    fake_ctrl.flushReplies();
+    REQUIRE(ap.state() == plat::kWifiApRunning);
+    fake_ctrl.emitEvent("<3>AP-DISABLED");
+    CHECK_EQ(plat::kWifiApFailed, ap.state());
+    CHECK_EQ(3, listener.failed_count);
+    CHECK_EQ(2, fake_wlan.restore_sync_count_);
 }
 
 int main() {

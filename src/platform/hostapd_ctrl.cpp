@@ -360,6 +360,7 @@ bool isHostapdReplyOk(HostapdCommandKind kind, const std::string& reply) {
         case kCmdDisable:
             return t == "OK";
         case kCmdStatus:
+        case kCmdGetConfig:
             return !t.empty() && !isFailureReply(t);
         case kCmdAllSta:
             return !isFailureReply(t);
@@ -516,6 +517,10 @@ bool HostapdCtrl::sendDetach(int timeout_ms) {
 
 bool HostapdCtrl::sendStatus(int timeout_ms) {
     return sendCommand(kCmdStatus, "STATUS", timeout_ms);
+}
+
+bool HostapdCtrl::sendGetConfig(int timeout_ms) {
+    return sendCommand(kCmdGetConfig, "GET_CONFIG", timeout_ms);
 }
 
 bool HostapdCtrl::sendAllSta(int timeout_ms) {

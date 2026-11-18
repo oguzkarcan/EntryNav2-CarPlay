@@ -1,18 +1,21 @@
-# Wireless CarPlay: Wi-Fi AP (`hostapd`) + mDNS/DNS-SD (`_airplay._tcp`)
+# Wireless CarPlay: Car-Native AP (`vMOST` / `wland`), `hostapd` Fallback, and mDNS/DNS-SD (`_airplay._tcp`)
 
 This document describes the Wireless CarPlay Wi-Fi Access Point and mDNS/DNS-SD advertisement
-subsystems (`F4-P3`) for the BMW `HU_ENTRYNAV2` (`2017 F20 LCI`, TI `wl18xx`, Linux 3.12 ARMv7).
+subsystems (`F4-P3` + `F4-B3`) for the BMW `HU_ENTRYNAV2` (`2017 F20 LCI`, TI `wl18xx`,
+Linux 3.12 ARMv7).
 
-> **Integration status:** `F4-P3` implements the standalone Wi-Fi AP, `hostapd` control client,
-> supervised process launcher, DNS-SD TXT builder, and `dns_sd` mDNS advertiser with full host
-> unit tests. Wiring into `CarPlayDaemon` and Bluetooth RFCOMM/iAP2 (`F4-P2`) happens in the
-> integration wave.
+> **Integration status:** `F4-B3` adds BMW's car-native Wi-Fi AP controller (`evo_wlan`), native
+> credential/AP reader (`evo_ap`), read-only `nl80211`/`TCP_INFO` link logger (`wifi_link`),
+> dual-backend `WifiAp` selection (`kWifiApBackendAuto` preferring car-native AP when present, with
+> `kWifiApBackendHostapd` fallback — never running both), and fixes `MdnsAdvertiser` `dlopen()` to
+> probe `libdns_sd.so.0` first as shipped on `HU_ENTRYNAV2`. Wiring into `CarPlayDaemon` happens in
+> the integration wave.
 
 ---
 
 ## 1. End-to-End Wireless CarPlay Flow
 
-1. **Bluetooth RFCOMM / iAP2 Control Session (`F4-P1` / `F4-P2`):**
+1. **Bluetooth RFCOMM / iAP2 Control Session:**
    - The iPhone and head unit connect over Bluetooth Classic (`alps_spp` + `iap2::CsmFramer`).
    - iAP2 identification advertises CarPlay capability and wireless availability (`0x4300` /
      `0x4e0d` `WirelessCarPlayUpdate`).
@@ -20,57 +23,75 @@ subsystems (`F4-P3`) for the BMW `HU_ENTRYNAV2` (`2017 F20 LCI`, TI `wl18xx`, Li
      `RequestAccessoryWiFiConfigurationInformation`), the head unit replies with `0x5703`
      (`AccessoryWiFiConfigurationInformation`), built by `iap2::buildAccessoryWiFiConfiguration`
      via `platform::buildAccessoryWiFiConfigFrame(wifi_ap.credentials(), frame)`:
-     - `BSSID` (6 bytes from `/sys/class/net/<iface>/address` or `hostapd` `STATUS` `bssid[0]`)
-     - `SSID` (`BMW-CarPlay-<random_hex>`, max 32 bytes)
-     - `Passphrase` (random WPA2-PSK passphrase from `OsRandomSource`, 8–63 printable ASCII bytes)
-     - `SecurityType` (`3` = WPA2-PSK; see assumptions below)
+     - `BSSID` (6 bytes from `/var/run/hostapd/<iface>` `STATUS` `bssid[0]` or `SIOCGIFHWADDR` /
+       `/sys/class/net/<iface>/address`)
+     - `SSID` (`<= 32` UTF-8 bytes)
+     - `Passphrase` (WPA2-PSK ASCII passphrase, `8–63` bytes — never logged)
+     - `SecurityType` (`3` = WPA2-PSK)
      - `Channel` (e.g. `36` for 5 GHz or `6` for 2.4 GHz)
 
-2. **Wi-Fi Access Point (`WifiAp` + `HostapdCtrl` + `SupervisedProcess`):**
-   - `WifiAp` generates fresh random SSID suffix + passphrase via `pairing::RandomSource`
-     (`OsRandomSource` reading `/dev/urandom`), validates band/channel/country code, and writes
-     our **own** isolated config file `/var/run/carplay/hostapd-carplay.conf` (mode `0600` inside
-     `/var/run/carplay/`, mode `0700`). **`/etc/hostapd.conf` is never read or modified.**
-   - `SupervisedProcess` launches `/usr/sbin/hostapd /var/run/carplay/hostapd-carplay.conf`
-     directly via `posix_spawnp` (no shell, no `-B` daemonize flag so `waitpid` tracks the child).
-   - `HostapdCtrl` opens a non-blocking `AF_UNIX` `SOCK_DGRAM` socket bound to its own path in
-     `/var/run/carplay/` and connected to `/var/run/carplay/hostapd_ctrl/<iface>`, integrated
-     with `Reactor`.
-   - `WifiAp` probes `PING` -> `ATTACH` -> `STATUS` -> `ALL_STA`, reads `bssid[0]` if not already
-     known, optionally starts `/usr/sbin/udhcpd -f /var/run/carplay/udhcpd-carplay.conf`, and
-     tracks `<N>AP-STA-CONNECTED <mac>` / `<N>AP-STA-DISCONNECTED <mac>` events.
-   - If `hostapd` exits unexpectedly, `WifiAp` tears down the control socket / `udhcpd`, notifies
-     `onWifiApRestarting`, and respawns `hostapd` with the same credentials (up to `max_restarts`).
-     On `stop()`, `SupervisedProcess` sends `SIGTERM` and escalates to `SIGKILL` before reaping.
+2. **Wi-Fi Access Point Backend Selection (`WifiAp`):**
+   - `WifiAp::resolveBackend(cfg)` chooses **exactly one** backend; it never runs both:
+     - **`kWifiApBackendAuto` (default):** probes `WifiAp::isNativeCapable(cfg)`
+       (`EvoWlanController::isAvailable()` or `EvoAccessPointReader::isNativeEnvironmentPresent()`).
+       Selects `kWifiApBackendNative` on `HU_ENTRYNAV2`, or `kWifiApBackendHostapd` on non-EVO
+       dev/host environments.
+     - **`kWifiApBackendNative`:** requires the car-native AP; fails closed without spawning
+       `hostapd` if `vmostd` / native WLAN is unavailable.
+     - **`kWifiApBackendHostapd`:** forces our own isolated `hostapd` (+ optional `udhcpd`) on
+       `interface_name` (`wlan1`) without touching `vmostd`.
 
-3. **mDNS / DNS-SD Advertisement (`dnssd_txt` + `MdnsAdvertiser`):**
-   - `dnssd::buildAirPlayTxtRecord(airplay_cfg, identity, txt)` builds the length-prefixed
-     RFC 6763 TXT record for `_airplay._tcp` from the receiver's `info::AirPlayConfig` and
-     `pairing::Identity`:
-     - `deviceid`: `config.device_id`
-     - `features`: `info::features(config)` formatted as `0x<lo32>,0x<hi32>`
-     - `flags`: `0x4` (matching `statusFlags = 4` in `src/core/airplay_info.cpp`)
-     - `model`: `config.model` (e.g. `HU_ENTRYNAV2`)
-     - `pi`: `identity.pairing_id` (RFC 4122 UUID)
-     - `pk`: 64-char lowercase hex of the 32-byte Ed25519 public key
-     - `srcvers`: `config.source_version` (`950.7.1`)
-   - `MdnsAdvertiser` dynamically loads `libdns_sd.so.1` or `libdns_sd.so` via `dlopen()` (no
-     link-time dependency; reports `"unavailable"` cleanly if absent), registers `_airplay._tcp`
-     on port `7000` (network byte order) with `/usr/local/bin/mdnsd`, and registers
-     `DNSServiceRefSockFD` on the `Reactor`.
-   - Name conflicts (`kDnsServiceErrNameConflict` or `mdnsd` auto-rename callbacks) are handled
-     cleanly and surface `onMdnsNameConflictRenamed`.
+3. **Backend A — Car-Native Wi-Fi AP (`evo_wlan` + `evo_ap` + `HostapdCtrl`):**
+   - **Conflict analysis on `HU_ENTRYNAV2` (verified in sysroot):**
+     - BMW's WLAN daemon (`wland`, `/opt/app/usr/WLAN/app/`, using `/usr/local/lib/libwpa_client.so.1`)
+       already manages `hostapd` on `wlan0` with control socket `/var/run/hostapd/wlan0` and
+       runtime config `/tmp/wland/ap.conf`, and tracks `APConnectionTimeout`.
+     - If an external process reconfigures `wlan0` or spawns a competing `hostapd` on the same
+       radio while `wland` owns it, `wland` fights it or disables the AP on idle timeout.
+     - Instead, BMW's own CarPlay service toggles `wland` cleanly over vMOST FBlock `0xA0` instance
+       `0x01`:
+       1. `EvoWlanController` queries `WLANState3.Get` (`0xA0.01.0xC10`, op `0x1`).
+       2. If `state_before == 1` (hotspot already ON), **nothing** is sent to `0xC11`
+          (`switched_on_by_us = false`).
+       3. Otherwise, `EvoWlanController` sends `SelectWLANState3.StartResultAck` (`0xA0.01.0xC11`,
+          op `0x6`, big-endian payload `57 41 01`), recording `switched_on_by_us = true`.
+   - **Readiness & Credential Readback:**
+     - `WifiAp` connects `HostapdCtrl` (Reactor-driven `AF_UNIX` `SOCK_DGRAM`) to
+       `/var/run/hostapd/wlan0` and sends `PING`, `ATTACH`, `STATUS`, `GET_CONFIG`, and `ALL_STA`,
+       merging with `EvoAccessPointReader` (`hostapd_cli -p /var/run/hostapd -i wlan0 get_config`
+       fallback -> `/tmp/wland/ap.conf` fallback + `SIOCGIFHWADDR` + `nl80211` `NL80211_CMD_GET_INTERFACE`).
+     - Note: `hostapd` `GET_CONFIG` typically omits `channel`/`freq`, while `STATUS` and `nl80211`
+       provide `freq`/`channel` and `bssid[0]`. `WifiAp` merges both before encoding `0x5703`.
+     - Station connect/disconnect events come from `HostapdCtrl` `ATTACH` events, with `nl80211`
+       `readConnectedStations` diff polling when control socket attach is unavailable.
+   - **CarPlay Restoration Rule:**
+     - On `stop()`, `stopSync()`, failure, or `~WifiAp()`, `WifiAp` sends `SelectWLANState3(0)`
+       (`57 41 00`) **only** when `nativeSwitchedOnByUs() == true && config_.native_restore_on_stop`.
+       If the car hotspot was already ON (`state_before == 1`), CarPlay leaves it ON.
 
-4. **AirPlay Session Bring-Up:**
-   - Once the iPhone associates to the AP, it obtains an IPv6 link-local address (`fe80::/64`)
-     and queries `_airplay._tcp.local` over mDNS.
-   - **IPv6 vs IPv4 note:** CarPlay primarily communicates over **IPv6 link-local (`fe80::/64`)**
-     plus mDNS. An optional `udhcpd` IPv4 subnet (`192.168.50.10..50`, `enable_udhcpd = false` by
-     default) is supported for diagnostics or fallback. `generateUdhcpdConfig` intentionally omits
-     `option router` and `option dns` so iOS keeps cellular data routing active while connected
-     to CarPlay Wi-Fi.
-   - The iPhone connects to `SessionServer` on port `7000` and proceeds through `/pair-setup` /
-     `/pair-verify`, `/info`, `SETUP`, `RECORD`, and encrypted media/HID/iAP2 streams.
+4. **Backend B — Isolated `hostapd` Fallback (`WifiAp` + `SupervisedProcess`):**
+   - Used on hosts/builds without BMW `wland` or when `backend = kWifiApBackendHostapd`.
+   - Generates random SSID suffix + WPA2 passphrase via `OsRandomSource`, writes an isolated
+     config at `/var/run/carplay/hostapd-carplay.conf` (`0600` in `0700` dir; **never touches
+     `/etc/hostapd.conf`**), spawns `/usr/sbin/hostapd` via `SupervisedProcess` (`posix_spawnp`, no
+     shell, `SIGTERM`->`SIGKILL`), attaches `HostapdCtrl` on `/var/run/carplay/hostapd_ctrl/wlan1`,
+     and optionally runs `/usr/sbin/udhcpd -f` (omitting `router` and `dns` so iOS keeps cellular data).
+
+5. **mDNS / DNS-SD Advertisement (`dnssd_txt` + `MdnsAdvertiser`):**
+   - `dnssd::buildAirPlayTxtRecord(airplay_cfg, identity, txt)` encodes the RFC 6763 TXT record
+     for `_airplay._tcp` (`deviceid`, `features`, `flags`, `model`, `pi`, `pk`, `srcvers`).
+   - `MdnsAdvertiser` dynamically loads `libdns_sd.so.0` first (then `libdns_sd.so.1`, then
+     `libdns_sd.so`) via `dlopen()`, resolving `DNSServiceRegister`, `DNSServiceRefSockFD`,
+     `DNSServiceProcessResult`, `DNSServiceRefDeallocate`, and optional `DNSServiceUpdateRecord`.
+   - **Sysroot verification (`HU_ENTRYNAV2`):** `/usr/local/lib/libdns_sd.so.0` (SONAME
+     `libdns_sd.so.0`) exports all 21 `DNSService*` symbols (including the 5 used by
+     `MdnsAdvertiser`) and **no** `TXTRecord*` helpers. `dnssd_txt` builds raw length-prefixed TXT
+     records standalone, so no `TXTRecord*` imports are needed.
+
+6. **Wi-Fi/TCP Diagnostics (`WifiLinkLog`):**
+   - Once TCP `:7000` is connected, `WifiLinkLog` holds an `F_DUPFD_CLOEXEC` copy of the socket and
+     logs periodic `nl80211` station stats (signal dBm, Tx/Rx PHY bitrates, frame retries/losses)
+     plus `TCP_INFO` RTT/retransmits without ever logging addresses or passphrases.
 
 ---
 
@@ -79,88 +100,74 @@ subsystems (`F4-P3`) for the BMW `HU_ENTRYNAV2` (`2017 F20 LCI`, TI `wl18xx`, Li
 ### Repository Modules
 | File | Role |
 | --- | --- |
-| `include/carplay/dnssd_txt.hpp`, `src/core/dnssd_txt.cpp` | Pure RFC 6763 TXT encoder/decoder (255-byte limit, key rules, duplicate rejection) + `_airplay._tcp` TXT builder |
+| `include/carplay/dnssd_txt.hpp`, `src/core/dnssd_txt.cpp` | Pure RFC 6763 TXT encoder/decoder + `_airplay._tcp` TXT builder (standalone; no `libdns_sd` `TXTRecord*` dependency) |
+| `include/carplay/platform/vmost_client.hpp`, `src/platform/vmost_client.cpp` | Runtime `dlopen("libvmostclient.so.1")` loader, MOST op constants (`0x1`/`0x6`/`0x9`/`0xA`/`0xC`/`0xD`/`0xF`), `buildVmostStartResultAck`, `isVmostDaemonPresent()` |
+| `include/carplay/platform/evo_wlan.hpp`, `src/platform/evo_wlan.cpp` | BMW vMOST `0xA0.01` `WLANState3`/`SelectWLANState3` sync helpers + Reactor `EvoWlanController` + CarPlay restore rule (ported from AA 0.12.0) |
+| `include/carplay/platform/evo_ap.hpp`, `src/platform/evo_ap.cpp` | `hostapd` config parser, channel<->MHz math, `EvoAccessPointReader` (`hostapd_cli`, `/tmp/wland/ap.conf`, ioctls, `nl80211`), `EvoApInfo::toWifiCredentials` (ported from AA 0.12.0) |
+| `include/carplay/platform/wifi_link.hpp`, `src/platform/wifi_link.cpp` | Read-only `nl80211` station/frequency parsers + queries, `TCP_INFO`, `describeWifiLink`, `WifiLinkLog` (ported from AA 0.12.0) |
+| `include/carplay/platform/hostapd_ctrl.hpp`, `src/platform/hostapd_ctrl.cpp` | Non-blocking Reactor `AF_UNIX` `SOCK_DGRAM` `hostapd` control client (`PING`/`ATTACH`/`STATUS`/`GET_CONFIG`/`ALL_STA`/`ENABLE`/`DISABLE`) |
 | `include/carplay/platform/evo_supervisor.hpp`, `src/platform/evo_supervisor.cpp` | `IChildProcess` + `SupervisedProcess` (`posix_spawnp`, `waitpid(WNOHANG)`, `SIGTERM`->`SIGKILL`) |
-| `include/carplay/platform/hostapd_ctrl.hpp`, `src/platform/hostapd_ctrl.cpp` | Non-blocking Reactor-integrated `AF_UNIX` `SOCK_DGRAM` `hostapd` control client + `STATUS`/`ALL_STA`/event parsers |
-| `include/carplay/platform/wifi_ap.hpp`, `src/platform/wifi_ap.cpp` | `WifiApConfig`, credential & config generators (`hostapd` / `udhcpd`), and `WifiAp` state machine |
-| `include/carplay/platform/mdns_advertiser.hpp`, `src/platform/mdns_advertiser.cpp` | Runtime `dlopen` `dns_sd` advertiser (`libdns_sd.so.1` / `libdns_sd.so`) + `"unavailable"` fallback + Reactor fd integration |
+| `include/carplay/platform/wifi_ap.hpp`, `src/platform/wifi_ap.cpp` | `WifiApConfig`, dual-backend `WifiAp` state machine (car-native AP + `hostapd` fallback), iAP2 `0x5703` frame helper |
+| `include/carplay/platform/mdns_advertiser.hpp`, `src/platform/mdns_advertiser.cpp` | Runtime `dlopen` `dns_sd` advertiser (`libdns_sd.so.0` -> `.1` -> `.so`) + `"unavailable"` fallback + Reactor fd integration |
 
 ### Target Head-Unit Paths (`HU_ENTRYNAV2`)
 | Path | Purpose | Notes |
 | --- | --- | --- |
-| `/usr/sbin/hostapd` | System `hostapd` binary | Verified present in `docs/TARGET_HARDWARE.md` §6 |
-| `/usr/sbin/udhcpd` | Optional BusyBox DHCPv4 daemon | Verified present in `docs/TARGET_HARDWARE.md` §6 |
-| `/usr/local/bin/mdnsd` | Apple-style mDNS responder daemon | Verified present in `docs/TARGET_HARDWARE.md` §6 |
-| `libdns_sd.so.1` / `libdns_sd.so` | Client library for `mdnsd` | Loaded via `dlopen` at runtime; not linked at build time |
-| `/var/run/carplay/` | Runtime directory (`0700`) | Created/owned by `WifiAp` |
-| `/var/run/carplay/hostapd-carplay.conf` | Generated WPA2-PSK CCMP config (`0600`) | Isolated from `/etc/hostapd.conf` |
-| `/var/run/carplay/hostapd_ctrl/wlan1` | `hostapd` UNIX datagram control socket | Created by `hostapd` |
-| `/var/run/carplay/carplay_wpa_ctrl_<pid>_<seq>.sock` | Our client bind socket (`0600`) | Unlinked on close |
-| `/var/run/carplay/udhcpd-carplay.conf` & `.leases` | Optional `udhcpd` runtime files | Only written when `enable_udhcpd = true` |
+| `/var/run/vmost_sockstream` / `/tmp/vmost_sockstream` | `vmostd` IPC UNIX socket | Verified via `isVmostDaemonPresent()` |
+| `libvmostclient.so.1` | vMOST shared client library | Loaded via `dlopen()` at runtime |
+| `/var/run/hostapd/wlan0` | BMW `wland` `hostapd` ctrl socket | Created by BMW `wland` on car-native AP start |
+| `/tmp/wland/ap.conf` | BMW `wland` AP configuration | Verified path; fallback read if `GET_CONFIG`/`hostapd_cli` unavailable |
+| `/usr/sbin/hostapd_cli` | `hostapd` CLI query helper | Used by `EvoAccessPointReader` (`get_config`) |
+| `/opt/app/usr/WLAN/app/libwpa_client.so.1` | BMW WLAN client library | Symlinked at `/usr/local/lib/libwpa_client.so.1` (verified in sysroot) |
+| `/usr/sbin/hostapd` & `/usr/sbin/udhcpd` | Fallback AP / optional DHCPv4 binaries | Used only in `kWifiApBackendHostapd` (`wlan1`) |
+| `/usr/local/bin/mdnsd` | Apple-style mDNS responder daemon | Verified in sysroot |
+| `/usr/local/lib/libdns_sd.so.0` | `mdnsd` client library (SONAME `.0`) | Verified in sysroot; exports 21 `DNSService*` symbols, 0 `TXTRecord*` symbols |
+| `/var/run/carplay/` | Runtime directory (`0700`) | Holds our `AF_UNIX` client bind sockets & fallback configs (`0600`) |
 
 ---
 
-## 3. Assumptions & Unverified Items (Must Verify on Vehicle)
+## 3. Verified vs. Vehicle-Check Items
 
-The following items are **assumptions / unverified against a live head unit or iPhone capture**:
+### Verified in Sysroot
+- **`libdns_sd.so.0` ABI & SONAME:** `/usr/local/lib/libdns_sd.so.0` exports `DNSServiceRegister`,
+  `DNSServiceRefSockFD`, `DNSServiceProcessResult`, `DNSServiceRefDeallocate`, and
+  `DNSServiceUpdateRecord`; does not export `TXTRecord*`.
+- **BMW WLAN ownership:** `/usr/local/lib/libwpa_client.so.1` -> `/opt/app/usr/WLAN/app/libwpa_client.so.1.0.0`,
+  `hostapd` socket `/var/run/hostapd/wlan0`, config `/tmp/wland/ap.conf`, vMOST `0xA0.01` `0xC10` /
+  `0xC11`.
 
-1. **Interface assignment (`wlan1` vs `wlan0`):**
-   - `docs/TARGET_HARDWARE.md` §6 confirms TI `wl18xx` exposes `wlan0` and `wlan1`. `WifiApConfig`
-     defaults to `wlan1` on the assumption `wlan0` is used for client/BMW services or P2P, and
-     `wlan1` is free for AP mode. Configurable via `WifiApConfig::interface_name`.
-2. **Band / channel / regulatory domain (`DE`, channel `36`):**
-   - `WifiApConfig` defaults to 5 GHz channel `36` (`hw_mode=a`) and `country_code="DE"`. Must
-     verify on the unit whether `wl18xx` + the installed `hostapd` binary and regdb allow 5 GHz
-     AP mode (`iw list`) or require 2.4 GHz (`hw_mode=g`, e.g. channel `6`).
-3. **iAP2 `WiFiSecurityType` (`kIap2WifiSecurityWpa2 = 3`):**
-   - Matches `tests/test_phase1.cpp` (lines 482, 534). Other security-type enum values are not
-     verified against live iPhone iAP2 traces.
-4. **`_airplay._tcp` TXT formatting & required keys:**
-   - Reuses existing repo values (`deviceid`, `features`, `flags`, `model`, `pi`, `pk`, `srcvers`).
-   - `features` formatting (`0x<lo32>,0x<hi32>`, lowercase hex) and `flags` (`0x4`) follow open
-     AirPlay conventions and have **not** been captured against `/opt/app/usr/MediaPlayer/bin/CARPLAY`
-     or a real iPhone. Whether iOS expects additional keys (such as `vv` or `protovers`) for
-     Wireless CarPlay discovery must be checked on-unit.
-5. **`libdns_sd` library filename & `mdnsd` IPC compatibility:**
-   - `MdnsAdvertiser` tries `libdns_sd.so.1` then `libdns_sd.so` via `dlopen`. Exact SONAME and
-     `/var/run/mdnsd` socket permissions on the target firmware must be confirmed on the unit.
-6. **Interface link-up / IPv6 link-local readiness:**
-   - `WifiAp` spawns `hostapd` and optional `udhcpd`; bringing the interface `UP` (`ip link set wlan1 up`)
-     or assigning an IPv4 address when `enable_udhcpd=true` is assumed to be handled either by
-     network scripts or the daemon integration wave. Note that `hostapd` with `driver=nl80211`
-     typically brings the AP interface up itself once started.
+### Must Verify on Live Vehicle
+1. **`libvmostclient.so.1` runtime IPC:** Verify `EvoWlanController` (`0xA0.01.0xC10` + `0xC11`
+   `57 41 01` / `57 41 00`) against live `vmostd` and confirm `wland` starts `/var/run/hostapd/wlan0`
+   without `APConnectionTimeout` interfering during CarPlay association.
+2. **Car-native AP channel & band:** Confirm whether `wland` brings `wlan0` up on 5 GHz (`36`+) or
+   2.4 GHz and that `STATUS` / `nl80211` reports the real operating frequency before `0x5703` is sent.
+3. **iAP2 `WiFiSecurityType` (`kIap2WifiSecurityWpa2 = 3`) & `_airplay._tcp` TXT keys:** Confirm
+   against a real iPhone pairing trace (`0x5702`/`0x5703` + `dns-sd -B _airplay._tcp local.`).
+4. **IPv6 link-local on `wlan0`:** CarPlay uses IPv6 `fe80::/64` over the car AP even when no
+   IPv4 address is assigned to `wlan0` (`EvoApInfo::ip` empty is explicitly permitted).
 
 ---
 
 ## 4. How to Verify on the Head Unit (ENET SSH)
 
-Run these read-only / isolated checks over ENET SSH on `HU_ENTRYNAV2`:
+Run these read-only checks over ENET SSH on `HU_ENTRYNAV2`:
 
 ```sh
-# 1. Inspect Wi-Fi interfaces, capabilities (AP mode, 5 GHz support), and current state
+# 1. Inspect Wi-Fi interfaces, vMOST daemon, and wland artifacts
 iw dev
 iw phy
 ifconfig -a
-ps | grep -E 'hostapd|wpa_supplicant|mdnsd|udhcpd'
+ps | grep -E 'hostapd|wpa_supplicant|wland|vmostd|mdnsd'
+ls -la /var/run/vmost_sockstream /tmp/vmost_sockstream /var/run/hostapd /tmp/wland 2>/dev/null
 
-# 2. Check existing /etc/hostapd.conf (READ-ONLY — do not modify!) and dns_sd libraries
-cat /etc/hostapd.conf
-ls -la /usr/sbin/hostapd /usr/sbin/udhcpd /usr/local/bin/mdnsd
-ls -la /usr/lib/libdns_sd* /usr/local/lib/libdns_sd* /lib/libdns_sd* 2>/dev/null
-
-# 3. Verify IPv6 link-local on the chosen AP interface (after starting hostapd with a test conf)
-ip -6 addr show dev wlan1
-
-# 4. Test mdnsd registration/browsing if dns-sd CLI is present on the image
+# 2. Check installed dns_sd library and test mdnsd browsing
+ls -la /usr/local/lib/libdns_sd* /usr/lib/libdns_sd* 2>/dev/null
 which dns-sd && dns-sd -B _airplay._tcp local.
-```
 
-During integration testing:
-1. Ensure `/var/run/carplay/` is writable and `/etc/hostapd.conf` remains untouched.
-2. Start `WifiAp` on `wlan1` and confirm `HostapdCtrl` receives `PONG`, `OK` (on `ATTACH`), and
-   `STATUS` with `state=ENABLED`.
-3. Confirm `MdnsAdvertiser` loads `libdns_sd.so*` (`backendName() == "dns_sd"`) and registers
-   `_airplay._tcp` on port `7000` without errors.
-4. Connect a test phone (with the generated SSID/passphrase or via iAP2 `0x5703`), confirm
-   `onStationConnected(<mac>)` fires, and verify `ip -6 neigh show dev wlan1` + TCP `:7000`
-   reachability.
+# 3. Read-only check of car hotspot state (0 = off, 1 = on)
+# After WifiAp starts in native mode, verify:
+#   - /var/run/hostapd/wlan0 responds to hostapd_cli -p /var/run/hostapd -i wlan0 status
+#   - ip -6 addr show dev wlan0 has link-local fe80::/64
+#   - on stop(), car hotspot turns back off only if it was off before CarPlay started
+```

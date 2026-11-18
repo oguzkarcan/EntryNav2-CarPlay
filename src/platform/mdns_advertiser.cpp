@@ -18,8 +18,10 @@ namespace platform {
 namespace {
 
 const char* const kTag = "mdns";
+bool g_has_test_lib_override = false;
 std::string g_test_lib_primary;
 std::string g_test_lib_fallback;
+std::string g_test_lib_tertiary;
 
 void setError(std::string* err, const std::string& msg) {
     if (err != NULL) {
@@ -137,15 +139,27 @@ bool MdnsAdvertiser::load(std::string* error_out) {
     setError(error_out, last_error_);
     return false;
 #else
-    const char* candidates[2];
-    candidates[0] = !g_test_lib_primary.empty() ? g_test_lib_primary.c_str() : "libdns_sd.so.1";
-    candidates[1] = !g_test_lib_fallback.empty() ? g_test_lib_fallback.c_str() : "libdns_sd.so";
+    std::vector<std::string> candidates;
+    if (g_has_test_lib_override) {
+        if (!g_test_lib_primary.empty()) {
+            candidates.push_back(g_test_lib_primary);
+        }
+        if (!g_test_lib_fallback.empty()) {
+            candidates.push_back(g_test_lib_fallback);
+        }
+        if (!g_test_lib_tertiary.empty()) {
+            candidates.push_back(g_test_lib_tertiary);
+        }
+    } else {
+        candidates = mdnsDefaultLibraryCandidates();
+    }
+
     std::string dl_errors;
-    for (size_t i = 0U; i < 2U; ++i) {
-        if (candidates[i] == NULL || candidates[i][0] == '\0') {
+    for (size_t i = 0U; i < candidates.size(); ++i) {
+        if (candidates[i].empty()) {
             continue;
         }
-        void* handle = dlopen(candidates[i], RTLD_NOW | RTLD_LOCAL);
+        void* handle = dlopen(candidates[i].c_str(), RTLD_NOW | RTLD_LOCAL);
         if (handle != NULL) {
             lib_ = handle;
             loaded_library_ = candidates[i];
@@ -155,7 +169,7 @@ bool MdnsAdvertiser::load(std::string* error_out) {
         if (!dl_errors.empty()) {
             dl_errors += "; ";
         }
-        dl_errors += std::string(candidates[i]) + ": " + (why != NULL ? why : "dlopen failed");
+        dl_errors += candidates[i] + ": " + (why != NULL ? why : "dlopen failed");
     }
 
     if (lib_ == NULL) {
@@ -165,6 +179,7 @@ bool MdnsAdvertiser::load(std::string* error_out) {
         return false;
     }
 
+    // Verified exports on sysroot /usr/local/lib/libdns_sd.so.0 (21 DNSService* symbols):
     bool ok = true;
     ok &= resolveOptionalSymbol(lib_, "DNSServiceRegister", api_.register_service);
     ok &= resolveOptionalSymbol(lib_, "DNSServiceRefSockFD", api_.ref_sock_fd);
@@ -528,9 +543,22 @@ void MdnsAdvertiser::onError() {
     }
 }
 
-void setMdnsLibraryPathsForTest(const char* primary_path, const char* fallback_path) {
+std::vector<std::string> mdnsDefaultLibraryCandidates() {
+    std::vector<std::string> out;
+    out.push_back("libdns_sd.so.0");  // verified: HU_ENTRYNAV2 sysroot /usr/local/lib/libdns_sd.so.0
+    out.push_back("libdns_sd.so.1");
+    out.push_back("libdns_sd.so");
+    return out;
+}
+
+void setMdnsLibraryPathsForTest(const char* primary_path,
+                                const char* fallback_path,
+                                const char* tertiary_path) {
+    g_has_test_lib_override =
+        (primary_path != NULL || fallback_path != NULL || tertiary_path != NULL);
     g_test_lib_primary = primary_path != NULL ? primary_path : "";
     g_test_lib_fallback = fallback_path != NULL ? fallback_path : "";
+    g_test_lib_tertiary = tertiary_path != NULL ? tertiary_path : "";
 }
 
 }  // namespace platform
