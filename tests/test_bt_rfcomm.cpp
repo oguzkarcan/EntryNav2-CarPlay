@@ -976,8 +976,11 @@ TEST_CASE(probeCapabilityAndFormatting) {
     cap.dbus_socket_present = true;
     cap.libbluetooth_loadable = true;
     cap.libbluetooth_name = "libbluetooth.so.3";
+    cap.libdbus_loadable = true;
+    cap.libdbus_name = "libdbus-1.so.3";
 
     CHECK(cap.rfcommSocketCapable());
+    CHECK(cap.alpsDbusCapable());
     const std::string text = carplay::platform::formatBtCapability(cap);
     CHECK(text.find("af_bluetooth=yes") != std::string::npos);
     CHECK(text.find("hci=hci0") != std::string::npos);
@@ -985,6 +988,7 @@ TEST_CASE(probeCapabilityAndFormatting) {
     CHECK(text.find("bluetoothd=no") != std::string::npos);
     CHECK(text.find("dbus=yes") != std::string::npos);
     CHECK(text.find("libbluetooth=libbluetooth.so.3") != std::string::npos);
+    CHECK(text.find("libdbus=libdbus-1.so.3") != std::string::npos);
     carplay::platform::logBtCapability(cap);
 
     std::unique_ptr<carplay::sdp::SdpRegistrar> reg =
@@ -1029,6 +1033,8 @@ TEST_CASE(probeCapabilityAndFormatting) {
     paths.dbus_socket = std::string(tmp_dir) + "/missing_dbus";
     paths.libbluetooth_candidates.clear();
     paths.libbluetooth_candidates.push_back("/tmp/definitely_missing_libbluetooth.so");
+    paths.libdbus_candidates.clear();
+    paths.libdbus_candidates.push_back("/tmp/definitely_missing_libdbus.so");
     paths.probe_af_bluetooth = false;
 
     const BtCapability probed = carplay::platform::probeBtCapability(paths);
@@ -1040,6 +1046,8 @@ TEST_CASE(probeCapabilityAndFormatting) {
     CHECK(!probed.bluetoothd_socket_present);
     CHECK(!probed.dbus_socket_present);
     CHECK(!probed.libbluetooth_loadable);
+    CHECK(!probed.libdbus_loadable);
+    CHECK(!probed.alpsDbusCapable());
 
     ::close(sfd);
     ::unlink(sdp_sock.c_str());

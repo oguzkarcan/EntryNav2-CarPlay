@@ -661,6 +661,8 @@ BtProbePaths::BtProbePaths()
       probe_af_bluetooth(true) {
     libbluetooth_candidates.push_back("libbluetooth.so.3");
     libbluetooth_candidates.push_back("libbluetooth.so");
+    libdbus_candidates.push_back("libdbus-1.so.3");
+    libdbus_candidates.push_back("libdbus-1.so");
 }
 
 BtCapability probeBtCapability() {
@@ -721,6 +723,20 @@ BtCapability probeBtCapability(const BtProbePaths& paths) {
             break;
         }
     }
+
+    for (size_t i = 0; i < paths.libdbus_candidates.size(); ++i) {
+        const std::string& lib = paths.libdbus_candidates[i];
+        if (lib.empty()) {
+            continue;
+        }
+        void* handle = ::dlopen(lib.c_str(), RTLD_LAZY | RTLD_LOCAL);
+        if (handle != NULL) {
+            cap.libdbus_loadable = true;
+            cap.libdbus_name = lib;
+            ::dlclose(handle);
+            break;
+        }
+    }
 #endif
 
     return cap;
@@ -745,15 +761,16 @@ std::string formatBtCapability(const BtCapability& cap) {
         snprintf(af_buf, sizeof(af_buf), "no(errno=%d)", cap.af_bluetooth_errno);
     }
 
-    char out[384];
+    char out[512];
     snprintf(out, sizeof(out),
-             "af_bluetooth=%s hci=%s sdpd=%s bluetoothd=%s dbus=%s libbluetooth=%s",
+             "af_bluetooth=%s hci=%s sdpd=%s bluetoothd=%s dbus=%s libbluetooth=%s libdbus=%s",
              af_buf,
              hci_list.c_str(),
              cap.sdpd_socket_present ? "yes" : "no",
              cap.bluetoothd_socket_present ? "yes" : "no",
              cap.dbus_socket_present ? "yes" : "no",
-             cap.libbluetooth_loadable ? cap.libbluetooth_name.c_str() : "no");
+             cap.libbluetooth_loadable ? cap.libbluetooth_name.c_str() : "no",
+             cap.libdbus_loadable ? cap.libdbus_name.c_str() : "no");
     return std::string(out);
 }
 

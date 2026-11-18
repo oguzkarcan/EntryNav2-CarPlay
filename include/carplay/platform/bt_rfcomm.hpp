@@ -269,6 +269,7 @@ struct BtProbePaths {
     std::string bluetoothd_socket;
     std::string dbus_socket;
     std::vector<std::string> libbluetooth_candidates;
+    std::vector<std::string> libdbus_candidates;
     bool probe_af_bluetooth;
 
     BtProbePaths();
@@ -284,6 +285,8 @@ struct BtCapability {
     bool dbus_socket_present;
     bool libbluetooth_loadable;
     std::string libbluetooth_name;
+    bool libdbus_loadable;
+    std::string libdbus_name;
 
     BtCapability()
         : af_bluetooth_supported(false),
@@ -292,9 +295,11 @@ struct BtCapability {
           sdpd_socket_present(false),
           bluetoothd_socket_present(false),
           dbus_socket_present(false),
-          libbluetooth_loadable(false) {}
+          libbluetooth_loadable(false),
+          libdbus_loadable(false) {}
 
     bool rfcommSocketCapable() const { return af_bluetooth_supported && has_hci_device; }
+    bool alpsDbusCapable() const { return dbus_socket_present && libdbus_loadable; }
 };
 
 BtCapability probeBtCapability();
