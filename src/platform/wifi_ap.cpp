@@ -538,7 +538,11 @@ WifiAp::~WifiAp() {
     if (alive_state_ != NULL) {
         alive_state_->alive = false;
     }
+    listener_ = NULL;
     stopSync();
+    hostapd_proc_override_ = NULL;
+    udhcpd_proc_override_ = NULL;
+    ctrl_override_ = NULL;
     if (alive_state_ != NULL) {
         if (--alive_state_->refs == 0) {
             delete alive_state_;
@@ -548,14 +552,26 @@ WifiAp::~WifiAp() {
 }
 
 void WifiAp::setHostapdProcessForTest(IChildProcess* proc) {
+    if (proc != NULL && state_ != kWifiApStopped && state_ != kWifiApFailed) {
+        CARPLAY_LOG_WARN(kTag, "ignoring setHostapdProcessForTest while WifiAp is active");
+        return;
+    }
     hostapd_proc_override_ = proc;
 }
 
 void WifiAp::setUdhcpdProcessForTest(IChildProcess* proc) {
+    if (proc != NULL && state_ != kWifiApStopped && state_ != kWifiApFailed) {
+        CARPLAY_LOG_WARN(kTag, "ignoring setUdhcpdProcessForTest while WifiAp is active");
+        return;
+    }
     udhcpd_proc_override_ = proc;
 }
 
 void WifiAp::setHostapdCtrlForTest(IHostapdCtrl* ctrl_ptr) {
+    if (ctrl_ptr != NULL && state_ != kWifiApStopped && state_ != kWifiApFailed) {
+        CARPLAY_LOG_WARN(kTag, "ignoring setHostapdCtrlForTest while WifiAp is active");
+        return;
+    }
     ctrl_override_ = ctrl_ptr;
 }
 
@@ -752,6 +768,15 @@ void WifiAp::stop() {
     if (state_ == kWifiApStopped) {
         return;
     }
+    if (state_ == kWifiApFailed) {
+        cancelTimer();
+        cleanupRuntimeFiles();
+        state_ = kWifiApStopped;
+        ctrl_attached_ = false;
+        ctrl_status_ok_ = false;
+        ctrl_probe_pending_ = false;
+        return;
+    }
     if (state_ == kWifiApStopping) {
         return;
     }
@@ -789,10 +814,24 @@ void WifiAp::stopSync() {
     if (state_ == kWifiApStopped) {
         return;
     }
+    if (state_ == kWifiApFailed) {
+        cancelTimer();
+        cleanupRuntimeFiles();
+        state_ = kWifiApStopped;
+        ctrl_attached_ = false;
+        ctrl_status_ok_ = false;
+        ctrl_probe_pending_ = false;
+        return;
+    }
+    const bool already_destroying = (alive_state_ != NULL && !alive_state_->alive);
+    AliveGuard guard(alive_state_);
     cancelTimer();
     ctrl()->setListener(NULL);
     ctrl()->close();
     clearConnectedStations();
+    if (!already_destroying && !guard.alive()) {
+        return;
+    }
 
     const int term_ms = config_.stop_term_timeout_ms > 0 ? config_.stop_term_timeout_ms : 500;
     const int kill_ms = config_.stop_kill_timeout_ms > 0 ? config_.stop_kill_timeout_ms : 500;
