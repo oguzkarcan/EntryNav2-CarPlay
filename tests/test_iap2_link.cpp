@@ -611,6 +611,94 @@ TEST_CASE(rstAndSleepHandling) {
     CHECK_EQ(iap2::kCtrlRst, sent[0].control);
 }
 
+TEST_CASE(diplayPresetsAndZeroAckMode) {
+    // Wired USB preset: immediate detect + SYN, initial_seq=99, 3 sessions, zero-ack mode.
+    {
+        RecordingSink sink;
+        RecordingListener listener;
+        iap2::LinkConfig cfg = iap2::LinkConfig::wiredUsb();
+        CHECK_EQ(99U, cfg.initial_seq);
+        CHECK(cfg.send_syn_with_detect);
+        CHECK_EQ(500U, cfg.syn_retry_interval_ms);
+        CHECK_EQ(0U, cfg.local_syn.retransmission_timeout_ms);
+        CHECK_EQ(0U, cfg.local_syn.max_retransmissions);
+        REQUIRE(cfg.local_syn.sessions.size() == 3U);
+        CHECK_EQ(iap2::kDefaultControlSessionId, cfg.local_syn.sessions[0].id);
+        CHECK_EQ(iap2::kDefaultControlSessionVersion, cfg.local_syn.sessions[0].version);
+        CHECK_EQ(iap2::kDefaultEaSessionId, cfg.local_syn.sessions[1].id);
+        CHECK_EQ(iap2::kDefaultFileTransferSessionId, cfg.local_syn.sessions[2].id);
+
+        iap2::Link link(sink, listener, cfg);
+        link.tick(0);
+        link.start();
+        CHECK_EQ(iap2::kLinkSynSent, link.state());
+        // Should have emitted detect + SYN in one go.
+        REQUIRE(sink.stream.size() > iap2::kDetectSequenceBytes);
+        CHECK(std::memcmp(&sink.stream[0], iap2::kDetectSequence, iap2::kDetectSequenceBytes) == 0);
+        std::vector<iap2::LinkPacket> pkts = sink.decodeAllPackets();
+        REQUIRE(pkts.size() == 1U);
+        CHECK_EQ(iap2::kCtrlSyn, pkts[0].control);
+        CHECK_EQ(99U, pkts[0].seq);
+        sink.clear();
+
+        // SYN retry fires at syn_retry_interval_ms = 500 even though local_syn RTO is 0.
+        link.tick(499);
+        CHECK(sink.stream.empty());
+        link.tick(500);
+        pkts = sink.decodeAllPackets();
+        REQUIRE(pkts.size() == 1U);
+        CHECK_EQ(iap2::kCtrlSyn, pkts[0].control);
+        sink.clear();
+
+        // Peer responds with zero-ack SYN|ACK.
+        REQUIRE(link.feed(encodeSynPacket(
+            static_cast<uint8_t>(iap2::kCtrlSyn | iap2::kCtrlAck), 10U, 99U, cfg.local_syn)));
+        CHECK_EQ(iap2::kLinkConnected, link.state());
+        sink.clear();
+
+        // Transmit more than max_outstanding (4) packets without peer ACKs -> zero in-flight.
+        for (int i = 0; i < 6; ++i) {
+            CHECK(link.sendPayload(iap2::kDefaultControlSessionId, Bytes(2, static_cast<uint8_t>(i))));
+        }
+        CHECK_EQ(0U, link.inFlightCount());
+        CHECK_EQ(0U, link.pendingCount());
+        CHECK_EQ(6U, sink.decodeAllPackets().size());
+        sink.clear();
+
+        // Receiving data in zero-ack mode delivers payload without scheduling cumulative ACK.
+        REQUIRE(link.feed(encodeRawPacket(
+            iap2::kCtrlAck, 11U, 105U, iap2::kDefaultControlSessionId, Bytes(3, 0x42U))));
+        REQUIRE(listener.payloads.size() == 1U);
+        link.tick(5000);
+        CHECK(sink.stream.empty());
+    }
+
+    // Wireless Bluetooth preset: waits for peer detect, keeps reliable timers.
+    {
+        RecordingSink sink;
+        RecordingListener listener;
+        iap2::LinkConfig cfg = iap2::LinkConfig::wirelessBluetooth();
+        CHECK(!cfg.send_syn_with_detect);
+        CHECK_EQ(4000U, cfg.local_syn.retransmission_timeout_ms);
+        CHECK_EQ(500U, cfg.local_syn.cumulative_ack_timeout_ms);
+        CHECK_EQ(4U, cfg.local_syn.max_retransmissions);
+        CHECK_EQ(3U, cfg.local_syn.max_cumulative_acks);
+
+        iap2::Link link(sink, listener, cfg);
+        link.start();
+        CHECK_EQ(iap2::kLinkDetecting, link.state());
+        CHECK(sink.decodeAllPackets().empty());
+    }
+
+    // Wireless Type-130 tunnel preset: matches wired USB zero-ack initiator.
+    {
+        iap2::LinkConfig tun = iap2::LinkConfig::wirelessTunnel();
+        CHECK(tun.send_syn_with_detect);
+        CHECK_EQ(0U, tun.local_syn.retransmission_timeout_ms);
+        CHECK_EQ(0U, tun.local_syn.max_retransmissions);
+    }
+}
+
 int main() {
     return test_support::runAll("test_iap2_link");
 }

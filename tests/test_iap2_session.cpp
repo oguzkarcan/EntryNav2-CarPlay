@@ -53,6 +53,7 @@ class RecordingSessionListener : public iap2::SessionListener {
 public:
     std::vector<iap2::SessionState> states;
     int ident_accepted_count;
+    std::vector<std::vector<uint16_t> > ident_retries;
     std::vector<std::vector<uint16_t> > ident_rejections;
     std::vector<iap2::ParameterList> ident_updates;
     int auth_succeeded_count;
@@ -65,8 +66,10 @@ public:
     std::vector<iap2::DeviceTransportIdentifier> transport_ids;
     std::vector<iap2::CarPlayAvailability> availabilities;
     std::vector<bool> wireless_updates;
+    std::vector<iap2::Frame> power_update_frames;
     std::vector<bool> power_updates;
     std::vector<bool> location_updates;
+    std::vector<bool> vehicle_status_updates;
     std::vector<iap2::Frame> unhandled;
     std::vector<std::string> errors;
 
@@ -89,6 +92,9 @@ public:
     }
     virtual void onIdentificationAccepted() {
         ++ident_accepted_count;
+    }
+    virtual void onIdentificationRetry(const std::vector<uint16_t>& omitted_messages) {
+        ident_retries.push_back(omitted_messages);
     }
     virtual void onIdentificationRejected(const std::vector<uint16_t>& rejected_params) {
         ident_rejections.push_back(rejected_params);
@@ -125,11 +131,17 @@ public:
     virtual void onWirelessCarPlayAvailability(bool available) {
         wireless_updates.push_back(available);
     }
+    virtual void onPowerUpdate(const iap2::Frame& frame) {
+        power_update_frames.push_back(frame);
+    }
     virtual void onPowerUpdatesChanged(bool active) {
         power_updates.push_back(active);
     }
     virtual void onLocationUpdatesChanged(bool active) {
         location_updates.push_back(active);
+    }
+    virtual void onVehicleStatusUpdatesChanged(bool active) {
+        vehicle_status_updates.push_back(active);
     }
     virtual void onUnhandledMessage(const iap2::Frame& frame) {
         unhandled.push_back(frame);
@@ -381,8 +393,13 @@ TEST_CASE(identificationInformationEncodingAllFields) {
     CHECK(root.readU8(iap2::param::kIdentPowerProvidingCapability, pwr) && pwr == 2U);
     CHECK(root.readU16(iap2::param::kIdentMaxCurrentDrawnFromDevice, cur) && cur == 0U);
 
-    // Repeated SupportedLanguage parameters
-    CHECK_EQ(3U, root.findAll(iap2::param::kIdentSupportedLanguage).size());
+    // NUL-separated STRING_LIST in SupportedLanguage (param 13)
+    std::vector<std::string> langs;
+    REQUIRE(root.readStrings(iap2::param::kIdentSupportedLanguage, langs));
+    REQUIRE(langs.size() == 3U);
+    CHECK_EQ(std::string("en"), langs[0]);
+    CHECK_EQ(std::string("tr"), langs[1]);
+    CHECK_EQ(std::string("de"), langs[2]);
 
     // Transport & vehicle groups
     iap2::ParameterList grp;
@@ -394,9 +411,15 @@ TEST_CASE(identificationInformationEncodingAllFields) {
     CHECK(grp.readBytes(iap2::param::kBtTransportMacAddress, mac) && mac.size() == 6U);
 
     REQUIRE(root.readGroup(iap2::param::kIdentWirelessCarPlayTransportComponent, grp, &err));
-    CHECK(grp.findFirst(iap2::param::kWirelessCarPlaySupportsCarPlay) != NULL);
+    CHECK_EQ(24U, iap2::param::kIdentWirelessCarPlayTransportComponent);
+    uint16_t wireless_tid = 0;
+    CHECK(grp.readU16(iap2::param::kWirelessCarPlayTransportIdentifier, wireless_tid));
+    CHECK_EQ(1U, wireless_tid);
+    CHECK(grp.findFirst(iap2::param::kWirelessCarPlayIsAvailable) != NULL);
+    CHECK(grp.findFirst(iap2::param::kWirelessCarPlayIsEnabled) != NULL);
 
     REQUIRE(root.readGroup(iap2::param::kIdentVehicleInformationComponent, grp, &err));
+    CHECK_EQ(6U, iap2::param::kVehicleInfoDisplayName);
     CHECK(grp.readString(iap2::param::kVehicleInfoDisplayName, s) && s == "BMW 1 Series");
 
     // Invalid BT MAC rejected.
@@ -510,10 +533,20 @@ TEST_CASE(fullLoopbackDetectSyncIdentAuthWifiConfig) {
     REQUIRE(listener.transport_ids.size() == 1U);
     CHECK_EQ(std::string("AA:BB:CC:DD:EE:FF"), listener.transport_ids[0].bluetooth_mac);
 
-    // StartPowerUpdates (0xAE00) -> sendPowerSourceUpdate (0xAE03)
-    dev.sendControlFrame(iap2::msg::kStartPowerUpdates);
+    // Accessory sends StartPowerUpdates (0xAE00) -> Device sends PowerUpdate (0xAE01) -> sendPowerSourceUpdate (0xAE03)
+    REQUIRE(session.sendStartPowerUpdates());
     dev.flushToAccessory(session, sink);
     CHECK(session.powerUpdatesActive());
+    REQUIRE(dev.received_frames.size() == 1U);
+    CHECK_EQ(iap2::msg::kStartPowerUpdates, dev.received_frames[0].message_id);
+    dev.received_frames.clear();
+
+    iap2::ParameterList pwr_upd;
+    pwr_upd.addU16(4, 1000U);
+    dev.sendControlFrame(iap2::msg::kPowerUpdate, pwr_upd);
+    dev.flushToAccessory(session, sink);
+    CHECK_EQ(1U, listener.power_update_frames.size());
+
     REQUIRE(session.sendPowerSourceUpdate(2400U, true, true));
     dev.flushToAccessory(session, sink);
     REQUIRE(dev.received_frames.size() == 1U);
@@ -712,7 +745,7 @@ TEST_CASE(failurePathsAuthIdentRejectTimeoutAndReset) {
         dev.flushToAccessory(session, sink);
 
         iap2::ParameterList rej;
-        rej.addU16(iap2::param::kIdentRejectedParamId, iap2::param::kIdentSerialNumber);
+        rej.addVoid(iap2::param::kIdentSerialNumber);
         dev.sendControlFrame(iap2::msg::kIdentificationRejected, rej);
         dev.flushToAccessory(session, sink);
         CHECK_EQ(iap2::kSessionFailed, session.state());
@@ -808,6 +841,61 @@ TEST_CASE(failurePathsAuthIdentRejectTimeoutAndReset) {
         dev.sendRst();
         dev.flushToAccessory(session, sink);
         CHECK_EQ(iap2::kSessionFailed, session.state());
+    }
+
+    // 7. 0x1D03 retry omits unsupported messages once; refuses second rejection or auth msg rejection.
+    {
+        WireSink sink;
+        FakeAuthProvider auth;
+        RecordingSessionListener listener;
+        iap2::SessionConfig cfg;
+        cfg.identification = makeFullIdentConfig();
+        iap2::Session session(sink, auth, listener, cfg);
+        FakeDevice dev;
+        session.start();
+        dev.consumeFromAccessory(sink);
+        dev.sendDetect();
+        dev.flushToAccessory(session, sink);
+        dev.sendSynAck();
+        dev.flushToAccessory(session, sink);
+
+        dev.sendControlFrame(iap2::msg::kStartIdentification);
+        dev.flushToAccessory(session, sink);
+        REQUIRE(dev.received_frames.size() == 1U);
+        dev.received_frames.clear();
+
+        // Reject CarPlay 0x4301 (sent) and 0x4300 (received) -> retry omitting them.
+        iap2::ParameterList rej;
+        std::vector<uint16_t> unsup_sent(1, iap2::msg::kCarPlayStartSession);
+        std::vector<uint16_t> unsup_recv(1, iap2::msg::kCarPlayAvailability);
+        rej.addU16List(iap2::param::kIdentMessagesSentByAccessory, unsup_sent);
+        rej.addU16List(iap2::param::kIdentMessagesReceivedFromDevice, unsup_recv);
+        dev.sendControlFrame(iap2::msg::kIdentificationRejected, rej);
+        dev.flushToAccessory(session, sink);
+
+        CHECK_EQ(iap2::kSessionIdentifying, session.state());
+        REQUIRE(listener.ident_retries.size() == 1U);
+        CHECK_EQ(2U, listener.ident_retries[0].size());
+        REQUIRE(dev.received_frames.size() == 1U);
+        CHECK_EQ(iap2::msg::kIdentificationInformation, dev.received_frames[0].message_id);
+
+        iap2::ParameterList retried;
+        REQUIRE(iap2::ParameterList::decode(dev.received_frames[0].payload, retried));
+        std::vector<uint16_t> sent_list;
+        std::vector<uint16_t> recv_list;
+        CHECK(retried.readU16List(iap2::param::kIdentMessagesSentByAccessory, sent_list));
+        CHECK(retried.readU16List(iap2::param::kIdentMessagesReceivedFromDevice, recv_list));
+        CHECK_EQ(1U, sent_list.size());
+        CHECK_EQ(iap2::msg::kAccessoryWiFiConfiguration, sent_list[0]);
+        CHECK_EQ(1U, recv_list.size());
+        CHECK_EQ(iap2::msg::kRequestAccessoryWiFiConfiguration, recv_list[0]);
+        dev.received_frames.clear();
+
+        // Second rejection must fail rather than looping forever.
+        dev.sendControlFrame(iap2::msg::kIdentificationRejected, rej);
+        dev.flushToAccessory(session, sink);
+        CHECK_EQ(iap2::kSessionFailed, session.state());
+        CHECK_EQ(1U, listener.ident_rejections.size());
     }
 }
 
