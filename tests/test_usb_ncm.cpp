@@ -601,4 +601,206 @@ TEST_CASE(ntb16MalformedRejection) {
     CHECK(!ncm::parseNtb16(&bad[0], bad.size(), opts, out, &err));
 }
 
+TEST_CASE(diplayCarPlayVsIos17NonCarPlaySelection) {
+    // Config 1: PTP + USBMUX (should be rejected / score 0)
+    std::vector<uint8_t> body_ptp;
+    appendIface(body_ptp, 0U, 0U, 2U, 0x06U, 0x01U, 0x01U);
+    appendEndpoint(body_ptp, 0x81U, usb::kEpTypeBulk, 512U);
+    appendEndpoint(body_ptp, 0x02U, usb::kEpTypeBulk, 512U);
+    appendIface(body_ptp, 1U, 0U, 2U, usb::kAppleUsbmuxClass, usb::kAppleUsbmuxSubClass,
+                usb::kAppleUsbmuxProtocol);
+    appendEndpoint(body_ptp, 0x85U, usb::kEpTypeBulk, 512U);
+    appendEndpoint(body_ptp, 0x04U, usb::kEpTypeBulk, 512U);
+    const std::vector<uint8_t> cfg_ptp = wrapConfig(1U, 2U, body_ptp);
+
+    // Config 5: iOS 17+/26 non-CarPlay USBMUX + NCM (NO Apple Ethernet ff/fd/01)
+    // Also place alt 2 BEFORE alt 1 on CDC-NCM data to verify alt==1 is preferred.
+    std::vector<uint8_t> body_ios17;
+    appendIface(body_ios17, 0U, 0U, 2U, usb::kAppleUsbmuxClass, usb::kAppleUsbmuxSubClass,
+                usb::kAppleUsbmuxProtocol);
+    appendEndpoint(body_ios17, 0x85U, usb::kEpTypeBulk, 512U);
+    appendEndpoint(body_ios17, 0x04U, usb::kEpTypeBulk, 512U);
+    appendIface(body_ios17, 1U, 0U, 1U, usb::kClassCommunications, usb::kSubClassCdcNcm, 0U);
+    appendCdcHeader(body_ios17, 0x0120U);
+    appendCdcUnion(body_ios17, 1U, 2U);
+    appendCdcNcm(body_ios17, 0x0100U, 0U);
+    appendEndpoint(body_ios17, 0x81U, usb::kEpTypeInterrupt, 16U, 9U);
+    appendIface(body_ios17, 2U, 0U, 0U, usb::kClassCdcData, 0U, usb::kProtocolCdcNcmData);
+    appendIface(body_ios17, 2U, 2U, 2U, usb::kClassCdcData, 0U, usb::kProtocolCdcNcmData);
+    appendEndpoint(body_ios17, 0x86U, usb::kEpTypeBulk, 512U);
+    appendEndpoint(body_ios17, 0x06U, usb::kEpTypeBulk, 512U);
+    appendIface(body_ios17, 2U, 1U, 2U, usb::kClassCdcData, 0U, usb::kProtocolCdcNcmData);
+    appendEndpoint(body_ios17, 0x82U, usb::kEpTypeBulk, 512U);
+    appendEndpoint(body_ios17, 0x02U, usb::kEpTypeBulk, 512U);
+    const std::vector<uint8_t> cfg_ios17 = wrapConfig(5U, 3U, body_ios17);
+
+    // 1a. PTP-only config is ignored
+    {
+        std::vector<usb::ConfigurationDescriptor> only_ptp(1U);
+        REQUIRE(usb::parseConfigurationDescriptor(&cfg_ptp[0], cfg_ptp.size(), only_ptp[0]));
+        const usb::CarPlayUsbSelection sel = usb::selectCarPlayInterfaces(only_ptp);
+        CHECK(!sel.found_config);
+    }
+
+    // 1b. iOS 17+ USBMUX+NCM without Apple Ethernet -> found, is_carplay_mode==false, alt==1
+    {
+        std::vector<usb::ConfigurationDescriptor> cfgs(2U);
+        REQUIRE(usb::parseConfigurationDescriptor(&cfg_ptp[0], cfg_ptp.size(), cfgs[0]));
+        REQUIRE(usb::parseConfigurationDescriptor(&cfg_ios17[0], cfg_ios17.size(), cfgs[1]));
+        const usb::CarPlayUsbSelection sel = usb::selectCarPlayInterfaces(cfgs);
+        CHECK(sel.found_config);
+        CHECK_EQ(5U, sel.configuration_value);
+        CHECK(sel.has_usbmux);
+        CHECK(sel.usbmux.found);
+        CHECK_EQ(0x04U, sel.usbmux.bulk_out_ep);
+        CHECK_EQ(0x85U, sel.usbmux.bulk_in_ep);
+        CHECK(sel.ncm.found);
+        CHECK_EQ(1U, sel.ncm.data_alt_setting);
+        CHECK_EQ(0x82U, sel.ncm.bulk_in_ep);
+        CHECK_EQ(0x02U, sel.ncm.bulk_out_ep);
+        CHECK(!sel.has_apple_ethernet);
+        CHECK(!sel.is_carplay_mode);
+    }
+
+    // Config 6: full CarPlay mode with USBMUX (fallback EPs 0x83/0x03) + NCM + Apple Ethernet (ff/fd/01)
+    std::vector<uint8_t> body_cp;
+    appendIface(body_cp, 0U, 0U, 2U, usb::kAppleUsbmuxClass, usb::kAppleUsbmuxSubClass,
+                usb::kAppleUsbmuxProtocol);
+    appendEndpoint(body_cp, 0x83U, usb::kEpTypeBulk, 512U);
+    appendEndpoint(body_cp, 0x03U, usb::kEpTypeBulk, 512U);
+    appendIface(body_cp, 1U, 0U, 1U, usb::kClassCommunications, usb::kSubClassCdcNcm, 0U);
+    appendCdcHeader(body_cp, 0x0120U);
+    appendCdcUnion(body_cp, 1U, 2U);
+    appendCdcNcm(body_cp, 0x0100U, 0U);
+    appendEndpoint(body_cp, 0x81U, usb::kEpTypeInterrupt, 16U, 9U);
+    appendIface(body_cp, 2U, 0U, 0U, usb::kClassCdcData, 0U, usb::kProtocolCdcNcmData);
+    appendIface(body_cp, 2U, 1U, 2U, usb::kClassCdcData, 0U, usb::kProtocolCdcNcmData);
+    appendEndpoint(body_cp, 0x84U, usb::kEpTypeBulk, 512U);
+    appendEndpoint(body_cp, 0x04U, usb::kEpTypeBulk, 512U);
+    appendIface(body_cp, 3U, 0U, 0U, usb::kAppleEthernetClass, usb::kAppleEthernetSubClass,
+                usb::kAppleEthernetProtocol);
+    const std::vector<uint8_t> cfg_cp = wrapConfig(6U, 4U, body_cp);
+
+    std::vector<usb::ConfigurationDescriptor> all_cfgs(3U);
+    REQUIRE(usb::parseConfigurationDescriptor(&cfg_ptp[0], cfg_ptp.size(), all_cfgs[0]));
+    REQUIRE(usb::parseConfigurationDescriptor(&cfg_ios17[0], cfg_ios17.size(), all_cfgs[1]));
+    REQUIRE(usb::parseConfigurationDescriptor(&cfg_cp[0], cfg_cp.size(), all_cfgs[2]));
+    const usb::CarPlayUsbSelection sel = usb::selectCarPlayInterfaces(all_cfgs);
+    CHECK(sel.found_config);
+    CHECK_EQ(6U, sel.configuration_value);
+    CHECK(sel.has_usbmux);
+    CHECK_EQ(0x83U, sel.usbmux.bulk_in_ep);
+    CHECK_EQ(0x03U, sel.usbmux.bulk_out_ep);
+    CHECK(sel.has_apple_ethernet);
+    CHECK(sel.is_carplay_mode);
+}
+
+TEST_CASE(ntb16OverlapAndMaxDatagramsCap) {
+    // 1. Overlapping datagrams exceeding wBlockLength budget must be rejected
+    std::vector<uint8_t> overlap(64U, 0U);
+    overlap[0] = 'N'; overlap[1] = 'C'; overlap[2] = 'M'; overlap[3] = 'H';
+    overlap[4] = 12U; overlap[5] = 0U;   // wHeaderLength
+    overlap[6] = 1U;  overlap[7] = 0U;   // wSequence
+    overlap[8] = 64U; overlap[9] = 0U;   // wBlockLength
+    overlap[10] = 12U; overlap[11] = 0U; // wNdpIndex
+
+    // NDP16 with 2 entries (20 bytes @ 12..32), both pointing to [32..62)
+    overlap[12] = 'N'; overlap[13] = 'C'; overlap[14] = 'M'; overlap[15] = '0';
+    overlap[16] = 20U; overlap[17] = 0U;
+    overlap[18] = 0U;  overlap[19] = 0U;
+    overlap[20] = 32U; overlap[21] = 0U;
+    overlap[22] = 30U; overlap[23] = 0U;
+    overlap[24] = 32U; overlap[25] = 0U;
+    overlap[26] = 30U; overlap[27] = 0U;
+
+    ncm::Ntb16Frame parsed;
+    std::string err;
+    CHECK(!ncm::parseNtb16(&overlap[0], overlap.size(), ncm::NtbParseOptions(), parsed, &err));
+
+    // 2. max_datagrams cap enforced
+    std::vector<std::vector<uint8_t> > frames;
+    frames.push_back(makeSampleEthernetFrame(1U, 32U));
+    frames.push_back(makeSampleEthernetFrame(2U, 32U));
+    frames.push_back(makeSampleEthernetFrame(3U, 32U));
+    std::vector<uint8_t> ntb;
+    REQUIRE(ncm::buildNtb16(frames, 9U, ncm::NtbBuildOptions(), ntb, &err));
+
+    ncm::NtbParseOptions capped;
+    capped.max_datagrams = 2U;
+    CHECK(!ncm::parseNtb16(&ntb[0], ntb.size(), capped, parsed, &err));
+    capped.max_datagrams = 3U;
+    REQUIRE(ncm::parseNtb16(&ntb[0], ntb.size(), capped, parsed, &err));
+    CHECK_EQ(3U, parsed.datagrams.size());
+}
+
+TEST_CASE(ntb16StreamDecoderSplitCoalescedPadAndResync) {
+    ncm::Ntb16StreamDecoder decoder(ncm::NtbParseOptions(), 512U);
+    std::vector<ncm::Ntb16Frame> out;
+    ncm::NtbStreamStats delta;
+
+    // 1. Build two NTBs and feed split + coalesced chunks
+    std::vector<std::vector<uint8_t> > f1(1U, makeSampleEthernetFrame(0x11U, 60U));
+    std::vector<std::vector<uint8_t> > f2(1U, makeSampleEthernetFrame(0x22U, 80U));
+    std::vector<uint8_t> ntb1, ntb2;
+    REQUIRE(ncm::buildNtb16(f1, 1U, ncm::NtbBuildOptions(), ntb1));
+    REQUIRE(ncm::buildNtb16(f2, 2U, ncm::NtbBuildOptions(), ntb2));
+
+    std::vector<uint8_t> combined = ntb1;
+    combined.insert(combined.end(), ntb2.begin(), ntb2.end());
+
+    // Split across 3 chunks: [0..10), [10..ntb1.size()+5), [rest)
+    decoder.push(&combined[0], 10U, out, &delta);
+    CHECK_EQ(0U, out.size());
+    decoder.push(&combined[10], ntb1.size() - 5U, out, &delta);
+    REQUIRE(out.size() == 1U);
+    CHECK_EQ(1U, out[0].sequence);
+    decoder.push(&combined[ntb1.size() + 5U], combined.size() - (ntb1.size() + 5U), out, &delta);
+    REQUIRE(out.size() == 2U);
+    CHECK_EQ(2U, out[1].sequence);
+    CHECK_EQ(0U, decoder.stats().parse_errors);
+
+    // 2. Packet-aligned (512B) NTB followed by 1-byte 0x00 short-packet pad across read boundary
+    out.clear();
+    std::vector<std::vector<uint8_t> > f_exact(1U, makeSampleEthernetFrame(0x33U, 466U));
+    ncm::NtbBuildOptions exact_opts;
+    exact_opts.ndp_alignment = 4U;
+    exact_opts.ndp_divisor = 4U;
+    std::vector<uint8_t> aligned_ntb;
+    REQUIRE(ncm::buildNtb16(f_exact, 3U, exact_opts, aligned_ntb));
+    if (aligned_ntb.size() < 512U) {
+        const size_t diff = 512U - aligned_ntb.size();
+        aligned_ntb.resize(512U, 0U);
+        aligned_ntb[8] = static_cast<uint8_t>(512U & 0xffU);
+        aligned_ntb[9] = static_cast<uint8_t>((512U >> 8) & 0xffU);
+        (void)diff;
+    }
+    REQUIRE(aligned_ntb.size() == 512U);
+
+    decoder.push(&aligned_ntb[0], aligned_ntb.size(), out, &delta);
+    REQUIRE(out.size() == 1U);
+    const uint8_t pad = 0x00U;
+    decoder.push(&pad, 1U, out, &delta);
+    decoder.push(&ntb1[0], ntb1.size(), out, &delta);
+    REQUIRE(out.size() == 2U);
+    CHECK_EQ(0U, decoder.stats().parse_errors);
+
+    // 3. Packet-aligned NTB followed directly by 'N' (ZLP instead of 0x00 pad)
+    out.clear();
+    decoder.push(&aligned_ntb[0], aligned_ntb.size(), out, &delta);
+    decoder.push(&ntb2[0], ntb2.size(), out, &delta);
+    REQUIRE(out.size() == 2U);
+    CHECK_EQ(0U, decoder.stats().parse_errors);
+
+    // 4. Garbage prefix triggers bounded resync and recovers the trailing valid NTB
+    out.clear();
+    std::vector<uint8_t> dirty(24U, 0xaaU);
+    dirty.insert(dirty.end(), ntb1.begin(), ntb1.end());
+    decoder.push(&dirty[0], dirty.size(), out, &delta);
+    REQUIRE(out.size() == 1U);
+    CHECK_EQ(1U, delta.parse_errors);
+    CHECK_EQ(1U, delta.resyncs);
+    CHECK_EQ(24U, delta.resync_bytes_skipped);
+    CHECK_BYTES_EQ(f1[0], out[0].datagrams[0]);
+}
+
 int main() { return test_support::runAll("test_usb_ncm"); }

@@ -2,11 +2,16 @@
 #define CARPLAY_USB_DESCRIPTORS_HPP
 
 // Pure USB 2.0, Interface Association, CDC / CDC-NCM 1.0 descriptor parser and
-// CarPlay interface selector (iAP2 bulk + CDC-NCM control/data).
+// CarPlay interface selector (iAP2 bulk / USBMUX + CDC-NCM control/data).
 //
 // Standard USB 2.0 / CDC 1.2 / CDC-NCM 1.0 descriptor layouts and constants are from
-// the public USB-IF specifications. Apple vendor-specific interface codes are marked
-// "unverified" until validated against a live iPhone USB descriptor dump.
+// the public USB-IF specifications. Verified Apple CarPlay / USBMUX / NCM discovery constants
+// and selection rules are derived in part from DiPlay-main:
+//   shared/src/main/java/com/shilapi/xcertplay/transport/IphoneCarPlayConfiguration.kt
+//   shared/src/main/java/com/shilapi/xcertplay/transport/NcmFunctionDiscovery.kt
+// GPL-3.0, Copyright (c) DiPlay contributors.
+// Apple bulk iAP2 interface codes (0xff/0xf0/0x00) remain marked "unverified" until validated
+// against a live iPhone USB descriptor dump.
 
 #include <stddef.h>
 #include <stdint.h>
@@ -17,7 +22,7 @@
 namespace carplay {
 namespace usb {
 
-// Standard USB 2.0 descriptor types (USB 2.0 Table 9-5).
+// Standard USB 2.0 descriptor types (USB 2.0 Table 9-5; verified: USB 2.0 spec).
 static const uint8_t kDescTypeDevice = 0x01U;
 static const uint8_t kDescTypeConfiguration = 0x02U;
 static const uint8_t kDescTypeString = 0x03U;
@@ -27,12 +32,15 @@ static const uint8_t kDescTypeInterfaceAssociation = 0x0bU;
 static const uint8_t kDescTypeCsInterface = 0x24U;
 static const uint8_t kDescTypeCsEndpoint = 0x25U;
 
-// Standard USB class / CDC subclass codes (USB-IF CDC 1.2 / CDC-NCM 1.0).
-static const uint8_t kClassCommunications = 0x02U;
-static const uint8_t kSubClassCdcNcm = 0x0dU;
-static const uint8_t kClassCdcData = 0x0aU;
-static const uint8_t kProtocolCdcNcmData = 0x01U;
-static const uint8_t kClassVendorSpecific = 0xffU;
+// Standard USB class / CDC subclass codes (verified: USB-IF CDC 1.2 / CDC-NCM 1.0 &
+// DiPlay-main/shared/src/main/java/com/shilapi/xcertplay/transport/NcmFunctionDiscovery.kt).
+static const uint8_t kClassHub = 0x09U;             // verified: USB 2.0 hub class
+static const uint8_t kClassCommunications = 0x02U;  // verified: DiPlay NcmFunctionDiscovery.CONTROL_CLASS
+static const uint8_t kSubClassCdcNcm = 0x0dU;       // verified: DiPlay NcmFunctionDiscovery.CONTROL_SUBCLASS
+static const uint8_t kClassCdcData = 0x0aU;         // verified: DiPlay NcmFunctionDiscovery.DATA_CLASS
+static const uint8_t kProtocolCdcNcmData = 0x01U;   // verified: USB-IF CDC-NCM 1.0
+static const uint8_t kNcmDataAltSetting = 1U;       // verified: DiPlay NcmFunctionDiscovery.DATA_ALTERNATE_SETTING
+static const uint8_t kClassVendorSpecific = 0xffU;  // verified: USB 2.0 vendor-specific class
 
 // CDC Class-Specific Interface Functional Descriptor subtypes (bDescriptorType == 0x24).
 static const uint8_t kCdcSubtypeHeader = 0x00U;
@@ -55,15 +63,27 @@ static const uint8_t kEpTypeInterrupt = 0x03U;
 static const uint16_t kAppleVendorId = 0x05acU;
 
 // Apple USB interface class/subclass/protocol identifiers.
-static const uint8_t kAppleIap2Class = 0xffU;      // unverified: Apple vendor-specific iAP2 class
-static const uint8_t kAppleIap2SubClass = 0xf0U;   // unverified: Apple iAP2 USB bulk subclass
-static const uint8_t kAppleIap2Protocol = 0x00U;   // unverified: Apple iAP2 USB bulk protocol
-static const uint8_t kAppleUsbmuxClass = 0xffU;    // unverified: Apple usbmux class
-static const uint8_t kAppleUsbmuxSubClass = 0xfeU; // unverified: Apple usbmux subclass
-static const uint8_t kAppleUsbmuxProtocol = 0x02U; // unverified: Apple usbmux protocol
-static const uint8_t kAppleEapClass = 0xffU;       // unverified: Apple Ethernet/EAP class
-static const uint8_t kAppleEapSubClass = 0xfdU;    // unverified: Apple Ethernet/EAP subclass
-static const uint8_t kAppleEapProtocol = 0x01U;    // unverified: Apple Ethernet/EAP protocol
+static const uint8_t kAppleIap2Class = 0xffU;      // unverified: Apple vendor-specific bulk iAP2 class
+static const uint8_t kAppleIap2SubClass = 0xf0U;   // unverified: Apple bulk iAP2 subclass (DiPlay uses USBMUX TCP)
+static const uint8_t kAppleIap2Protocol = 0x00U;   // unverified: Apple bulk iAP2 protocol
+
+// verified: DiPlay-main/shared/src/main/java/com/shilapi/xcertplay/transport/IphoneCarPlayConfiguration.kt
+static const uint8_t kAppleUsbmuxClass = 0xffU;
+static const uint8_t kAppleUsbmuxSubClass = 0xfeU;
+static const uint8_t kAppleUsbmuxProtocol = 0x02U;
+static const uint8_t kPreferredUsbmuxOutEp = 0x04U;
+static const uint8_t kPreferredUsbmuxInEp = 0x85U;
+
+// verified: DiPlay-main/.../IphoneCarPlayConfiguration.kt & NcmFunctionDiscovery.kt
+// iOS 17+ / iOS 26 exposes USBMUX + NCM outside CarPlay mode too, but only CarPlay mode adds
+// the Apple Ethernet interface (0xff/0xfd/0x01).
+static const uint8_t kAppleEthernetClass = 0xffU;
+static const uint8_t kAppleEthernetSubClass = 0xfdU;
+static const uint8_t kAppleEthernetProtocol = 0x01U;
+static const uint8_t kAppleEapClass = kAppleEthernetClass;
+static const uint8_t kAppleEapSubClass = kAppleEthernetSubClass;
+static const uint8_t kAppleEapProtocol = kAppleEthernetProtocol;
+
 
 struct DeviceDescriptor {
     uint16_t bcd_usb;
@@ -296,19 +316,41 @@ struct NcmInterfaceSelection {
           ncm_capabilities(0) {}
 };
 
+struct UsbmuxInterfaceSelection {
+    bool found;
+    uint8_t interface_number;
+    uint8_t alternate_setting;
+    uint8_t bulk_in_ep;
+    uint16_t bulk_in_max_packet;
+    uint8_t bulk_out_ep;
+    uint16_t bulk_out_max_packet;
+
+    UsbmuxInterfaceSelection()
+        : found(false),
+          interface_number(0),
+          alternate_setting(0),
+          bulk_in_ep(0),
+          bulk_in_max_packet(0),
+          bulk_out_ep(0),
+          bulk_out_max_packet(0) {}
+};
+
 struct CarPlayUsbSelection {
     bool found_config;
     uint8_t configuration_value;
     Iap2InterfaceSelection iap2;
+    UsbmuxInterfaceSelection usbmux;
     NcmInterfaceSelection ncm;
     bool has_usbmux;
     bool has_apple_ethernet;
+    bool is_carplay_mode;  // verified: DiPlay IphoneCarPlayConfiguration.isCarPlayMode (has Apple Ethernet + NCM)
 
     CarPlayUsbSelection()
         : found_config(false),
           configuration_value(0),
           has_usbmux(false),
-          has_apple_ethernet(false) {}
+          has_apple_ethernet(false),
+          is_carplay_mode(false) {}
 };
 
 /// Parses an 18-byte USB Device Descriptor.
@@ -333,8 +375,10 @@ bool parseUsbfsDescriptors(const uint8_t* data,
                            std::vector<ConfigurationDescriptor>& configs_out,
                            std::string* error_out = NULL);
 
-/// Selects the best configuration carrying Apple iAP2 and/or CDC-NCM interfaces.
-/// Priority: (iAP2 + CDC-NCM) > (iAP2 only) > (CDC-NCM only).
+/// Selects the best configuration carrying Apple CarPlay (USBMUX/iAP2 + CDC-NCM + Apple Ethernet)
+/// or fallback iAP2 / CDC-NCM interfaces.
+/// Priority: (USBMUX + CDC-NCM + Apple Ethernet [+ iAP2]) > (iAP2 + CDC-NCM) >
+///           (USBMUX + CDC-NCM) > (iAP2 only) > (CDC-NCM only).
 CarPlayUsbSelection selectCarPlayInterfaces(
     const std::vector<ConfigurationDescriptor>& configs,
     const Iap2SelectionCriteria& criteria = Iap2SelectionCriteria());

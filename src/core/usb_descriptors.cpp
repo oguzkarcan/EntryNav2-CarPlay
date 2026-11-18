@@ -1,3 +1,8 @@
+// Derived in part from DiPlay-main:
+//   shared/src/main/java/com/shilapi/xcertplay/transport/IphoneCarPlayConfiguration.kt
+//   shared/src/main/java/com/shilapi/xcertplay/transport/NcmFunctionDiscovery.kt
+// GPL-3.0, Copyright (c) DiPlay contributors.
+
 #include "carplay/usb_descriptors.hpp"
 
 #include <sstream>
@@ -75,10 +80,74 @@ Iap2InterfaceSelection findIap2InConfig(const ConfigurationDescriptor& cfg,
     return best;
 }
 
+// verified: DiPlay-main/.../IphoneCarPlayConfiguration.kt (usbMuxInterface / usbMuxEndpoints)
+UsbmuxInterfaceSelection findUsbmuxInConfig(const ConfigurationDescriptor& cfg) {
+    UsbmuxInterfaceSelection best;
+    int best_rank = -1;
+    for (size_t i = 0; i < cfg.interfaces.size(); ++i) {
+        const InterfaceDescriptor& iface = cfg.interfaces[i];
+        if (iface.interface_class != kAppleUsbmuxClass ||
+            iface.interface_subclass != kAppleUsbmuxSubClass ||
+            iface.interface_protocol != kAppleUsbmuxProtocol) {
+            continue;
+        }
+
+        const EndpointDescriptor* pref_out = NULL;
+        const EndpointDescriptor* unique_out = NULL;
+        size_t out_count = 0U;
+        const EndpointDescriptor* pref_in = NULL;
+        const EndpointDescriptor* unique_in = NULL;
+        size_t in_count = 0U;
+
+        for (size_t e = 0; e < iface.endpoints.size(); ++e) {
+            const EndpointDescriptor& ep = iface.endpoints[e];
+            if (!ep.isBulk()) {
+                continue;
+            }
+            if (ep.isOut()) {
+                ++out_count;
+                unique_out = &ep;
+                if (ep.address == kPreferredUsbmuxOutEp && pref_out == NULL) {
+                    pref_out = &ep;
+                }
+            } else if (ep.isIn()) {
+                ++in_count;
+                unique_in = &ep;
+                if (ep.address == kPreferredUsbmuxInEp && pref_in == NULL) {
+                    pref_in = &ep;
+                }
+            }
+        }
+
+        const EndpointDescriptor* chosen_out =
+            (pref_out != NULL) ? pref_out : (out_count == 1U ? unique_out : NULL);
+        const EndpointDescriptor* chosen_in =
+            (pref_in != NULL) ? pref_in : (in_count == 1U ? unique_in : NULL);
+        if (chosen_out == NULL || chosen_in == NULL) {
+            continue;
+        }
+
+        const int rank = (pref_out != NULL && pref_in != NULL ? 2 : 0) +
+                         (iface.alternate_setting == 0 ? 1 : 0);
+        if (rank > best_rank) {
+            best_rank = rank;
+            best.found = true;
+            best.interface_number = iface.number;
+            best.alternate_setting = iface.alternate_setting;
+            best.bulk_in_ep = chosen_in->address;
+            best.bulk_in_max_packet = chosen_in->packetSize();
+            best.bulk_out_ep = chosen_out->address;
+            best.bulk_out_max_packet = chosen_out->packetSize();
+        }
+    }
+    return best;
+}
+
 bool pickDataAltSetting(const ConfigurationDescriptor& cfg,
                         uint8_t data_iface_num,
                         NcmInterfaceSelection& out) {
     const InterfaceDescriptor* best_active = NULL;
+    int best_alt_rank = -1;
     bool found_idle = false;
     uint8_t idle_alt = 0;
 
@@ -93,11 +162,15 @@ bool pickDataAltSetting(const ConfigurationDescriptor& cfg,
         const EndpointDescriptor* bulk_in = iface.findBulkIn();
         const EndpointDescriptor* bulk_out = iface.findBulkOut();
         if (bulk_in != NULL && bulk_out != NULL) {
-            // CDC-NCM spec uses alt 0 as zero-bandwidth and alt >= 1 as active, though
-            // tolerate devices that put bulk endpoints on alt 0 when no higher alt exists.
-            if (best_active == NULL ||
-                (best_active->alternate_setting == 0 && iface.alternate_setting > 0)) {
+            // verified: DiPlay NcmFunctionDiscovery.kt prefers DATA_ALTERNATE_SETTING (1),
+            // tolerating other active alt settings (or alt 0 when no higher alt exists).
+            const int alt_rank =
+                (iface.alternate_setting == kNcmDataAltSetting)
+                    ? 2
+                    : (iface.alternate_setting > 0U ? 1 : 0);
+            if (best_active == NULL || alt_rank > best_alt_rank) {
                 best_active = &iface;
+                best_alt_rank = alt_rank;
             }
         } else if (iface.endpoints.empty() || (bulk_in == NULL && bulk_out == NULL)) {
             if (!found_idle || iface.alternate_setting == 0) {
@@ -460,10 +533,35 @@ CarPlayUsbSelection selectCarPlayInterfaces(const std::vector<ConfigurationDescr
     for (size_t i = 0; i < configs.size(); ++i) {
         const ConfigurationDescriptor& cfg = configs[i];
         const Iap2InterfaceSelection iap2 = findIap2InConfig(cfg, criteria);
+        const UsbmuxInterfaceSelection usbmux = findUsbmuxInConfig(cfg);
         const NcmInterfaceSelection ncm = findNcmInConfig(cfg);
 
+        bool has_usbmux = usbmux.found;
+        bool has_apple_ethernet = false;
+        for (size_t k = 0; k < cfg.interfaces.size(); ++k) {
+            const InterfaceDescriptor& iface = cfg.interfaces[k];
+            if (iface.interface_class == kAppleUsbmuxClass &&
+                iface.interface_subclass == kAppleUsbmuxSubClass &&
+                iface.interface_protocol == kAppleUsbmuxProtocol) {
+                has_usbmux = true;
+            }
+            if (iface.interface_class == kAppleEthernetClass &&
+                iface.interface_subclass == kAppleEthernetSubClass &&
+                iface.interface_protocol == kAppleEthernetProtocol) {
+                has_apple_ethernet = true;
+            }
+        }
+
+        // verified: DiPlay IphoneCarPlayConfiguration.kt — CarPlay mode adds Apple Ethernet (ff/fd/01)
+        // alongside USBMUX + CDC-NCM. Plain PTP + USBMUX (no NCM and no iAP2) must score 0.
         int score = 0;
-        if (iap2.found && ncm.found) {
+        if (has_usbmux && ncm.found && has_apple_ethernet && iap2.found) {
+            score = 6;
+        } else if ((has_usbmux || iap2.found) && ncm.found && has_apple_ethernet) {
+            score = 5;
+        } else if (iap2.found && ncm.found) {
+            score = 4;
+        } else if (has_usbmux && ncm.found) {
             score = 3;
         } else if (iap2.found) {
             score = 2;
@@ -477,20 +575,11 @@ CarPlayUsbSelection selectCarPlayInterfaces(const std::vector<ConfigurationDescr
             best.found_config = true;
             best.configuration_value = cfg.configuration_value;
             best.iap2 = iap2;
+            best.usbmux = usbmux;
             best.ncm = ncm;
-            for (size_t k = 0; k < cfg.interfaces.size(); ++k) {
-                const InterfaceDescriptor& iface = cfg.interfaces[k];
-                if (iface.interface_class == kAppleUsbmuxClass &&
-                    iface.interface_subclass == kAppleUsbmuxSubClass &&
-                    iface.interface_protocol == kAppleUsbmuxProtocol) {
-                    best.has_usbmux = true;
-                }
-                if (iface.interface_class == kAppleEapClass &&
-                    iface.interface_subclass == kAppleEapSubClass &&
-                    iface.interface_protocol == kAppleEapProtocol) {
-                    best.has_apple_ethernet = true;
-                }
-            }
+            best.has_usbmux = has_usbmux;
+            best.has_apple_ethernet = has_apple_ethernet;
+            best.is_carplay_mode = ((has_usbmux || iap2.found) && ncm.found && has_apple_ethernet);
         }
     }
 
