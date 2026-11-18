@@ -139,8 +139,9 @@ std::string formatUuid128(const Uuid128& uuid) {
 }
 
 Uuid128 defaultIap2AccessoryUuid128() {
-    // UNVERIFIED: commonly cited Apple MFi iAP2 accessory RFCOMM UUID
-    // (00000000-deca-fade-deca-deafdecacafe).
+    // verified: EntryNav2-Android-Auto-0.12.0/platform/spp_baseline.hpp,
+    // tests/fixtures/spp-bmw-uuids.txt (CarPlay slot 1 local SDP record UUID),
+    // and DiPlay-main/.../CarPlayController.kt:3239 (IAP2_IPHONE_UUID).
     static const uint8_t kRaw[16] = {
         0x00, 0x00, 0x00, 0x00,
         0xde, 0xca, 0xfa, 0xde,
@@ -151,8 +152,8 @@ Uuid128 defaultIap2AccessoryUuid128() {
 }
 
 Uuid128 defaultAppleIapDeviceUuid128() {
-    // UNVERIFIED: commonly cited iOS device iAP/iAP2 UUID
-    // (00000000-deca-fade-deca-deafdecacaff).
+    // verified: EntryNav2-Android-Auto-0.12.0/platform/spp_baseline.hpp and
+    // tests/fixtures/spp-bmw-uuids.txt (CarPlay slot 1 initiator UUID).
     static const uint8_t kRaw[16] = {
         0x00, 0x00, 0x00, 0x00,
         0xde, 0xca, 0xfa, 0xde,

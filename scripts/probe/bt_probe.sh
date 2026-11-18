@@ -85,10 +85,28 @@ for dir in /var/run /run /tmp; do
     fi
 done
 
-section "Libraries matching *blue* or *bt* in /lib /usr/lib /usr/local/lib /opt"
+section "Libraries matching *blue*, *bt*, *alps*, or libdbus in /lib /usr/lib /usr/local/lib /opt"
 for dir in /lib /usr/lib /usr/local/lib /opt; do
     if [ -d "$dir" ]; then
-        find "$dir" \( -name '*blue*' -o -name '*bt*' \) 2>/dev/null | sort || true
+        find "$dir" \( -name '*blue*' -o -name '*bt*' -o -name '*alps*' -o -name 'libdbus-1*' \) 2>/dev/null | sort || true
+    fi
+done
+
+section "ALPS Evolution library, config & /proc/*/maps (read-only)"
+ls -la /usr/local/lib/alps /usr/local/lib/alps/evolution \
+    /opt/app/usr/BTMedia/evolution/stack/lib/libevo_btappl.so \
+    /opt/app/usr/BTMedia/evolution/stack/etc/evo_config.xml 2>/dev/null || printf '(ALPS paths not found)\n'
+if [ -r /opt/app/usr/BTMedia/evolution/stack/etc/evo_config.xml ]; then
+    grep -iE 'spp|uuid|6203|instance|carplay' /opt/app/usr/BTMedia/evolution/stack/etc/evo_config.xml 2>/dev/null | head -n 40 || true
+fi
+for map in /proc/[0-9]*/maps; do
+    [ -r "$map" ] || continue
+    if grep -q 'libevo_btappl\.so' "$map" 2>/dev/null; then
+        pid=${map#/proc/}
+        pid=${pid%/maps}
+        comm=$(cat "/proc/$pid/comm" 2>/dev/null || printf '?')
+        printf 'pid=%s comm=%s:\n' "$pid" "$comm"
+        grep 'libevo_btappl\.so' "$map" 2>/dev/null | head -n 5 || true
     fi
 done
 
@@ -103,6 +121,9 @@ done
 if command -v dbus-send >/dev/null 2>&1; then
     dbus-send --system --print-reply --dest=org.freedesktop.DBus \
         /org/freedesktop/DBus org.freedesktop.DBus.ListNames 2>/dev/null || printf 'dbus-send ListNames failed\n'
+    dbus-send --system --print-reply --dest=org.alps.evolution \
+        /org/alps/evolution/hli org.freedesktop.DBus.Introspectable.Introspect 2>/dev/null | head -n 80 || \
+        printf 'org.alps.evolution Introspect unavailable\n'
 else
     printf 'dbus-send: not installed\n'
 fi

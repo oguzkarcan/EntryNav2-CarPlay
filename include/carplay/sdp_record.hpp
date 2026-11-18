@@ -13,11 +13,11 @@
 //     PublicBrowseRoot (0x1002), SerialPort (0x1101).
 //   * BlueZ 4 local sdpd UNIX socket registration PDUs (0x81..0x86 on /var/run/sdp).
 //
-// NOTE on iAP2 Bluetooth service UUID:
-//   Apple's MFi / iAP2 specification is behind Apple NDA and no Bluetooth SDP
-//   capture from the target BMW EntryNav2 head unit or an iPhone is in the
-//   repository yet. The default 128-bit UUID below is marked UNVERIFIED and is
-//   overridable via Iap2SdpConfig::service_uuid.
+// NOTE on iAP2 Bluetooth service UUIDs:
+//   verified: EntryNav2-Android-Auto-0.12.0/platform/spp_baseline.hpp and
+//   tests/fixtures/spp-bmw-uuids.txt (observed BMW HU_ENTRYNAV2 CarPlay slot 1),
+//   and DiPlay-main/.../CarPlayController.kt:3239 (IAP2_IPHONE_UUID). Overridable
+//   via Iap2SdpConfig::service_uuid.
 
 #include <stddef.h>
 #include <stdint.h>
@@ -79,14 +79,14 @@ bool parseUuid128(const std::string& text, Uuid128& out);
 /// Formats as lowercase hyphenated canonical UUID string.
 std::string formatUuid128(const Uuid128& uuid);
 
-/// UNVERIFIED: commonly cited Apple MFi iAP2 accessory RFCOMM service class UUID
-/// (00000000-deca-fade-deca-deafdecacafe). Needs verification against live
-/// head-unit / iPhone SDP capture (see docs/BLUETOOTH.md).
+/// verified: EntryNav2-Android-Auto-0.12.0/platform/spp_baseline.hpp,
+/// tests/fixtures/spp-bmw-uuids.txt, and DiPlay-main/.../CarPlayController.kt:3239
+/// (00000000-deca-fade-deca-deafdecacafe: local iAP2 SDP record UUID).
 Uuid128 defaultIap2AccessoryUuid128();
 
-/// UNVERIFIED: commonly cited iOS device iAP/iAP2 service class UUID
-/// (00000000-deca-fade-deca-deafdecacaff). Needs verification against live
-/// iPhone SDP capture (see docs/BLUETOOTH.md).
+/// verified: EntryNav2-Android-Auto-0.12.0/platform/spp_baseline.hpp and
+/// tests/fixtures/spp-bmw-uuids.txt
+/// (00000000-deca-fade-deca-deafdecacaff: iOS initiator iAP/iAP2 UUID).
 Uuid128 defaultAppleIapDeviceUuid128();
 
 // ------------------------------------------------------------------------------------------------
@@ -140,7 +140,7 @@ private:
 struct Iap2SdpConfig {
     /// RFCOMM server channel (must be in 1..30).
     uint8_t rfcomm_channel;
-    /// Primary 128-bit ServiceClassIDList UUID (defaults to UNVERIFIED iAP2 accessory UUID).
+    /// Primary 128-bit ServiceClassIDList UUID (defaults to verified iAP2 accessory UUID).
     Uuid128 service_uuid;
     /// Optional additional 16-bit service class UUIDs appended after `service_uuid`
     /// (e.g. uuid16::kSerialPort if testing SPP fallback).
