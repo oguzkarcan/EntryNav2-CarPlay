@@ -118,3 +118,14 @@ Thanks to the dlopen policy, the sysroot is **not needed to build**. It is only 
 - **Never commit** the sysroot, the tarball, or any file taken from it (`*.so`, `*.so.*`, `*.ko`, headers, firmware) — not even temporarily, not in a branch. `no-proprietary-files` fails the build if one appears; if it ever happens, the file must also be removed from history.
 - **Never upload** it anywhere: not to CI (no artifacts, no caches, no secrets, no download URLs), not to issues, releases or any file host.
 - **Never extract it on NTFS** or inside the repository directory.
+
+## 7. Verifying runtime `dlopen()` / `dlsym()` against a sysroot
+
+`scripts/ci/check_sysroot_symbols.sh` verifies that every runtime-resolved soname and symbol in C++ sources matches `scripts/ci/sysroot_symbols.txt`, and (when `SYSROOT` exists) confirms each soname resolves inside the sysroot and exports the expected symbols. See [docs/SYSROOT_CHECK.md](SYSROOT_CHECK.md) for the manifest format and current findings.
+
+```sh
+sh scripts/ci/check_sysroot_symbols.sh --sync-only             # source <-> manifest sync only
+SYSROOT=~/entrynav2/sysroot sh scripts/ci/check_sysroot_symbols.sh
+sh scripts/ci/check_sysroot_symbols.sh --self-test             # temporary compiler-built fake sysroot
+CHECK_SYSROOT=1 SYSROOT=~/entrynav2/sysroot sh scripts/ci/build_and_test.sh host
+```
