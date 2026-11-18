@@ -1,6 +1,10 @@
 #ifndef CARPLAY_RTSP_MESSAGE_HPP
 #define CARPLAY_RTSP_MESSAGE_HPP
 
+// Derived from DiPlay
+// (shared/src/main/java/com/shilapi/xcertplay/airplay/RtspMessage.kt),
+// GPL-3.0, Copyright (c) DiPlay contributors.
+//
 // RTSP/HTTP-style message framing for the CarPlay control channel (TCP :7000)
 // and the event channel. Port of DiPlay's RtspMessage.kt.
 //

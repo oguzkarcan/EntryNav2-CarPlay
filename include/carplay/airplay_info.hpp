@@ -1,6 +1,13 @@
 #ifndef CARPLAY_AIRPLAY_INFO_HPP
 #define CARPLAY_AIRPLAY_INFO_HPP
 
+// Derived from DiPlay
+// (shared/src/main/java/com/shilapi/xcertplay/airplay/AirPlayInfoPlist.kt,
+//  shared/src/main/java/com/shilapi/xcertplay/airplay/AirPlayDisplaySettings.kt,
+//  shared/src/main/java/com/shilapi/xcertplay/airplay/AirPlayConfig.kt,
+//  shared/src/main/java/com/shilapi/xcertplay/airplay/AirPlaySession.kt),
+// GPL-3.0, Copyright (c) DiPlay contributors.
+//
 // AirPlay / CarPlay receiver `/info` response builder (port of DiPlay AirPlayInfoPlist.kt) plus the
 // SETUP `enabledFeatures` negotiation (port of AirPlaySession.setupEnabledFeatures).
 //

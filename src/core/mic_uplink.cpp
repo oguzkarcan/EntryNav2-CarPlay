@@ -1,3 +1,9 @@
+// Derived from DiPlay
+// (shared/src/main/java/com/shilapi/xcertplay/airplay/CarPlayMediaEngine.kt,
+//  shared/src/main/java/com/shilapi/xcertplay/airplay/MicrophonePacketizer.kt,
+//  shared/src/main/java/com/shilapi/xcertplay/media/MicrophoneUplink.kt),
+// GPL-3.0, Copyright (c) DiPlay contributors.
+
 #include "carplay/mic_uplink.hpp"
 
 #include <math.h>

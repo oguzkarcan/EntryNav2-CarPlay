@@ -1,6 +1,15 @@
 #ifndef CARPLAY_AIRPLAY_HID_HPP
 #define CARPLAY_AIRPLAY_HID_HPP
 
+// Derived from DiPlay
+// (shared/src/main/java/com/shilapi/xcertplay/airplay/AirPlayHid.kt,
+//  shared/src/main/java/com/shilapi/xcertplay/airplay/AirPlayTouchSlots.kt,
+//  shared/src/main/java/com/shilapi/xcertplay/airplay/CarPlayMediaButton.kt,
+//  shared/src/main/java/com/shilapi/xcertplay/airplay/AirPlaySession.kt,
+//  common/src/main/java/com/shilapi/xcertplay/CarPlayRemoteKeys.kt,
+//  common/src/main/java/com/shilapi/xcertplay/WheelKeyService.kt),
+// GPL-3.0, Copyright (c) DiPlay contributors.
+//
 // CarPlay virtual HID devices: report descriptors, report encoders, touch slot assignment and the
 // BMW HU_ENTRYNAV2 ZBE3 controller mapping.
 //

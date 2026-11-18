@@ -1,6 +1,10 @@
 #ifndef CARPLAY_NTP_TIMING_HPP
 #define CARPLAY_NTP_TIMING_HPP
 
+// Derived from DiPlay
+// (shared/src/main/java/com/shilapi/xcertplay/airplay/NtpClock.kt),
+// GPL-3.0, Copyright (c) DiPlay contributors.
+//
 // CarPlay timing-port clock sync (port of DiPlay NtpClock.kt) without sockets, threads or clocks.
 //
 // The accessory drives an RTCP-style exchange with the iPhone: PT 210 (request) carries our

@@ -1,6 +1,13 @@
 #ifndef CARPLAY_PAIRING_HPP
 #define CARPLAY_PAIRING_HPP
 
+// Derived from DiPlay
+// (shared/src/main/java/com/shilapi/xcertplay/airplay/PairSetup.kt,
+//  shared/src/main/java/com/shilapi/xcertplay/airplay/PairVerify.kt,
+//  shared/src/main/java/com/shilapi/xcertplay/airplay/AirPlayIdentity.kt,
+//  shared/src/main/java/com/shilapi/xcertplay/airplay/PairingStore.kt),
+// GPL-3.0, Copyright (c) DiPlay contributors.
+//
 // Accessory-side (receiver) HAP-style Pair-Setup and Pair-Verify state machines used on the
 // AirPlay/CarPlay control connection ("application/pairing+tlv8" bodies of POST /pair-setup and
 // POST /pair-verify). Byte-exact port of DiPlay PairSetup.kt / PairVerify.kt, plus hardening.

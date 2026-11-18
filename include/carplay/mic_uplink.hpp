@@ -1,6 +1,12 @@
 #ifndef CARPLAY_MIC_UPLINK_HPP
 #define CARPLAY_MIC_UPLINK_HPP
 
+// Derived from DiPlay
+// (shared/src/main/java/com/shilapi/xcertplay/airplay/CarPlayMediaEngine.kt,
+//  shared/src/main/java/com/shilapi/xcertplay/airplay/MicrophonePacketizer.kt,
+//  shared/src/main/java/com/shilapi/xcertplay/media/MicrophoneUplink.kt),
+// GPL-3.0, Copyright (c) DiPlay contributors.
+//
 // CarPlay microphone uplink (accessory -> iPhone) as pure logic: stream-SETUP parsing and RTP
 // packetisation. No sockets, no ALSA, no clocks; the platform layer captures host-order int16 PCM,
 // feeds it to MicPacketizer and sends each produced datagram to the phone's UDP `dataPort` at the

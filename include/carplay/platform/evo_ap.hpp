@@ -46,7 +46,7 @@ struct EvoApInfo {
     int freq_mhz;       // 0 if unknown
     std::string key_mgmt;
     std::string wpa;
-    uint8_t security_type;  // defaults to 3 (kIap2WifiSecurityWpa2)
+    uint8_t security_type;  // defaults to kIap2WifiSecurityWpa2 (2 = WPA/WPA2-PSK)
 
     EvoApInfo();
 

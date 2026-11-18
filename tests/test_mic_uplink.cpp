@@ -1,3 +1,9 @@
+// Derived in part from DiPlay
+// (shared/src/main/java/com/shilapi/xcertplay/airplay/MicrophonePacketizer.kt,
+//  shared/src/main/java/com/shilapi/xcertplay/airplay/CarPlayMediaEngine.kt,
+//  shared/src/test/java/com/shilapi/xcertplay/airplay/MicrophonePacketizerTest.kt),
+// GPL-3.0, Copyright (c) DiPlay contributors.
+//
 // Microphone uplink (port of DiPlay MicrophonePacketizer.kt / CarPlayMediaEngine.microphoneConfig).
 // Packets are checked against an independent construction (direct ChaCha20-Poly1305 over the
 // hand-built header) and opened with audio::openPacket under the phone-side key derivation.

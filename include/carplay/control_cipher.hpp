@@ -1,6 +1,10 @@
 #ifndef CARPLAY_CONTROL_CIPHER_HPP
 #define CARPLAY_CONTROL_CIPHER_HPP
 
+// Derived from DiPlay
+// (shared/src/main/java/com/shilapi/xcertplay/airplay/ControlCipher.kt),
+// GPL-3.0, Copyright (c) DiPlay contributors.
+//
 // ChaCha20-Poly1305 framing for the encrypted AirPlay/CarPlay control (and event) channel,
 // a byte-exact port of DiPlay's ControlCipher.kt.
 //

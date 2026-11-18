@@ -1,3 +1,7 @@
+// Derived from DiPlay
+// (shared/src/main/java/com/shilapi/xcertplay/airplay/NtpClock.kt),
+// GPL-3.0, Copyright (c) DiPlay contributors.
+
 #include "carplay/ntp_timing.hpp"
 
 #include <math.h>

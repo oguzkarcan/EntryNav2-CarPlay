@@ -1,6 +1,10 @@
 #ifndef CARPLAY_SRP6A_HPP
 #define CARPLAY_SRP6A_HPP
 
+// Derived from DiPlay
+// (shared/src/main/java/com/shilapi/xcertplay/airplay/Srp6a.kt),
+// GPL-3.0, Copyright (c) DiPlay contributors.
+//
 // SRP-6a SERVER (accessory) side for AirPlay / CarPlay pair-setup.
 //
 // Byte-exact port of DiPlay `Srp6a.kt` (RFC 5054 3072-bit group, generator 5, SHA-512,

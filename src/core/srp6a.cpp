@@ -1,3 +1,7 @@
+// Derived from DiPlay
+// (shared/src/main/java/com/shilapi/xcertplay/airplay/Srp6a.kt),
+// GPL-3.0, Copyright (c) DiPlay contributors.
+
 #include "carplay/srp6a.hpp"
 
 #include "carplay/airplay_crypto.hpp"

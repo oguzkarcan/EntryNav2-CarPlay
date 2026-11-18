@@ -34,8 +34,8 @@ namespace carplay {
 namespace platform {
 
 /// iAP2 AccessoryWiFiConfigurationInformation (0x5703) WiFiSecurityType for WPA2-PSK.
-/// Matches `tests/test_phase1.cpp` (lines 482, 534); other enum values are unverified on vehicle.
-static const uint8_t kIap2WifiSecurityWpa2 = 3U;
+/// Matches `iap2::kWirelessSecurityWpaWpa2` (2U, verified against DiPlay Iap2WirelessSecurity.WPA_WPA2).
+static const uint8_t kIap2WifiSecurityWpa2 = iap2::kWirelessSecurityWpaWpa2;
 
 enum WifiBand {
     kWifiBandAuto = 0,

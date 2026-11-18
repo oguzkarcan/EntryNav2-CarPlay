@@ -1,3 +1,10 @@
+// Derived from DiPlay
+// (shared/src/main/java/com/shilapi/xcertplay/airplay/PairSetup.kt,
+//  shared/src/main/java/com/shilapi/xcertplay/airplay/PairVerify.kt,
+//  shared/src/main/java/com/shilapi/xcertplay/airplay/AirPlayIdentity.kt,
+//  shared/src/main/java/com/shilapi/xcertplay/airplay/PairingStore.kt),
+// GPL-3.0, Copyright (c) DiPlay contributors.
+
 #include "carplay/pairing.hpp"
 
 #include <string.h>

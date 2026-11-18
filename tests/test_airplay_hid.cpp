@@ -1,7 +1,14 @@
-// Exact-byte tests for carplay::hid against the reference
-// DiPlay-main/shared/src/main/java/com/shilapi/xcertplay/airplay/AirPlayHid.kt, AirPlayTouchSlots.kt,
-// CarPlayMediaButton.kt and their unit tests (AirPlayHidInputSemanticsTest.kt,
-// AirPlayTouchSlotsTest.kt, CarPlayMediaButtonTest.kt).
+// Derived from DiPlay
+// (shared/src/main/java/com/shilapi/xcertplay/airplay/AirPlayHid.kt,
+//  shared/src/main/java/com/shilapi/xcertplay/airplay/AirPlayTouchSlots.kt,
+//  shared/src/main/java/com/shilapi/xcertplay/airplay/CarPlayMediaButton.kt,
+//  shared/src/main/java/com/shilapi/xcertplay/airplay/AirPlaySession.kt,
+//  shared/src/test/java/com/shilapi/xcertplay/airplay/AirPlayHidInputSemanticsTest.kt,
+//  shared/src/test/java/com/shilapi/xcertplay/airplay/AirPlayTouchSlotsTest.kt,
+//  shared/src/test/java/com/shilapi/xcertplay/airplay/CarPlayMediaButtonTest.kt),
+// GPL-3.0, Copyright (c) DiPlay contributors.
+//
+// Exact-byte tests for carplay::hid against the reference DiPlay implementation.
 
 #include "carplay/airplay_hid.hpp"
 

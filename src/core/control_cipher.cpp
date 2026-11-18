@@ -1,3 +1,7 @@
+// Derived from DiPlay
+// (shared/src/main/java/com/shilapi/xcertplay/airplay/ControlCipher.kt),
+// GPL-3.0, Copyright (c) DiPlay contributors.
+
 #include "carplay/control_cipher.hpp"
 
 #include <string.h>
