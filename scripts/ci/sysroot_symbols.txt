@@ -1,0 +1,125 @@
+# Runtime shared-library (soname) and symbol manifest for EntryNav2-CarPlay.
+#
+# Checked by scripts/ci/check_sysroot_symbols.sh:
+#   1. Kept strictly in sync with C++ dlopen/dlsym calls under src/ and include/.
+#   2. Verified against $SYSROOT (lib, usr/lib, usr/local/lib, opt/hmi/lib).
+#
+# Directives:
+#   library <name> <required|optional> <any|all> [handle=<expr>]
+#     required|optional : missing soname fails the check only if required
+#     any               : first matching soname candidate satisfies the library;
+#                         all symbols must be exported by that resolved soname
+#     all               : every soname candidate must exist; each symbol must be
+#                         exported by at least one of them (e.g. RTLD_DEFAULT)
+#     handle=<expr>     : optional disambiguator when one source file loads
+#                         multiple libraries (matches the handle passed to dlsym)
+#
+#   source <repo-relative-path>
+#   soname <filename> [manifest_only]
+#   symbol <required|optional> <symbol_name> [manifest_only]
+#
+# Use `manifest_only` only when a soname/symbol cannot be extracted from C++
+# code directly (for example, the host DSOs backing dlsym(RTLD_DEFAULT, ...)).
+
+library libasound required any
+  source src/platform/evo_audio.cpp
+  soname libasound.so.2
+  symbol required snd_pcm_open
+  symbol required snd_pcm_set_params
+  symbol required snd_pcm_writei
+  symbol required snd_pcm_readi
+  symbol required snd_pcm_recover
+  symbol required snd_pcm_prepare
+  symbol required snd_pcm_drop
+  symbol required snd_pcm_drain
+  symbol required snd_pcm_close
+  symbol required snd_strerror
+
+library libxsvideo required any
+  source src/platform/evo_video.cpp
+  source include/carplay/platform/evo_video.hpp
+  soname libxsvideo.so.4
+  symbol required xsv_open
+  symbol required xsv_close
+  symbol required xsv_configure_stream
+  symbol required xsv_set_output_dimension
+  symbol required xsv_set_input_viewport
+  symbol required xsv_decode_video_frame
+  symbol required xsv_start
+  symbol required xsv_stop
+  symbol required xsv_pause
+  symbol required xsv_update
+  symbol required xsv_enable_frame_events
+  symbol required xsv_disable_frame_events
+  symbol required xsv_receive_event
+  symbol required xsv_get_event_queue_fd
+
+library libdrm required any handle=drm_handle_
+  source src/platform/omap_dmabuf.cpp
+  source include/carplay/platform/evo_video.hpp
+  soname libdrm.so.2
+  symbol required drmOpen
+  symbol required drmClose
+
+library libdrm_omap required any handle=omap_handle_
+  source src/platform/omap_dmabuf.cpp
+  source include/carplay/platform/evo_video.hpp
+  soname libdrm_omap.so.1
+  symbol required omap_device_new
+  symbol required omap_device_del
+  symbol required omap_bo_new
+  symbol required omap_bo_del
+  symbol required omap_bo_dmabuf
+  symbol required omap_bo_map
+
+library libvmostclient required any
+  source src/platform/vmost_client.cpp
+  soname libvmostclient.so.1
+  symbol required vmostConnect
+  symbol required vmostFblockShadowRegister
+  symbol required vmostFblockShadowDeregister
+  symbol required vmostFileDescriptorGet
+  symbol required vmostProcessMessages
+  symbol required vmostDisconnect
+  symbol required vmostMostMsgSend
+
+library libdns_sd required any
+  source src/platform/mdns_advertiser.cpp
+  soname libdns_sd.so.1
+  soname libdns_sd.so
+  symbol required DNSServiceRegister
+  symbol required DNSServiceRefSockFD
+  symbol required DNSServiceProcessResult
+  symbol required DNSServiceRefDeallocate
+  symbol optional DNSServiceUpdateRecord
+
+library libbluetooth optional any
+  source src/platform/bt_rfcomm.cpp
+  soname libbluetooth.so.3
+  soname libbluetooth.so
+
+library hmi_framework required all
+  source src/platform/entry_carplay_plugin.cpp
+  soname libAppFramework.A.so manifest_only
+  soname libCoreFramework.A.so manifest_only
+  symbol required _ZN3bmw6ParcelC1Eb
+  symbol required _ZN3bmw6ParcelD1Ev
+  symbol required _ZNK3bmw6Parcel8readBoolERb
+  symbol required _ZN3bmw11BasicStringIcEC1EPKc
+  symbol required _ZN3bmw11BasicStringIcED1Ev
+  symbol required _ZN3bmw6TextIDC1Ej
+  symbol required _ZN3bmw7ImageIDC1Ej
+  symbol required _ZN3bmw9PluginAppC1ERNS_11IDispatcherENS_11BasicStringIcEEjjNS_20RHMIInterfaceVersionERKNS_6BundleES8_
+  symbol required _ZN3bmw9PluginApp10addHandlerEjRKNS_8DelegateIbRKNS_6ParcelEvvvEE
+  symbol required _ZN3bmw9PluginApp10addHandlerEjjRKNS_8DelegateIbRKNS_6ParcelEvvvEE
+  symbol required _ZN3bmw9PluginApp12triggerEventEj
+  symbol required _ZN3bmw9PluginApp12triggerEventEjRKNS_6ParcelE
+  symbol required _ZN3bmw9PluginApp4postEPNS_8RunnableEj
+  symbol required _ZN3bmw9PluginApp11updateModelEjRKNS_6TextIDE
+  symbol required _ZN3bmw9PluginApp11updateModelEjRKNS_7ImageIDE
+  symbol required _ZN3bmw9PluginApp11updateModelEjb
+  symbol required _ZN3bmw9PluginApp11setPropertyEjjRKNS_6ParcelE
+  symbol required _ZN3bmw9PluginApp33cdsAddPropertyChangedEventHandlerERNS_11BasicStringIcEEjRKNS_8DelegateIbRKNS1_ItEEvvvEE
+  symbol required _ZN3bmw9PluginApp6onInitEv
+  symbol required _ZN3bmw9PluginApp10onFinalizeEv
+  symbol optional _ZTVN3bmw8RunnableE

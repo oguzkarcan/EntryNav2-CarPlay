@@ -21,6 +21,7 @@
 #   TEST_TIMEOUT     seconds per test binary when `timeout` exists (default 3600)
 #   EXPECT_GCC       required `-dumpversion` prefix (armv7-gcc47 default: 4.7)
 #   ALLOWED_NEEDED   space-separated DT_NEEDED sonames allowed in ARM binaries
+#   CHECK_SYSROOT    set to 1 to run scripts/ci/check_sysroot_symbols.sh (default: 0, skipped)
 #
 # The build runs with `make -k` so ONE run reports every compile error; the script still
 # fails at the end if anything failed to build or any test binary failed.
@@ -277,5 +278,9 @@ fi
 if [ "$BUILD_RC" -ne 0 ] || [ "$failed" -ne 0 ] || [ "$missing" -ne 0 ] || [ "$ABI_RC" -ne 0 ]; then
     echo "::error::$PROFILE: build or tests FAILED (see summary above and $LOG_DIR)"
     exit 1
+fi
+if [ "${CHECK_SYSROOT:-0}" = "1" ]; then
+    section "Sysroot symbol/soname check"
+    sh scripts/ci/check_sysroot_symbols.sh
 fi
 echo "$PROFILE: all $total test binaries built and passed"
