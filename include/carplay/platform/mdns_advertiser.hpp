@@ -128,6 +128,9 @@ public:
     virtual void onMdnsStopped() = 0;
 };
 
+/// Ownership and lifetime: `reactor` and any non-NULL `MdnsAdvertiserListener*` must outlive
+/// `MdnsAdvertiser` (or the listener must be cleared via `setListener(NULL)` before destruction).
+/// `~MdnsAdvertiser()` detaches the listener before tearing down active registrations.
 class MdnsAdvertiser : private IoHandler {
 public:
     explicit MdnsAdvertiser(Reactor& reactor);

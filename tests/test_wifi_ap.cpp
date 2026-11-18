@@ -683,8 +683,8 @@ TEST_CASE(hostapdCtrlRealFakeUnixSocket) {
     plat::Reactor reactor;
     REQUIRE(reactor.init());
 
-    plat::HostapdCtrl ctrl(reactor);
     RecordingCtrlListener listener;
+    plat::HostapdCtrl ctrl(reactor);
     ctrl.setListener(&listener);
 
     std::string err;
@@ -777,12 +777,11 @@ TEST_CASE(wifiApStateMachineStartConnectCrashRestartStop) {
     REQUIRE(reactor.init());
 
     DeterministicRng rng(0x25U);
-    plat::WifiAp ap(reactor, rng);
-
     FakeChildProcess fake_hostapd;
     FakeChildProcess fake_udhcpd;
     FakeHostapdCtrl fake_ctrl;
     RecordingApListener listener;
+    plat::WifiAp ap(reactor, rng);
 
     ap.setHostapdProcessForTest(&fake_hostapd);
     ap.setUdhcpdProcessForTest(&fake_udhcpd);
@@ -907,6 +906,123 @@ TEST_CASE(wifiApStateMachineStartConnectCrashRestartStop) {
     reactor.runOnce(0);
     CHECK_EQ(plat::kWifiApFailed, ap.state());
     CHECK_EQ(1, listener.failed_count);
+}
+
+TEST_CASE(wifiApDestructorAndFailedStopRobustness) {
+    TempDirGuard tmp("wifiap_robust");
+    g_fake_clock_ns = 1000000000LL;
+    plat::Reactor reactor(&fakeClockNs);
+    REQUIRE(reactor.init());
+
+    // 1. Repeated start -> ready -> crash -> restart -> ready -> crash -> failed -> ~WifiAp loop.
+    for (int iter = 0; iter < 20; ++iter) {
+        DeterministicRng rng(static_cast<uint8_t>(0x30 + iter));
+        FakeChildProcess fake_hostapd;
+        FakeChildProcess fake_udhcpd;
+        FakeHostapdCtrl fake_ctrl;
+        RecordingApListener listener;
+        plat::WifiAp ap(reactor, rng);
+
+        ap.setHostapdProcessForTest(&fake_hostapd);
+        ap.setUdhcpdProcessForTest(&fake_udhcpd);
+        ap.setHostapdCtrlForTest(&fake_ctrl);
+        ap.setListener(&listener);
+
+        plat::WifiApConfig cfg;
+        cfg.runtime_dir = tmp.path();
+        cfg.enable_udhcpd = true;
+        cfg.ctrl_poll_interval_ms = 10;
+        cfg.ctrl_wait_timeout_ms = 500;
+        cfg.health_check_interval_ms = 20;
+        cfg.restart_backoff_ms = 50;
+        cfg.max_restarts = 1;
+        tmp.trackDir(cfg.effectiveCtrlInterfaceDir());
+
+        fake_ctrl.socket_ready_ = true;
+        std::string err;
+        REQUIRE(ap.start(cfg, &err));
+        fake_ctrl.flushReplies();
+        REQUIRE(ap.state() == plat::kWifiApRunning);
+        CHECK_EQ(1, listener.started_count);
+
+        // First crash triggers restart.
+        fake_hostapd.simulateExit(1, 0);
+        advanceFakeClockMs(20);
+        reactor.runOnce(0);
+        REQUIRE(ap.state() == plat::kWifiApRestarting);
+        CHECK_EQ(1, listener.restarting_count);
+
+        advanceFakeClockMs(50);
+        reactor.runOnce(0);
+        fake_ctrl.flushReplies();
+        REQUIRE(ap.state() == plat::kWifiApRunning);
+        CHECK_EQ(2, listener.started_count);
+
+        // Second crash exhausts max_restarts -> kWifiApFailed.
+        fake_hostapd.simulateExit(2, 0);
+        advanceFakeClockMs(20);
+        reactor.runOnce(0);
+        REQUIRE(ap.state() == plat::kWifiApFailed);
+        CHECK_EQ(1, listener.failed_count);
+        CHECK(!fake_ctrl.isOpen());
+        CHECK(fake_ctrl.listener_ == NULL);
+
+        // Calling stop() / stopSync() from kWifiApFailed resets to kWifiApStopped without
+        // touching ctrl/processes or emitting spurious onWifiApStopped().
+        if (iter % 2 == 0) {
+            const int closes_before = fake_ctrl.close_count_;
+            ap.stop();
+            CHECK_EQ(plat::kWifiApStopped, ap.state());
+            CHECK_EQ(closes_before, fake_ctrl.close_count_);
+            CHECK_EQ(0, listener.stopped_count);
+        }
+        // Odd iterations intentionally let ~WifiAp() run while still in kWifiApFailed.
+    }
+
+    // 2. Destroying WifiAp directly while kWifiApRunning stops children cleanly without
+    // firing callbacks into listener during destruction.
+    FakeChildProcess running_hostapd;
+    FakeChildProcess running_udhcpd;
+    FakeHostapdCtrl running_ctrl;
+    RecordingApListener running_listener;
+    {
+        DeterministicRng rng(0x55U);
+        plat::WifiAp ap(reactor, rng);
+        ap.setHostapdProcessForTest(&running_hostapd);
+        ap.setUdhcpdProcessForTest(&running_udhcpd);
+        ap.setHostapdCtrlForTest(&running_ctrl);
+        ap.setListener(&running_listener);
+
+        plat::WifiApConfig cfg;
+        cfg.runtime_dir = tmp.path();
+        cfg.enable_udhcpd = true;
+        cfg.ctrl_poll_interval_ms = 10;
+        cfg.ctrl_wait_timeout_ms = 500;
+        cfg.health_check_interval_ms = 20;
+        tmp.trackDir(cfg.effectiveCtrlInterfaceDir());
+
+        running_ctrl.socket_ready_ = true;
+        std::string err;
+        REQUIRE(ap.start(cfg, &err));
+        running_ctrl.flushReplies();
+        REQUIRE(ap.state() == plat::kWifiApRunning);
+        running_ctrl.emitEvent("<3>AP-STA-CONNECTED aa:bb:cc:dd:ee:11");
+        CHECK_EQ(static_cast<size_t>(1U), ap.connectedStations().size());
+
+        // Non-NULL test override changes are ignored while WifiAp is active.
+        FakeHostapdCtrl other_ctrl;
+        ap.setHostapdCtrlForTest(&other_ctrl);
+        CHECK_EQ(0, other_ctrl.open_count_);
+        CHECK_EQ(0, other_ctrl.close_count_);
+    }
+    CHECK(!running_hostapd.isRunning());
+    CHECK(!running_udhcpd.isRunning());
+    CHECK_EQ(1, running_hostapd.term_count_);
+    CHECK_EQ(1, running_udhcpd.term_count_);
+    CHECK(!running_ctrl.isOpen());
+    CHECK(running_ctrl.listener_ == NULL);
+    CHECK_EQ(0, running_listener.stopped_count);
+    CHECK(running_listener.disconnected_events.empty());
 }
 
 TEST_CASE(supervisedProcessRealPosixChild) {

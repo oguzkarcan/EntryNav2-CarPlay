@@ -172,6 +172,14 @@ public:
     virtual void onStationDisconnected(const std::string& mac) = 0;
 };
 
+/// Ownership and lifetime contract:
+///   * `reactor`, `rng`, any non-NULL `WifiApListener*`, and any non-NULL `IChildProcess*` or
+///     `IHostapdCtrl*` test overrides are non-owning references/pointers and MUST outlive `WifiAp`
+///     (or be detached via `setListener(NULL)` / `set*ForTest(NULL)` after `stopSync()` before
+///     those objects are destroyed).
+///   * Destructor `~WifiAp()` detaches the listener and invokes `stopSync()` without firing
+///     listener callbacks; callers requiring `onWifiApStopped()` must call `stop()`/`stopSync()`
+///     before destroying `WifiAp`.
 class WifiAp : private TimerHandler, private HostapdCtrlListener {
 public:
     WifiAp(Reactor& reactor, pairing::RandomSource& rng);
@@ -179,8 +187,9 @@ public:
 
     void setListener(WifiApListener* listener) { listener_ = listener; }
 
-    /// Test injection hooks (must be called while kWifiApStopped / kWifiApFailed; caller retains
-    /// ownership; NULL restores the default owned implementation).
+    /// Test injection hooks (must be called while kWifiApStopped or kWifiApFailed; caller retains
+    /// ownership and must keep the target alive past ~WifiAp() unless cleared with NULL after
+    /// stopping). Non-NULL calls while active are ignored.
     void setHostapdProcessForTest(IChildProcess* proc);
     void setUdhcpdProcessForTest(IChildProcess* proc);
     void setHostapdCtrlForTest(IHostapdCtrl* ctrl);

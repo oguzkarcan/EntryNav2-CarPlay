@@ -402,8 +402,8 @@ TEST_CASE(mdnsAdvertiserRegisterProcessConflictUpdateDeallocate) {
     plat::Reactor reactor;
     REQUIRE(reactor.init());
 
-    plat::MdnsAdvertiser adv(reactor);
     RecordingMdnsListener listener;
+    plat::MdnsAdvertiser adv(reactor);
     adv.setListener(&listener);
 
     const plat::DnsSdApi api_with_update = makeFakeApi(true);

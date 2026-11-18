@@ -381,6 +381,7 @@ HostapdCtrl::~HostapdCtrl() {
     if (alive_state_ != NULL) {
         alive_state_->alive = false;
     }
+    listener_ = NULL;
     close();
     if (alive_state_ != NULL) {
         if (--alive_state_->refs == 0) {

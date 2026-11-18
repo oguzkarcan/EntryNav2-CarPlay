@@ -85,6 +85,7 @@ MdnsAdvertiser::~MdnsAdvertiser() {
     if (alive_state_ != NULL) {
         alive_state_->alive = false;
     }
+    listener_ = NULL;
     stop();
     unload();
     if (alive_state_ != NULL) {

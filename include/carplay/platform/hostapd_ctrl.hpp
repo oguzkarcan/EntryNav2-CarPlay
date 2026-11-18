@@ -140,6 +140,8 @@ public:
                              int timeout_ms = 1000) = 0;
 };
 
+/// Ownership and lifetime: `reactor` and any non-NULL `HostapdCtrlListener*` must outlive
+/// `HostapdCtrl` (or the listener must be cleared via `setListener(NULL)` before destruction).
 class HostapdCtrl : public IHostapdCtrl, private IoHandler, private TimerHandler {
 public:
     static const size_t kMaxPendingCommands = 64U;
