@@ -85,6 +85,7 @@ library libvmostclient required any
 
 library libdns_sd required any
   source src/platform/mdns_advertiser.cpp
+  soname libdns_sd.so.0
   soname libdns_sd.so.1
   soname libdns_sd.so
   symbol required DNSServiceRegister
@@ -97,6 +98,67 @@ library libbluetooth optional any
   source src/platform/bt_rfcomm.cpp
   soname libbluetooth.so.3
   soname libbluetooth.so
+
+library libdbus required any
+  source src/platform/alps_spp.cpp
+  source src/platform/bt_rfcomm.cpp
+  soname libdbus-1.so.3
+  soname libdbus-1.so
+  symbol required dbus_threads_init_default
+  symbol required dbus_error_init
+  symbol required dbus_error_is_set
+  symbol required dbus_error_free
+  symbol required dbus_bus_get_private
+  symbol required dbus_bus_add_match
+  symbol required dbus_connection_set_exit_on_disconnect
+  symbol required dbus_connection_close
+  symbol required dbus_connection_unref
+  symbol required dbus_connection_add_filter
+  symbol required dbus_connection_remove_filter
+  symbol required dbus_connection_send
+  symbol required dbus_connection_send_with_reply_and_block
+  symbol required dbus_connection_read_write_dispatch
+  symbol required dbus_message_new_method_call
+  symbol required dbus_message_unref
+  symbol required dbus_message_set_no_reply
+  symbol required dbus_message_get_type
+  symbol required dbus_message_get_member
+  symbol required dbus_message_get_interface
+  symbol required dbus_message_get_signature
+  symbol required dbus_message_has_interface
+  symbol required dbus_message_has_path
+  symbol required dbus_message_has_sender
+  symbol required dbus_message_has_signature
+  symbol required dbus_message_is_signal
+  symbol required dbus_message_iter_init
+  symbol required dbus_message_iter_next
+  symbol required dbus_message_iter_get_arg_type
+  symbol required dbus_message_iter_get_element_type
+  symbol required dbus_message_iter_get_basic
+  symbol required dbus_message_iter_recurse
+  symbol required dbus_message_iter_get_fixed_array
+  symbol required dbus_message_iter_init_append
+  symbol required dbus_message_iter_append_basic
+  symbol required dbus_message_iter_open_container
+  symbol required dbus_message_iter_close_container
+  symbol required dbus_message_iter_abandon_container
+  symbol required dbus_message_iter_append_fixed_array
+  symbol required dbus_validate_path
+
+# Partial sysroot gap: on HU_ENTRYNAV2, libevo_btappl.so lives under
+# /opt/app/usr/BTMedia/evolution/stack/lib/libevo_btappl.so via the absolute
+# symlink /usr/local/lib/alps/evolution -> /opt/app/usr/BTMedia/evolution/stack/lib,
+# which is dangling in the partial sysroot because /opt/app is not included.
+# SppSnapshotReader inspects its .dynsym & R_ARM_GLOB_DAT GOT slots read-only via
+# /proc/<pid>/{maps,root,mem} (not dlopen). Marked optional in the manifest so the
+# partial sysroot check passes while keeping the gap visible.
+library libevo_btappl optional any
+  source include/carplay/platform/spp_snapshot.hpp
+  source src/platform/spp_snapshot.cpp
+  soname libevo_btappl.so
+  symbol required app manifest_only
+  symbol required spp_info manifest_only
+  symbol required spp_connected manifest_only
 
 library hmi_framework required all
   source src/platform/entry_carplay_plugin.cpp

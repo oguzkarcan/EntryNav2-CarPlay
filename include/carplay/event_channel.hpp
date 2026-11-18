@@ -1,6 +1,10 @@
 #ifndef CARPLAY_EVENT_CHANNEL_HPP
 #define CARPLAY_EVENT_CHANNEL_HPP
 
+// Derived from DiPlay
+// (shared/src/main/java/com/shilapi/xcertplay/airplay/AirPlaySession.kt),
+// GPL-3.0, Copyright (c) DiPlay contributors.
+//
 // Encrypted AirPlay/CarPlay EVENT channel endpoint (accessory side), sans-I/O.
 //
 // After the session SETUP the accessory advertises an `eventPort`; the iPhone connects to it and the

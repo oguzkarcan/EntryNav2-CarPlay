@@ -1,3 +1,9 @@
+// Derived from DiPlay
+// (shared/src/main/java/com/shilapi/xcertplay/airplay/AirPlayInfoPlist.kt,
+//  shared/src/main/java/com/shilapi/xcertplay/airplay/AirPlayHid.kt,
+//  shared/src/test/java/com/shilapi/xcertplay/airplay/AirPlayInfoPlistTest.kt),
+// GPL-3.0, Copyright (c) DiPlay contributors.
+//
 // /info plist builder (port of DiPlay AirPlayInfoPlist.kt) and SETUP enabledFeatures.
 // Every check goes through bplist encode -> decode so it covers what the phone actually receives.
 

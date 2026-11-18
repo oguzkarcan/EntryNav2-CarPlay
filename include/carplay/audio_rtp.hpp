@@ -1,6 +1,13 @@
 #ifndef CARPLAY_AUDIO_RTP_HPP
 #define CARPLAY_AUDIO_RTP_HPP
 
+// Derived from DiPlay
+// (shared/src/main/java/com/shilapi/xcertplay/airplay/AudioStream.kt,
+//  shared/src/main/java/com/shilapi/xcertplay/airplay/MicrophonePacketizer.kt,
+//  shared/src/main/java/com/shilapi/xcertplay/airplay/CarPlayMediaEngine.kt,
+//  shared/src/main/java/com/shilapi/xcertplay/airplay/BufferedAudioStream.kt),
+// GPL-3.0, Copyright (c) DiPlay contributors.
+//
 // CarPlay realtime audio (stream types 100 / 101 / 102) RTP handling.
 //
 // Pure byte-in / byte-out logic: no sockets, no threads, no clocks. The socket layer (later

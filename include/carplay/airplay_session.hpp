@@ -1,6 +1,11 @@
 #ifndef CARPLAY_AIRPLAY_SESSION_HPP
 #define CARPLAY_AIRPLAY_SESSION_HPP
 
+// Derived from DiPlay
+// (shared/src/main/java/com/shilapi/xcertplay/airplay/AirPlaySession.kt,
+//  shared/src/main/java/com/shilapi/xcertplay/airplay/CarPlayMediaEngine.kt),
+// GPL-3.0, Copyright (c) DiPlay contributors.
+//
 // One CarPlay AirPlay CONTROL connection (accessory side) as a pure, sans-I/O state machine.
 // Port of DiPlay AirPlaySession.kt (runControl / handle / handleSetup / handleStreams / handleCommand /
 // handleTeardown / acceptEvent / close) with the socket, thread and clock work delegated to abstract

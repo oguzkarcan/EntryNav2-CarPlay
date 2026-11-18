@@ -1,3 +1,8 @@
+// Derived from DiPlay
+// (shared/src/main/java/com/shilapi/xcertplay/airplay/AirPlaySession.kt,
+//  shared/src/main/java/com/shilapi/xcertplay/airplay/CarPlayMediaEngine.kt),
+// GPL-3.0, Copyright (c) DiPlay contributors.
+
 #include "carplay/airplay_session.hpp"
 
 #include "carplay/audio_rtp.hpp"

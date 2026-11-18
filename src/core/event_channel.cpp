@@ -1,3 +1,7 @@
+// Derived from DiPlay
+// (shared/src/main/java/com/shilapi/xcertplay/airplay/AirPlaySession.kt),
+// GPL-3.0, Copyright (c) DiPlay contributors.
+
 #include "carplay/event_channel.hpp"
 
 #include "carplay/pairing.hpp"

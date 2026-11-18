@@ -1,3 +1,12 @@
+// Derived from DiPlay
+// (shared/src/main/java/com/shilapi/xcertplay/airplay/AirPlayHid.kt,
+//  shared/src/main/java/com/shilapi/xcertplay/airplay/AirPlayTouchSlots.kt,
+//  shared/src/main/java/com/shilapi/xcertplay/airplay/CarPlayMediaButton.kt,
+//  shared/src/main/java/com/shilapi/xcertplay/airplay/AirPlaySession.kt,
+//  common/src/main/java/com/shilapi/xcertplay/CarPlayRemoteKeys.kt,
+//  common/src/main/java/com/shilapi/xcertplay/WheelKeyService.kt),
+// GPL-3.0, Copyright (c) DiPlay contributors.
+
 #include "carplay/airplay_hid.hpp"
 
 #include <math.h>

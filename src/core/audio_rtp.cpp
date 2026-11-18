@@ -1,3 +1,10 @@
+// Derived from DiPlay
+// (shared/src/main/java/com/shilapi/xcertplay/airplay/AudioStream.kt,
+//  shared/src/main/java/com/shilapi/xcertplay/airplay/MicrophonePacketizer.kt,
+//  shared/src/main/java/com/shilapi/xcertplay/airplay/CarPlayMediaEngine.kt,
+//  shared/src/main/java/com/shilapi/xcertplay/airplay/BufferedAudioStream.kt),
+// GPL-3.0, Copyright (c) DiPlay contributors.
+
 #include "carplay/audio_rtp.hpp"
 
 #include <string.h>

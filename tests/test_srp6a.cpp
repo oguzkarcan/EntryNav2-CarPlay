@@ -1,3 +1,7 @@
+// Derived in part from DiPlay
+// (shared/src/main/java/com/shilapi/xcertplay/airplay/Srp6a.kt: RFC 5054 N_HEX literal & vectors),
+// GPL-3.0, Copyright (c) DiPlay contributors.
+//
 // SRP-6a server (AirPlay pair-setup variant) tests.
 //
 // A minimal SRP-6a CLIENT is implemented below on top of the bigint module so a full handshake

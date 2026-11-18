@@ -1,3 +1,10 @@
+// Derived from DiPlay
+// (shared/src/main/java/com/shilapi/xcertplay/airplay/AirPlayInfoPlist.kt,
+//  shared/src/main/java/com/shilapi/xcertplay/airplay/AirPlayDisplaySettings.kt,
+//  shared/src/main/java/com/shilapi/xcertplay/airplay/AirPlayConfig.kt,
+//  shared/src/main/java/com/shilapi/xcertplay/airplay/AirPlaySession.kt),
+// GPL-3.0, Copyright (c) DiPlay contributors.
+
 #include "carplay/airplay_info.hpp"
 
 #include <math.h>

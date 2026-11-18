@@ -1,3 +1,7 @@
+// Derived from DiPlay
+// (shared/src/main/java/com/shilapi/xcertplay/airplay/RtspMessage.kt),
+// GPL-3.0, Copyright (c) DiPlay contributors.
+//
 // Phase 2 P1: RTSP/HTTP message framing (port of DiPlay RtspMessage.kt).
 
 #include "carplay/rtsp_message.hpp"
