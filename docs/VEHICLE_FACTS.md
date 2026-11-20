@@ -1,6 +1,6 @@
 # EntryNav2 / EVO Vehicle Facts Ledger (Phase 4 & Platform Audit)
 
-Audit baseline: **`EntryNav2-Android-Auto` `v0.12.0` -> `v0.13.0-rc.6`**, **`DiPlay-main`**, and the **HU_ENTRYNAV2 sysroot** (`/home/ozzy/Projects/EntryNav2-CarPlay-Assets/sysroot`).
+Audit baseline: **`EntryNav2-Android-Auto` `v0.12.0` -> `v0.13.0-rc.6`**, **`DiPlay-main`**, and the **HU_ENTRYNAV2 sysroot** (`$SYSROOT`).
 
 This ledger tracks every vehicle-specific constant, ABI assumption, path, D-Bus coordinate, vMOST function ID, and hardware quirk used in `EntryNav2-CarPlay`, its provenance, verification status, dependent code, and live-car probe method. For how `CarPlayDaemon` and `CarPlayConnectivity` gate ALPS compatibility, toggle per-transport Wi-Fi QoS, and drive read-only link logging, see [docs/CONNECTIVITY.md](CONNECTIVITY.md). For live-car probing (`car_visit.sh` / `--compat`), QEMU sysroot runtime verification, and MFi I2C research, see [docs/CAR_VISIT.md](CAR_VISIT.md), [docs/CARLIB_SMOKE.md](CARLIB_SMOKE.md), and [docs/MFI_AUTH.md](MFI_AUTH.md).
 

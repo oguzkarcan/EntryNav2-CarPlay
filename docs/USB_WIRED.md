@@ -114,7 +114,7 @@ Because the kernel cannot create a `usb0` network device for CDC-NCM, this modul
 
 ## 6. Sysroot Ownership Analysis & Coexistence Policy
 
-Inspection of the head unit sysroot (`/home/ozzy/Projects/EntryNav2-CarPlay-Assets/sysroot`) shows:
+Inspection of the head unit sysroot (`$SYSROOT`) shows:
 
 1. **Userspace Apple/USB stack (`MediaPlayer` / `CARPLAY`):**
    - `/usr/local/lib/libauxin-apple.so.0` symlinks to `../../../opt/app/usr/MediaPlayer/lib/libauxin-apple.so.0` (alongside `libauxin-aoap.so.0` and `libauxin-player.so.0`), and the image contains `/opt/app/usr/MediaPlayer/bin/CARPLAY`. (`/opt/app` is not populated in the partial sysroot extract, so these symlinks dangle offline.)

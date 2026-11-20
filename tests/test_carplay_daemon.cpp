@@ -2057,7 +2057,7 @@ TEST_CASE(testCarPlayDaemonEndToEndIntegration) {
     REQUIRE(phone.timing_sock.open(plat::Address::ipv4Loopback(0)));
     bplist::Value setup_sess = bplist::Value::makeDict();
     setup_sess.set("deviceID", bplist::Value::makeString("AA:BB:CC:DD:EE:FF"));
-    setup_sess.set("name", bplist::Value::makeString("Ozzy iPhone"));
+    setup_sess.set("name", bplist::Value::makeString("Test iPhone"));
     setup_sess.set("model", bplist::Value::makeString("iPhone15,2"));
     setup_sess.set("timingPort", bplist::Value::makeInt(phone.timing_sock.port()));
     rtsp::Request setup_resp;

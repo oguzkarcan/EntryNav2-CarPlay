@@ -6,7 +6,7 @@ This document records the sysroot/asset research, register protocol, AirPlay `/a
 
 ## 1. Local Research Findings & Confidence Levels
 
-All findings below were verified in `/home/ozzy/Projects/EntryNav2-CarPlay-Assets/sysroot` (`etc/version`: `202402191339`, library-only extract without `/opt/app`), `DiPlay-main`, `EntryNav2-Android-Auto-latest`, and the live head-unit SSH profile recorded in [TARGET_HARDWARE.md](TARGET_HARDWARE.md).
+All findings below were verified in `$SYSROOT` (`etc/version`: `202402191339`, library-only extract without `/opt/app`), `DiPlay-main`, `EntryNav2-Android-Auto-latest`, and the live head-unit SSH profile recorded in [TARGET_HARDWARE.md](TARGET_HARDWARE.md).
 
 | Finding | Evidence (File & Line / Offset) | Confidence |
 | --- | --- | --- |

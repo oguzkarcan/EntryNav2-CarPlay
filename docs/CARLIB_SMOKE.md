@@ -51,7 +51,7 @@ All libraries in [scripts/ci/sysroot_symbols.txt](../../scripts/ci/sysroot_symbo
 
 ## ARMv7 Unit Test Subset & Symbol-Version Results
 
-Against `/home/ozzy/Projects/EntryNav2-CarPlay-Assets/sysroot` (`GLIBC_2.15`, `GLIBCXX_3.4.17`, `CXXABI_1.3.6`, `GCC_4.7.0`):
+Against `$SYSROOT` (`GLIBC_2.15`, `GLIBCXX_3.4.17`, `CXXABI_1.3.6`, `GCC_4.7.0`):
 - **Max required versions across all built binaries:** `GLIBC_2.9` (`carplayd`; `GLIBC_2.4` elsewhere), `GLIBCXX_3.4.11`, `CXXABI_ARM_1.3.3` / `CXXABI_1.3`. Every required symbol version is present in the sysroot.
 - **`carplayd --help` and `carplayd --version`:** load with `LD_BIND_NOW=1` and exit `0`.
 - **Self-contained ARMv7 unit tests under QEMU (`LD_BIND_NOW=1`):** `test_phase1` (10/10), `test_evo_audio` (16/16), `test_evo_input` (19/19), `test_mdns_advertiser` (4/4), `test_alps_spp` (11/11), `test_bt_rfcomm` (11/11), `test_airplay_session` (26/26), `test_iap2_session` (4/4). Tests that `fork()`/`exec()` `/bin/sh` helper scripts (`test_evo_video`, `test_carplay_daemon`) are excluded from the library-only sysroot subset because the partial sysroot has no `/bin/sh`.
