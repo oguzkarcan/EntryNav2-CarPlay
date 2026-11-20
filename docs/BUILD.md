@@ -129,3 +129,14 @@ SYSROOT=~/entrynav2/sysroot sh scripts/ci/check_sysroot_symbols.sh
 sh scripts/ci/check_sysroot_symbols.sh --self-test             # temporary compiler-built fake sysroot
 CHECK_SYSROOT=1 SYSROOT=~/entrynav2/sysroot sh scripts/ci/build_and_test.sh host
 ```
+
+## 8. Car-library runtime smoke test (QEMU + `SYSROOT`)
+
+To go beyond static ELF symbol checks and execute our platform `dlopen()` loaders, `carplayd`, `libEntryCarPlay.so`, and ARMv7 unit tests against the real car libraries (`eglibc 2.15`, `libstdc++.so.6.0.17`, ALSA, `libxsvideo`, `libdrm`, `libvmostclient`, `libdns_sd.so.0`, `libdbus-1.so.3`, `libAppFramework.A.so`, `libCoreFramework.A.so`, `libEGL.so.1`, `libGLESv2.so.2`) under `qemu-arm-static -L "$SYSROOT"` with `LD_BIND_NOW=1`, see [docs/CARLIB_SMOKE.md](CARLIB_SMOKE.md):
+
+```sh
+SYSROOT=~/entrynav2/sysroot sh scripts/ci/carlib_smoke.sh
+RUN_CARLIB_SMOKE=1 SYSROOT=~/entrynav2/sysroot sh scripts/ci/build_and_test.sh host
+```
+
+Both scripts skip cleanly (exit `0`) when `SYSROOT`, Docker, or QEMU is unavailable.
