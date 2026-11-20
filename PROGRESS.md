@@ -168,9 +168,10 @@ All Phase 1 protocol primitives are implemented in portable C++11 (`-std=gnu++0x
 
 **Verified test status (2026-11-18, after Phase 4 Wave B):** **34 test binaries (409 tests)** passing on host `g++` 16.2.1 and `clang++` 23.1.3 and on Debian 7 wheezy `armhf` `g++-4.7` 4.7.2 under QEMU (`ARM checks: 0`); `check_repo_content.sh` and `check_sysroot_symbols.sh` passed.
 
+- [x] **Connectivity Orchestration & Daemon Wiring (Wave C, host-simulated):** `CarPlayConnectivity` (`include/carplay/platform/carplay_connectivity.hpp`, `src/platform/carplay_connectivity.cpp`, documented in `docs/CONNECTIVITY.md`) wired into `CarPlayDaemon` and `carplayd` (`--wireless`/`--no-wireless`, `--wired`/`--no-wired`, both defaulting to `false`). Orchestrates Wireless (ALPS SPP / RFCOMM -> iAP2 -> EVO AP / hostapd -> `0x5703`/`0x4301` -> mDNS -> `SessionServer`) and Wired (coexistence-safe USB -> CDC-NCM/TAP -> iAP2 -> `0x4301` -> `SessionServer`) with single-phone concurrency policy and clean teardown/restore (incl. borrowed ALPS slot 5 restore). Verified in host simulation (`tests/test_carplay_connectivity.cpp`, `tests/test_carplay_e2e_sim.cpp`); vehicle bring-up + Phase 5 MFi I2C `AuthProvider` remain for live-car testing.
+
 Remaining for Phase 4:
-- [ ] **Wired USB Transport:** `usb_device` / `devfs` host -> USB role/configuration switch (`0x12a8`/`0x12a*` iPhone CarPlay USB config) -> `usbmuxd`-less direct USB bulk iAP2 + `CDC NCM` virtual Ethernet + link-local IPv6 (`fe80::/64`) socket binding.
-- [ ] **Wireless Transport:** `Bluetooth` RFCOMM iAP2 channel (SDP CarPlay service discovery) -> `0x5700/0x5701` & `0x5702/0x5703` Wi-Fi AP credential handoff -> hostapd/Wi-Fi AP interface management + lightweight mDNS/DNS-SD responder (`_airplay._tcp.local`).
+- [ ] **Live-Car Bring-Up & Vehicle Validation:** Verify Wave A/B/C modules on EntryNav2/EVO hardware alongside Phase 5 MFi coprocessor `AuthProvider` wiring (all protocol/transport modules are compiled and host-tested; only host simulation has run without car hardware).
 
 ### Phase 5 — Authentication Bridge & Live Vehicle Bring-Up
 - [ ] Pluggable `AuthProvider` interface supporting both hardware Apple MFi CP (`I2C` coprocessor on bench/target) and optional `BAA` local/proxy test signer.

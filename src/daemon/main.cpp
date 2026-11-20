@@ -50,6 +50,10 @@ void printUsage(const char* argv0) {
         "  --no-input             Disable vMOST controller & UDP 30567 touchscreen\n"
         "  --no-control           Disable abstract Unix control channel\n"
         "  --no-touch             Advertise knob-only display profile\n"
+        "  --wireless             Enable Wireless CarPlay (BT ALPS/RFCOMM + Wi-Fi AP + mDNS)\n"
+        "  --no-wireless          Disable Wireless CarPlay (default)\n"
+        "  --wired                Enable Wired USB CarPlay (usbfs + CDC-NCM/TAP)\n"
+        "  --no-wired             Disable Wired USB CarPlay (default)\n"
         "  --service              Supervisor compatibility flag (default mode)\n"
         "  --version              Show version information and exit\n"
         "  --help                 Show this help message and exit\n",
@@ -120,6 +124,18 @@ int main(int argc, char** argv) {
             cfg.enable_control = false;
         } else if (strcmp(arg, "--no-touch") == 0) {
             cfg.touch_enabled = false;
+        } else if (strcmp(arg, "--wireless") == 0) {
+            cfg.enable_wireless = true;
+            cfg.connectivity_config.enable_wireless = true;
+        } else if (strcmp(arg, "--no-wireless") == 0) {
+            cfg.enable_wireless = false;
+            cfg.connectivity_config.enable_wireless = false;
+        } else if (strcmp(arg, "--wired") == 0) {
+            cfg.enable_wired = true;
+            cfg.connectivity_config.enable_wired = true;
+        } else if (strcmp(arg, "--no-wired") == 0) {
+            cfg.enable_wired = false;
+            cfg.connectivity_config.enable_wired = false;
         } else {
             fprintf(stderr, "carplayd: unknown option: %s\n", arg);
             printUsage(argv[0]);
