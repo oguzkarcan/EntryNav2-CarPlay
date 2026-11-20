@@ -96,7 +96,7 @@ TEST_HDRS   := $(wildcard tests/*.hpp)
 TEST_SRCS := $(sort $(wildcard tests/test_*.cpp))
 TEST_BINS := $(patsubst tests/%.cpp,$(BUILD_DIR)/%$(BIN_EXT),$(TEST_SRCS))
 
-.PHONY: all core platform daemon hmiapp hmiapp-res install-layout tests test-host clean arm-core arm-platform arm-daemon arm-hmiapp
+.PHONY: all core platform daemon hmiapp hmiapp-res install-layout tests test-host carlib-smoke clean arm-core arm-platform arm-daemon arm-hmiapp
 
 all: test-host
 
@@ -164,6 +164,11 @@ install-layout: $(DAEMON_BIN) $(HMI_PLUGIN_SO) hmiapp/EntryCarPlay.manifest hmia
 	cp $(HMI_IMAGES_ZIP) $(STAGE_DIR)/opt/hmi/data/ro/Plugins/EntryCarPlay/EntryCarPlay_ALL_Images.zip
 
 $(BUILD_DIR)/test_%$(BIN_EXT): tests/test_%.cpp $(PLATFORM_LIB) $(CORE_LIB) $(PUBLIC_HDRS) $(TEST_HDRS) | $(BUILD_DIR)
+	$(CXX) $(TEST_CPPFLAGS) $(CXXFLAGS) $< $(PLATFORM_LIB) $(CORE_LIB) $(SYS_LIBS) -o $@
+
+carlib-smoke: $(BUILD_DIR)/carlib_smoke$(BIN_EXT)
+
+$(BUILD_DIR)/carlib_smoke$(BIN_EXT): tests/carlib_smoke.cpp $(PLATFORM_LIB) $(CORE_LIB) $(PUBLIC_HDRS) $(TEST_HDRS) | $(BUILD_DIR)
 	$(CXX) $(TEST_CPPFLAGS) $(CXXFLAGS) $< $(PLATFORM_LIB) $(CORE_LIB) $(SYS_LIBS) -o $@
 
 test-host: $(TEST_BINS) $(DAEMON_BIN) $(HMI_PLUGIN_SO)

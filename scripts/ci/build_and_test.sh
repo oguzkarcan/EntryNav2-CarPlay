@@ -22,6 +22,7 @@
 #   EXPECT_GCC       required `-dumpversion` prefix (armv7-gcc47 default: 4.7)
 #   ALLOWED_NEEDED   space-separated DT_NEEDED sonames allowed in ARM binaries
 #   CHECK_SYSROOT    set to 1 to run scripts/ci/check_sysroot_symbols.sh (default: 0, skipped)
+#   RUN_CARLIB_SMOKE set to 1 to run scripts/ci/carlib_smoke.sh (default: 0, skipped)
 #
 # The build runs with `make -k` so ONE run reports every compile error; the script still
 # fails at the end if anything failed to build or any test binary failed.
@@ -282,5 +283,9 @@ fi
 if [ "${CHECK_SYSROOT:-0}" = "1" ]; then
     section "Sysroot symbol/soname check"
     sh scripts/ci/check_sysroot_symbols.sh
+fi
+if [ "${RUN_CARLIB_SMOKE:-0}" = "1" ]; then
+    section "Car-library runtime smoke test (QEMU + SYSROOT)"
+    sh scripts/ci/carlib_smoke.sh
 fi
 echo "$PROFILE: all $total test binaries built and passed"
