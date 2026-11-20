@@ -876,7 +876,17 @@ Value Value::makeDict(const Dict& dict) {
 
 int64_t Value::asDateUnixMillis() const {
     const double ms = (real_val_ + kAppleEpochOffsetSeconds) * 1000.0;
-    return static_cast<int64_t>(ms >= 0.0 ? std::floor(ms + 0.5) : std::ceil(ms - 0.5));
+    if (ms != ms) {
+        return 0;
+    }
+    const double rounded = ms >= 0.0 ? std::floor(ms + 0.5) : std::ceil(ms - 0.5);
+    if (rounded >= 9223372036854775808.0) {
+        return std::numeric_limits<int64_t>::max();
+    }
+    if (rounded < -9223372036854775808.0) {
+        return std::numeric_limits<int64_t>::min();
+    }
+    return static_cast<int64_t>(rounded);
 }
 
 void Value::set(const std::string& key, const Value& val) {

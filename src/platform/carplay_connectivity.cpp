@@ -395,6 +395,8 @@ bool CarPlayConnectivity::start(SessionServer& server,
 
     if (!config_.enable_wireless && !config_.enable_wired) {
         CARPLAY_LOG_INFO(kTag, "wireless and wired transports both disabled by config");
+        server_ = NULL;
+        identity_ = NULL;
         return true;
     }
 
@@ -581,6 +583,23 @@ bool CarPlayConnectivity::startWiredSubsystem() {
 
     if (!usb_bridge_->start(reactor_, &usb_adapter_)) {
         CARPLAY_LOG_WARN(kTag, "wired UsbCarPlayBridge failed to start");
+        usb_adapter_.setSession(NULL);
+        usb_adapter_.setDownstreamListener(NULL);
+        usb_adapter_.setBridge(NULL);
+        delete wired_iap2_session_;
+        wired_iap2_session_ = NULL;
+        delete usb_bridge_;
+        usb_bridge_ = NULL;
+        if (owned_usb_host_ != NULL) {
+            delete owned_usb_host_;
+            owned_usb_host_ = NULL;
+        }
+        if (owned_tap_port_ != NULL) {
+            delete owned_tap_port_;
+            owned_tap_port_ = NULL;
+        }
+        usb_host_ = NULL;
+        tap_port_ = NULL;
         wired_transport_ready_ = false;
         return false;
     }
@@ -741,6 +760,9 @@ void CarPlayConnectivity::onAirPlaySessionEnded() {
             server_->setWifiVideoQos(false);
         }
         setState(kConnWaiting, "direct AirPlay session ended");
+        if (started_ && !stopping_) {
+            ensureWiredRestartIfEnabled();
+        }
     }
 }
 
@@ -757,8 +779,7 @@ void CarPlayConnectivity::handleBtConnected(const BtAddr& peer) {
     if (!started_ || stopping_) {
         return;
     }
-    if (active_mode_ != kActiveNone ||
-        (state_ != kConnWaiting && state_ != kConnWirelessIap2)) {
+    if (active_mode_ != kActiveNone || state_ != kConnWaiting) {
         ++rejected_concurrent_attempts_;
         CARPLAY_LOG_WARN(kTag, "rejecting BT peer %s: busy in state %s (%s)",
                          peer.toString().c_str(),
@@ -767,13 +788,17 @@ void CarPlayConnectivity::handleBtConnected(const BtAddr& peer) {
         if (bt_transport_ != NULL) {
             bt_adapter_.setSession(NULL);
             bt_transport_->disconnect("busy with another CarPlay session");
-            bt_adapter_.setSession(wireless_iap2_session_);
         }
         return;
     }
 
     CARPLAY_LOG_INFO(kTag, "BT peer connected (%s); starting wireless iAP2 bootstrap",
                      peer.toString().c_str());
+    if (wireless_iap2_session_ != NULL &&
+        wireless_iap2_session_->state() != iap2::kSessionIdle) {
+        wireless_iap2_session_->reset(false);
+    }
+    bt_adapter_.setSession(wireless_iap2_session_);
     active_mode_ = kActiveWireless;
     if (server_ != NULL) {
         server_->setWifiVideoQos(true);
@@ -922,7 +947,9 @@ bool CarPlayConnectivity::handleWirelessStartSessionRequested(
     if (!populateWirelessStartSession(out)) {
         return false;
     }
-    setState(kConnWirelessWaitingAirPlay, "wireless 0x4301 CarPlayStartSession sent");
+    if (state_ != kConnActiveSession) {
+        setState(kConnWirelessWaitingAirPlay, "wireless 0x4301 CarPlayStartSession sent");
+    }
     return true;
 }
 
@@ -965,9 +992,17 @@ void CarPlayConnectivity::handleWifiApStarted(const WifiCredentials& creds) {
     if (listener_ != NULL) {
         listener_->onWirelessCredentialsReady(creds);
     }
+    if (!started_ || stopping_ || in_teardown_ || active_mode_ != kActiveWireless) {
+        return;
+    }
 
     startMdnsForWireless(creds);
-    setState(kConnWirelessWaitingAirPlay, "Wi-Fi AP ready");
+    if (state_ != kConnActiveSession) {
+        setState(kConnWirelessWaitingAirPlay, "Wi-Fi AP ready");
+    }
+    if (!started_ || stopping_ || in_teardown_ || active_mode_ != kActiveWireless) {
+        return;
+    }
 
     if (wireless_iap2_session_ != NULL && wireless_iap2_session_->isIdentified() &&
         creds.ssid != last_advertised_wireless_ssid_) {
@@ -1061,6 +1096,10 @@ void CarPlayConnectivity::teardownWirelessSession(const std::string& reason, boo
     if (is_failure) {
         ++failure_teardowns_;
         reportError(reason);
+        if (!started_ || stopping_) {
+            in_teardown_ = false;
+            return;
+        }
     } else {
         CARPLAY_LOG_INFO(kTag, "tearing down wireless session: %s", reason.c_str());
     }
@@ -1079,6 +1118,7 @@ void CarPlayConnectivity::teardownWirelessSession(const std::string& reason, boo
     wifi_ap_.stopSync();
     active_wifi_creds_ = WifiCredentials();
 
+    bt_adapter_.setSession(NULL);
     if (wireless_iap2_session_ != NULL &&
         wireless_iap2_session_->state() != iap2::kSessionIdle) {
         const bool send_rst = bt_transport_ != NULL && bt_transport_->isConnected();
@@ -1094,8 +1134,13 @@ void CarPlayConnectivity::teardownWirelessSession(const std::string& reason, boo
     active_mode_ = kActiveNone;
 
     in_teardown_ = false;
+    if (!started_ || stopping_) {
+        return;
+    }
     setState(kConnWaiting, reason.c_str());
-    ensureWiredRestartIfEnabled();
+    if (started_ && !stopping_) {
+        ensureWiredRestartIfEnabled();
+    }
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -1108,7 +1153,8 @@ void CarPlayConnectivity::handleUsbIap2Ready(const usb::Iap2InterfaceSelection& 
     if (!started_ || stopping_) {
         return;
     }
-    if (active_mode_ != kActiveNone && active_mode_ != kActiveWired) {
+    if ((active_mode_ != kActiveNone && active_mode_ != kActiveWired) ||
+        (active_mode_ == kActiveNone && state_ != kConnWaiting && state_ != kConnWiredConfiguring)) {
         ++rejected_concurrent_attempts_;
         CARPLAY_LOG_WARN(kTag, "rejecting wired USB device: busy in state %s (%s)",
                          connectivityStateName(state_),
@@ -1170,7 +1216,8 @@ void CarPlayConnectivity::handleUsbNcmReady(const std::string& tap_ifname,
         pending_wired_start_session_ = false;
         iap2::StartSessionConfig scfg;
         if (populateWiredStartSession(scfg)) {
-            if (wired_iap2_session_->sendStartCarPlaySession(scfg)) {
+            if (wired_iap2_session_->sendStartCarPlaySession(scfg) &&
+                state_ != kConnActiveSession) {
                 setState(kConnWiredWaitingAirPlay, "NCM ready & wired 0x4301 sent");
             }
         }
@@ -1266,7 +1313,9 @@ bool CarPlayConnectivity::handleWiredStartSessionRequested(
     if (!populateWiredStartSession(out)) {
         return false;
     }
-    setState(kConnWiredWaitingAirPlay, "wired 0x4301 CarPlayStartSession sent");
+    if (state_ != kConnActiveSession) {
+        setState(kConnWiredWaitingAirPlay, "wired 0x4301 CarPlayStartSession sent");
+    }
     return true;
 }
 
@@ -1280,6 +1329,10 @@ void CarPlayConnectivity::teardownWiredSession(const std::string& reason,
     if (is_failure) {
         ++failure_teardowns_;
         reportError(reason);
+        if (!started_ || stopping_) {
+            in_teardown_ = false;
+            return;
+        }
     } else {
         CARPLAY_LOG_INFO(kTag, "tearing down wired session: %s", reason.c_str());
     }
@@ -1301,7 +1354,8 @@ void CarPlayConnectivity::teardownWiredSession(const std::string& reason,
             // Stop the bridge to synchronously close TAP and release all USB interfaces.
             usb_bridge_->stop();
             wired_transport_ready_ = false;
-            if (config_.enable_wired && config_.wired_failure_retry_ms > 0 &&
+            if (started_ && !stopping_ &&
+                config_.enable_wired && config_.wired_failure_retry_ms > 0 &&
                 wired_retry_timer_ == Reactor::kNoTimer) {
                 wired_retry_timer_ = reactor_.startTimer(config_.wired_failure_retry_ms,
                                                          0,
@@ -1315,6 +1369,9 @@ void CarPlayConnectivity::teardownWiredSession(const std::string& reason,
     active_mode_ = kActiveNone;
 
     in_teardown_ = false;
+    if (!started_ || stopping_) {
+        return;
+    }
     setState(kConnWaiting, reason.c_str());
 }
 
@@ -1354,11 +1411,17 @@ void CarPlayConnectivity::handleTimer(uint32_t timer_id) {
         wireless_iap2_session_->state() != iap2::kSessionIdle &&
         wireless_iap2_session_->state() != iap2::kSessionFailed) {
         wireless_iap2_session_->tick(now_ms);
+        if (!started_ || stopping_) {
+            return;
+        }
     }
     if (wired_iap2_session_ != NULL &&
         wired_iap2_session_->state() != iap2::kSessionIdle &&
         wired_iap2_session_->state() != iap2::kSessionFailed) {
         wired_iap2_session_->tick(now_ms);
+        if (!started_ || stopping_) {
+            return;
+        }
     }
 
     if (config_.handoff_timeout_ms > 0 &&

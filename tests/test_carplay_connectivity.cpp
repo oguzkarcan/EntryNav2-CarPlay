@@ -893,6 +893,240 @@ TEST_CASE(wiredOnlyModeRunsAlpsCompatAsInformational) {
     server.stop();
 }
 
+class StopOnErrorListener : public plat::CarPlayConnectivityListener {
+public:
+    explicit StopOnErrorListener(plat::CarPlayConnectivity* conn)
+        : conn_(conn), stop_on_error(false), stop_on_creds(false), errors(0), creds(0) {}
+
+    virtual void onConnectivityError(const std::string& /*reason*/) {
+        ++errors;
+        if (stop_on_error && conn_ != NULL) {
+            conn_->stop();
+        }
+    }
+    virtual void onWirelessCredentialsReady(const plat::WifiCredentials& /*c*/) {
+        ++creds;
+        if (stop_on_creds && conn_ != NULL) {
+            conn_->stop();
+        }
+    }
+
+    plat::CarPlayConnectivity* conn_;
+    bool stop_on_error;
+    bool stop_on_creds;
+    int errors;
+    int creds;
+};
+
+class FailingStartUsbHost : public FakeGateUsbHost {
+public:
+    virtual bool start(plat::Reactor&, plat::UsbHostListener*) {
+        started = false;
+        return false;
+    }
+};
+
+class ReadyBulkUsbHost : public FakeGateUsbHost {
+public:
+    ReadyBulkUsbHost() : next_urb_(1U) {}
+    virtual uint64_t submitBulkIn(uint8_t, size_t, void*) { return next_urb_++; }
+    virtual uint64_t submitBulkOut(uint8_t, const uint8_t*, size_t, bool, void*) { return next_urb_++; }
+    uint64_t next_urb_;
+};
+
+TEST_CASE(waveCReviewRegressionGuards) {
+    g_fake_now_ns = 30000000000LL;
+    plat::Reactor reactor(&fakeClockNs);
+    REQUIRE(reactor.init());
+    plat::OsRandomSource rng;
+    pairing::Identity id;
+    REQUIRE(pairing::generateIdentity(rng, id));
+    pairing::InMemoryPairingStore store;
+    info::AirPlayConfig ap_cfg = info::bmwEntryNav2_800x480(false);
+    NoopSessionListener sl;
+    NoopMediaHandler mh;
+    plat::SessionServerConfig scfg;
+    scfg.control_port = 0U;
+    plat::SessionServer server(reactor, ap_cfg, id, store, rng, sl, mh, NULL, scfg);
+    REQUIRE(server.start(plat::Address::ipv4Loopback(0U)));
+
+    // 1. Rejected BT peer while direct AirPlay is active must NOT start wireless iAP2 session.
+    //    Also, wired USB arrival while direct AirPlay is active must be rejected and later restart.
+    {
+        plat::CarPlayConnectivity conn(reactor, rng);
+        MockBtTransport mock_bt;
+        ReadyBulkUsbHost fake_usb;
+        FakeGateTapPort fake_tap;
+        conn.setBtTransportForTest(&mock_bt);
+        conn.setUsbHostForTest(&fake_usb);
+        conn.setTapPortForTest(&fake_tap);
+
+        plat::CarPlayConnectivityConfig ccfg;
+        ccfg.enable_wireless = true;
+        ccfg.enable_wired = true;
+        ccfg.iap2_tick_interval_ms = 20;
+        REQUIRE(conn.start(server, ap_cfg, id, ccfg));
+        CHECK_EQ(plat::kConnWaiting, conn.state());
+        CHECK(fake_usb.started);
+
+        // Simulate direct AirPlay session active (active_mode == kActiveNone, state == kConnActiveSession).
+        conn.onAirPlaySessionStarted();
+        CHECK_EQ(plat::kConnActiveSession, conn.state());
+
+        plat::BtAddr peer;
+        REQUIRE(plat::BtAddr::parse("AA:BB:CC:DD:EE:03", peer));
+        mock_bt.connectPeer(peer);
+        CHECK_EQ(1ULL, conn.rejectedConcurrentAttempts());
+        CHECK_EQ(1, mock_bt.disconnect_calls);
+        CHECK(mock_bt.tx.empty());
+        REQUIRE(conn.wirelessIap2Session() != NULL);
+        CHECK_EQ(carplay::iap2::kSessionIdle, conn.wirelessIap2Session()->state());
+
+        // Wired USB interface arriving during direct AirPlay is also rejected.
+        carplay::usb::ConfigurationDescriptor cfg;
+        cfg.configuration_value = 1U;
+        carplay::usb::InterfaceDescriptor iface;
+        iface.number = 2U;
+        iface.interface_class = carplay::usb::kAppleIap2Class;
+        iface.interface_subclass = carplay::usb::kAppleIap2SubClass;
+        iface.interface_protocol = carplay::usb::kAppleIap2Protocol;
+        carplay::usb::EndpointDescriptor ep_in;
+        ep_in.address = 0x81U;
+        ep_in.attributes = carplay::usb::kEpTypeBulk;
+        ep_in.max_packet_size = 512U;
+        carplay::usb::EndpointDescriptor ep_out;
+        ep_out.address = 0x01U;
+        ep_out.attributes = carplay::usb::kEpTypeBulk;
+        ep_out.max_packet_size = 512U;
+        iface.endpoints.push_back(ep_in);
+        iface.endpoints.push_back(ep_out);
+        cfg.interfaces.push_back(iface);
+        std::vector<carplay::usb::ConfigurationDescriptor> cfgs(1U, cfg);
+        const_cast<plat::UsbCarPlayBridge*>(conn.usbBridge())->onUsbDeviceArrived(
+            plat::UsbDeviceInfo(), carplay::usb::DeviceDescriptor(), cfgs);
+        CHECK_EQ(2ULL, conn.rejectedConcurrentAttempts());
+        CHECK(!conn.wiredTransportReady());
+        CHECK_EQ(plat::kConnActiveSession, conn.state());
+
+        // Ending direct AirPlay restarts wired scanning and allows subsequent BT connect.
+        conn.onAirPlaySessionEnded();
+        CHECK_EQ(plat::kConnWaiting, conn.state());
+        CHECK(conn.wiredTransportReady());
+
+        mock_bt.connectPeer(peer);
+        CHECK_EQ(plat::kConnWirelessIap2, conn.state());
+        CHECK(!mock_bt.tx.empty());
+        CHECK_EQ(carplay::iap2::kSessionDetecting, conn.wirelessIap2Session()->state());
+
+        conn.stop();
+    }
+
+    // 2. Reentrant stop() from onConnectivityError() during teardown must stay kConnStopped.
+    {
+        plat::CarPlayConnectivity conn(reactor, rng);
+        StopOnErrorListener listener(&conn);
+        listener.stop_on_error = true;
+        MockBtTransport mock_bt;
+        conn.setListener(&listener);
+        conn.setBtTransportForTest(&mock_bt);
+
+        plat::CarPlayConnectivityConfig ccfg;
+        ccfg.enable_wireless = true;
+        ccfg.iap2_tick_interval_ms = 0;
+        REQUIRE(conn.start(server, ap_cfg, id, ccfg));
+
+        plat::BtAddr peer;
+        REQUIRE(plat::BtAddr::parse("AA:BB:CC:DD:EE:04", peer));
+        mock_bt.connectPeer(peer);
+        CHECK_EQ(plat::kConnWirelessIap2, conn.state());
+
+        mock_bt.disconnect("unexpected drop");
+        CHECK_EQ(1, listener.errors);
+        CHECK(!conn.isStarted());
+        CHECK_EQ(plat::kConnStopped, conn.state());
+        CHECK_EQ(plat::kActiveNone, conn.activeTransport());
+    }
+
+    // 3. Reentrant stop() from onWirelessCredentialsReady() must stay kConnStopped.
+    {
+        plat::CarPlayConnectivity conn(reactor, rng);
+        StopOnErrorListener listener(&conn);
+        listener.stop_on_creds = true;
+        MockBtTransport mock_bt;
+        MockAuthProvider mock_auth;
+        MockWlanCtrl mock_wlan;
+        MockApReader mock_ap_reader;
+        MockHostapdCtrl mock_ctrl;
+        conn.setListener(&listener);
+        conn.setBtTransportForTest(&mock_bt);
+        conn.setIap2AuthProvider(&mock_auth);
+        conn.wifiAp().setWlanControllerForTest(&mock_wlan);
+        conn.wifiAp().setAccessPointReaderForTest(&mock_ap_reader);
+        conn.wifiAp().setHostapdCtrlForTest(&mock_ctrl);
+        conn.wifiAp().setNativeCapabilityForTest(1);
+
+        plat::CarPlayConnectivityConfig ccfg;
+        ccfg.enable_wireless = true;
+        ccfg.iap2_tick_interval_ms = 0;
+        ccfg.start_mdns_on_wireless = false;
+        ccfg.wifi_ap_config.backend = plat::kWifiApBackendNative;
+        REQUIRE(conn.start(server, ap_cfg, id, ccfg));
+
+        plat::BtAddr peer;
+        REQUIRE(plat::BtAddr::parse("AA:BB:CC:DD:EE:05", peer));
+        mock_bt.connectPeer(peer);
+        mock_bt.rx(Bytes(iap2::kDetectSequence, iap2::kDetectSequence + iap2::kDetectSequenceBytes));
+        iap2::LinkPacket acc_syn;
+        REQUIRE(iap2::LinkPacket::decode(&mock_bt.tx[iap2::kDetectSequenceBytes],
+                                         mock_bt.tx.size() - iap2::kDetectSequenceBytes, acc_syn));
+        iap2::SynPayload dev_syn;
+        dev_syn.sessions.push_back(iap2::SynSession(10U, iap2::kSessionTypeControl, 2U));
+        iap2::LinkPacket syn_ack;
+        syn_ack.control = static_cast<uint8_t>(iap2::kCtrlSyn | iap2::kCtrlAck);
+        syn_ack.seq = 12U;
+        syn_ack.ack = acc_syn.seq;
+        REQUIRE(dev_syn.encode(syn_ack.payload));
+        Bytes raw_syn_ack;
+        REQUIRE(syn_ack.encode(raw_syn_ack));
+        mock_bt.rx(raw_syn_ack);
+
+        uint8_t dev_seq = 12U;
+        mock_bt.rx(buildPeerFramePacket(dev_seq, acc_syn.seq, 10U, iap2::msg::kStartIdentification));
+        mock_bt.rx(buildPeerFramePacket(dev_seq, acc_syn.seq, 10U, iap2::msg::kIdentificationAccepted));
+        mock_bt.rx(buildPeerFramePacket(dev_seq, acc_syn.seq, 10U, iap2::msg::kRequestAuthenticationCertificate));
+        iap2::ParameterList chal;
+        chal.addRaw(iap2::param::kAuthChallengeData, Bytes(16U, 0x22U));
+        mock_bt.rx(buildPeerFramePacket(dev_seq, acc_syn.seq, 10U,
+                                        iap2::msg::kRequestAuthenticationChallengeResponse, chal));
+        mock_bt.rx(buildPeerFramePacket(dev_seq, acc_syn.seq, 10U, iap2::msg::kAuthenticationSucceeded));
+
+        CHECK_EQ(1, listener.creds);
+        CHECK(!conn.isStarted());
+        CHECK_EQ(plat::kConnStopped, conn.state());
+        CHECK_EQ(plat::kWifiApStopped, conn.wifiAp().state());
+    }
+
+    // 4. Failed wired start cleans up half-initialized bridge/session pointers.
+    {
+        plat::CarPlayConnectivity conn(reactor, rng);
+        FailingStartUsbHost fail_usb;
+        FakeGateTapPort fake_tap;
+        conn.setUsbHostForTest(&fail_usb);
+        conn.setTapPortForTest(&fake_tap);
+
+        plat::CarPlayConnectivityConfig ccfg;
+        ccfg.enable_wired = true;
+        ccfg.iap2_tick_interval_ms = 0;
+        REQUIRE(conn.start(server, ap_cfg, id, ccfg));
+        CHECK(!conn.wiredTransportReady());
+        CHECK(conn.usbBridge() == NULL);
+        CHECK(conn.wiredIap2Session() == NULL);
+        conn.stop();
+    }
+
+    server.stop();
+}
+
 }  // namespace
 
 int main() {

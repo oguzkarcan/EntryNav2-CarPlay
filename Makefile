@@ -96,7 +96,7 @@ TEST_HDRS   := $(wildcard tests/*.hpp)
 TEST_SRCS := $(sort $(wildcard tests/test_*.cpp))
 TEST_BINS := $(patsubst tests/%.cpp,$(BUILD_DIR)/%$(BIN_EXT),$(TEST_SRCS))
 
-.PHONY: all core platform daemon hmiapp hmiapp-res install-layout tests test-host clean arm-core arm-platform arm-daemon arm-hmiapp
+.PHONY: all core platform daemon hmiapp hmiapp-res install-layout tests test-host fuzz clean arm-core arm-platform arm-daemon arm-hmiapp
 
 all: test-host
 
@@ -193,6 +193,9 @@ arm-hmiapp:
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
+
+fuzz:
+	sh scripts/ci/fuzz.sh
 
 clean:
 	rm -rf build
