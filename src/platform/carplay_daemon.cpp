@@ -61,6 +61,7 @@ CarPlayDaemon::CarPlayDaemon(const CarPlayDaemonConfig& config)
       media_sink_(audio_sink_, mic_, this),
       media_engine_(NULL),
       server_(NULL),
+      connectivity_(reactor_, rng_),
       knob_(),
       touch_(),
       input_bridge_(NULL),
@@ -230,6 +231,19 @@ bool CarPlayDaemon::start() {
         tick_timer_ = reactor_.startTimer(config_.tick_interval_ms, config_.tick_interval_ms, this);
     }
 
+    CarPlayConnectivityConfig conn_cfg = config_.connectivity_config;
+    if (config_.enable_wireless) {
+        conn_cfg.enable_wireless = true;
+    }
+    if (config_.enable_wired) {
+        conn_cfg.enable_wired = true;
+    }
+    if (!connectivity_.start(*server_, airplay_config_, identity_, conn_cfg)) {
+        CARPLAY_LOG_ERROR("daemon", "CarPlayDaemon: CarPlayConnectivity failed to start");
+        stop();
+        return false;
+    }
+
     started_ = true;
     stepVisibility();
     return true;
@@ -267,6 +281,8 @@ void CarPlayDaemon::stop() {
         delete input_bridge_;
         input_bridge_ = NULL;
     }
+
+    connectivity_.stop();
 
     if (server_ != NULL) {
         server_->stop();
@@ -493,12 +509,14 @@ void CarPlayDaemon::activateSessionFocus() {
 // ---- session::SessionListener ----
 
 void CarPlayDaemon::onSessionActive(session::Session& /*session*/) {
+    connectivity_.onAirPlaySessionStarted();
     activateSessionFocus();
 }
 
 void CarPlayDaemon::onDeviceInfo(session::Session& /*session*/, const session::DeviceInfo& info) {
     CARPLAY_LOG_INFO("daemon", "CarPlayDaemon: device connected name=\"%s\" model=\"%s\"",
                      info.name.c_str(), info.model.c_str());
+    connectivity_.onAirPlaySessionStarted();
     activateSessionFocus();
 }
 
@@ -519,6 +537,7 @@ void CarPlayDaemon::onCommand(session::Session& /*session*/,
 }
 
 void CarPlayDaemon::onSessionEnded(session::Session& /*session*/) {
+    connectivity_.onAirPlaySessionEnded();
     session_focus_initialized_ = false;
     mic_.stopCapture();
     audio_sink_.stopAll();
@@ -566,6 +585,10 @@ void CarPlayDaemon::onVideoFrame(int32_t type,
     if (!was_ready && video_.isReady()) {
         stepVisibility();
     }
+}
+
+void CarPlayDaemon::onIapMessage(const uint8_t* data, size_t len) {
+    connectivity_.onAirPlayIapMessage(data, len);
 }
 
 // ---- EvoInputListener ----

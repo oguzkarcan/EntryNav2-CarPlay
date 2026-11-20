@@ -23,6 +23,7 @@
 #include "carplay/airplay_info.hpp"
 #include "carplay/airplay_session.hpp"
 #include "carplay/pairing.hpp"
+#include "carplay/platform/carplay_connectivity.hpp"
 #include "carplay/platform/evo_audio.hpp"
 #include "carplay/platform/evo_control.hpp"
 #include "carplay/platform/evo_ilm.hpp"
@@ -61,6 +62,11 @@ struct CarPlayDaemonConfig {
     bool enable_audio;
     bool enable_input;
     bool enable_control;
+    /// Safe defaults: both wireless and wired transports are disabled by default so `carplayd`
+    /// never borrows ALPS SPP slot 5, toggles car-native Wi-Fi AP, or touches Apple USB devices
+    /// alongside BMW MediaPlayer/CARPLAY unless explicitly enabled (or passed --wireless / --wired).
+    bool enable_wireless;
+    bool enable_wired;
 
     bool query_display_from_ilm;
     uint32_t fallback_width;
@@ -84,6 +90,7 @@ struct CarPlayDaemonConfig {
     EvoKnobConfig knob_config;
     SessionServerConfig server_config;
     MediaEngineConfig media_config;
+    CarPlayConnectivityConfig connectivity_config;
 
     CarPlayDaemonConfig()
         : control_port(7000U),
@@ -100,6 +107,8 @@ struct CarPlayDaemonConfig {
           enable_audio(true),
           enable_input(true),
           enable_control(true),
+          enable_wireless(false),
+          enable_wired(false),
           query_display_from_ilm(true),
           fallback_width(800U),
           fallback_height(480U),
@@ -114,7 +123,8 @@ struct CarPlayDaemonConfig {
           mic_config(),
           knob_config(),
           server_config(),
-          media_config() {}
+          media_config(),
+          connectivity_config() {}
 };
 
 class CarPlayDaemon : public session::SessionListener,
@@ -174,6 +184,8 @@ public:
     SessionServer* server() { return server_; }
     MediaEngine* mediaEngine() { return media_engine_; }
     FilePairingStore* pairingStore() { return pairing_store_; }
+    CarPlayConnectivity& connectivity() { return connectivity_; }
+    const CarPlayConnectivity& connectivity() const { return connectivity_; }
 
     // ---- TimerHandler (Reactor thread) ----
     virtual void onTimer(uint32_t timer_id);
@@ -202,6 +214,7 @@ public:
                               size_t len,
                               uint64_t sender_nanos,
                               int64_t arrival_mono_nanos);
+    virtual void onIapMessage(const uint8_t* data, size_t len);
 
     // ---- EvoInputListener (Reactor thread) ----
     virtual void onUiKey(CcsKey key, bool pressed, const char* name);
@@ -237,6 +250,7 @@ private:
 
     MediaEngine* media_engine_;
     SessionServer* server_;
+    CarPlayConnectivity connectivity_;
 
     EvoKnob knob_;
     EvoTouch touch_;
