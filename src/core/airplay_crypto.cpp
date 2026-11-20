@@ -264,5 +264,333 @@ bool chacha20Poly1305Open(const uint8_t key[kKeyBytes],
     return true;
 }
 
+namespace {
+
+inline uint32_t rotl32(uint32_t v, unsigned n) {
+    return (v << n) | (v >> (32U - n));
+}
+
+inline uint32_t rotr32(uint32_t v, unsigned n) {
+    return (v >> n) | (v << (32U - n));
+}
+
+inline uint32_t loadBe32(const uint8_t* p) {
+    return (static_cast<uint32_t>(p[0]) << 24) |
+           (static_cast<uint32_t>(p[1]) << 16) |
+           (static_cast<uint32_t>(p[2]) << 8) |
+           static_cast<uint32_t>(p[3]);
+}
+
+inline void storeBe32(uint8_t* p, uint32_t v) {
+    p[0] = static_cast<uint8_t>((v >> 24) & 0xffU);
+    p[1] = static_cast<uint8_t>((v >> 16) & 0xffU);
+    p[2] = static_cast<uint8_t>((v >> 8) & 0xffU);
+    p[3] = static_cast<uint8_t>(v & 0xffU);
+}
+
+inline uint8_t aesXtime(uint8_t x) {
+    return static_cast<uint8_t>((x << 1) ^ ((x & 0x80U) ? 0x1bU : 0x00U));
+}
+
+uint8_t aesGfMul(uint8_t a, uint8_t b) {
+    uint8_t r = 0;
+    for (int i = 0; i < 8; ++i) {
+        if ((b & 1U) != 0) r ^= a;
+        a = aesXtime(a);
+        b >>= 1;
+    }
+    return r;
+}
+
+uint8_t aesSboxByte(uint8_t x) {
+    uint8_t inv = 0;
+    if (x != 0) {
+        uint8_t base = x;
+        uint8_t exp = 254U;
+        inv = 1;
+        while (exp > 0) {
+            if ((exp & 1U) != 0) inv = aesGfMul(inv, base);
+            base = aesGfMul(base, base);
+            exp >>= 1;
+        }
+    }
+    uint8_t s = 0x63U;
+    for (unsigned i = 0; i < 5; ++i) {
+        s ^= static_cast<uint8_t>((inv << i) | (inv >> (8U - i)));
+    }
+    return s;
+}
+
+void aesKeyExpansion128(const uint8_t key[kAes128KeyBytes], uint8_t round_keys[176]) {
+    std::memcpy(round_keys, key, kAes128KeyBytes);
+    uint8_t rcon = 0x01U;
+    size_t generated = 16;
+    while (generated < 176) {
+        uint8_t t0 = round_keys[generated - 4];
+        uint8_t t1 = round_keys[generated - 3];
+        uint8_t t2 = round_keys[generated - 2];
+        uint8_t t3 = round_keys[generated - 1];
+        if ((generated % 16) == 0) {
+            uint8_t tmp = t0;
+            t0 = aesSboxByte(t1) ^ rcon;
+            t1 = aesSboxByte(t2);
+            t2 = aesSboxByte(t3);
+            t3 = aesSboxByte(tmp);
+            rcon = aesXtime(rcon);
+        }
+        round_keys[generated + 0] = round_keys[generated - 16] ^ t0;
+        round_keys[generated + 1] = round_keys[generated - 15] ^ t1;
+        round_keys[generated + 2] = round_keys[generated - 14] ^ t2;
+        round_keys[generated + 3] = round_keys[generated - 13] ^ t3;
+        generated += 4;
+    }
+}
+
+void aesAddRoundKey(uint8_t state[16], const uint8_t* rk) {
+    for (int i = 0; i < 16; ++i) {
+        state[i] ^= rk[i];
+    }
+}
+
+void aesShiftRows(uint8_t s[16]) {
+    uint8_t t = s[1];
+    s[1] = s[5];
+    s[5] = s[9];
+    s[9] = s[13];
+    s[13] = t;
+
+    t = s[2];
+    s[2] = s[10];
+    s[10] = t;
+    t = s[6];
+    s[6] = s[14];
+    s[14] = t;
+
+    t = s[15];
+    s[15] = s[11];
+    s[11] = s[7];
+    s[7] = s[3];
+    s[3] = t;
+}
+
+void aesMixColumns(uint8_t s[16]) {
+    for (int c = 0; c < 4; ++c) {
+        uint8_t* col = s + c * 4;
+        uint8_t a0 = col[0], a1 = col[1], a2 = col[2], a3 = col[3];
+        uint8_t xor_all = a0 ^ a1 ^ a2 ^ a3;
+        col[0] = a0 ^ xor_all ^ aesXtime(a0 ^ a1);
+        col[1] = a1 ^ xor_all ^ aesXtime(a1 ^ a2);
+        col[2] = a2 ^ xor_all ^ aesXtime(a2 ^ a3);
+        col[3] = a3 ^ xor_all ^ aesXtime(a3 ^ a0);
+    }
+}
+
+void aesEncryptBlock128(const uint8_t round_keys[176], const uint8_t in[16], uint8_t out[16]) {
+    uint8_t s[16];
+    std::memcpy(s, in, 16);
+    aesAddRoundKey(s, round_keys);
+    for (int round = 1; round <= 10; ++round) {
+        for (int i = 0; i < 16; ++i) {
+            s[i] = aesSboxByte(s[i]);
+        }
+        aesShiftRows(s);
+        if (round < 10) {
+            aesMixColumns(s);
+        }
+        aesAddRoundKey(s, round_keys + round * 16);
+    }
+    std::memcpy(out, s, 16);
+    wipe(s, sizeof(s));
+}
+
+void sha1Transform(uint32_t state[5], const uint8_t block[64]) {
+    uint32_t w[80];
+    for (int i = 0; i < 16; ++i) {
+        w[i] = loadBe32(block + i * 4);
+    }
+    for (int i = 16; i < 80; ++i) {
+        w[i] = rotl32(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1U);
+    }
+    uint32_t a = state[0], b = state[1], c = state[2], d = state[3], e = state[4];
+    for (int i = 0; i < 80; ++i) {
+        uint32_t f = 0;
+        uint32_t k = 0;
+        if (i < 20) {
+            f = (b & c) | ((~b) & d);
+            k = 0x5A827999U;
+        } else if (i < 40) {
+            f = b ^ c ^ d;
+            k = 0x6ED9EBA1U;
+        } else if (i < 60) {
+            f = (b & c) | (b & d) | (c & d);
+            k = 0x8F1BBCDCU;
+        } else {
+            f = b ^ c ^ d;
+            k = 0xCA62C1D6U;
+        }
+        uint32_t temp = rotl32(a, 5U) + f + e + k + w[i];
+        e = d;
+        d = c;
+        c = rotl32(b, 30U);
+        b = a;
+        a = temp;
+    }
+    state[0] += a;
+    state[1] += b;
+    state[2] += c;
+    state[3] += d;
+    state[4] += e;
+    wipe(w, sizeof(w));
+}
+
+void sha256Transform(uint32_t state[8], const uint8_t block[64]) {
+    static const uint32_t kRound[64] = {
+        0x428a2f98U, 0x71374491U, 0xb5c0fbcfU, 0xe9b5dba5U, 0x3956c25bU, 0x59f111f1U, 0x923f82a4U, 0xab1c5ed5U,
+        0xd807aa98U, 0x12835b01U, 0x243185beU, 0x550c7dc3U, 0x72be5d74U, 0x80deb1feU, 0x9bdc06a7U, 0xc19bf174U,
+        0xe49b69c1U, 0xefbe4786U, 0x0fc19dc6U, 0x240ca1ccU, 0x2de92c6fU, 0x4a7484aaU, 0x5cb0a9dcU, 0x76f988daU,
+        0x983e5152U, 0xa831c66dU, 0xb00327c8U, 0xbf597fc7U, 0xc6e00bf3U, 0xd5a79147U, 0x06ca6351U, 0x14292967U,
+        0x27b70a85U, 0x2e1b2138U, 0x4d2c6dfcU, 0x53380d13U, 0x650a7354U, 0x766a0abbU, 0x81c2c92eU, 0x92722c85U,
+        0xa2bfe8a1U, 0xa81a664bU, 0xc24b8b70U, 0xc76c51a3U, 0xd192e819U, 0xd6990624U, 0xf40e3585U, 0x106aa070U,
+        0x19a4c116U, 0x1e376c08U, 0x2748774cU, 0x34b0bcb5U, 0x391c0cb3U, 0x4ed8aa4aU, 0x5b9cca4fU, 0x682e6ff3U,
+        0x748f82eeU, 0x78a5636fU, 0x84c87814U, 0x8cc70208U, 0x90befffaU, 0xa4506cebU, 0xbef9a3f7U, 0xc67178f2U
+    };
+    uint32_t w[64];
+    for (int i = 0; i < 16; ++i) {
+        w[i] = loadBe32(block + i * 4);
+    }
+    for (int i = 16; i < 64; ++i) {
+        uint32_t s0 = rotr32(w[i - 15], 7U) ^ rotr32(w[i - 15], 18U) ^ (w[i - 15] >> 3);
+        uint32_t s1 = rotr32(w[i - 2], 17U) ^ rotr32(w[i - 2], 19U) ^ (w[i - 2] >> 10);
+        w[i] = w[i - 16] + s0 + w[i - 7] + s1;
+    }
+    uint32_t a = state[0], b = state[1], c = state[2], d = state[3];
+    uint32_t e = state[4], f = state[5], g = state[6], h = state[7];
+    for (int i = 0; i < 64; ++i) {
+        uint32_t S1 = rotr32(e, 6U) ^ rotr32(e, 11U) ^ rotr32(e, 25U);
+        uint32_t ch = (e & f) ^ ((~e) & g);
+        uint32_t temp1 = h + S1 + ch + kRound[i] + w[i];
+        uint32_t S0 = rotr32(a, 2U) ^ rotr32(a, 13U) ^ rotr32(a, 22U);
+        uint32_t maj = (a & b) ^ (a & c) ^ (b & c);
+        uint32_t temp2 = S0 + maj;
+        h = g;
+        g = f;
+        f = e;
+        e = d + temp1;
+        d = c;
+        c = b;
+        b = a;
+        a = temp1 + temp2;
+    }
+    state[0] += a;
+    state[1] += b;
+    state[2] += c;
+    state[3] += d;
+    state[4] += e;
+    state[5] += f;
+    state[6] += g;
+    state[7] += h;
+    wipe(w, sizeof(w));
+}
+
+template <typename TransformFn>
+void hashFinalize64(const uint8_t* data,
+                    size_t len,
+                    uint32_t* state,
+                    TransformFn transform_fn) {
+    uint8_t block[64];
+    size_t offset = 0;
+    while (len - offset >= 64U) {
+        transform_fn(state, data + offset);
+        offset += 64U;
+    }
+    const size_t rem = len - offset;
+    std::memset(block, 0, sizeof(block));
+    if (rem > 0 && data != NULL) {
+        std::memcpy(block, data + offset, rem);
+    }
+    block[rem] = 0x80U;
+    if (rem >= 56U) {
+        transform_fn(state, block);
+        std::memset(block, 0, sizeof(block));
+    }
+    const uint64_t bit_len = static_cast<uint64_t>(len) * 8ULL;
+    storeBe32(block + 56, static_cast<uint32_t>((bit_len >> 32) & 0xffffffffULL));
+    storeBe32(block + 60, static_cast<uint32_t>(bit_len & 0xffffffffULL));
+    transform_fn(state, block);
+    wipe(block, sizeof(block));
+}
+
+}  // namespace
+
+void sha1(const uint8_t* data, size_t len, uint8_t hash_out[kSha1Bytes]) {
+    if (hash_out == NULL) {
+        return;
+    }
+    static const uint8_t dummy = 0;
+    const uint8_t* src = (len > 0 && data != NULL) ? data : &dummy;
+    uint32_t state[5] = {
+        0x67452301U, 0xEFCDAB89U, 0x98BADCFEU, 0x10325476U, 0xC3D2E1F0U
+    };
+    hashFinalize64(src, len, state, sha1Transform);
+    for (int i = 0; i < 5; ++i) {
+        storeBe32(hash_out + i * 4, state[i]);
+    }
+    wipe(state, sizeof(state));
+}
+
+void sha256(const uint8_t* data, size_t len, uint8_t hash_out[kSha256Bytes]) {
+    if (hash_out == NULL) {
+        return;
+    }
+    static const uint8_t dummy = 0;
+    const uint8_t* src = (len > 0 && data != NULL) ? data : &dummy;
+    uint32_t state[8] = {
+        0x6a09e667U, 0xbb67ae85U, 0x3c6ef372U, 0xa54ff53aU,
+        0x510e527fU, 0x9b05688cU, 0x1f83d9abU, 0x5be0cd19U
+    };
+    hashFinalize64(src, len, state, sha256Transform);
+    for (int i = 0; i < 8; ++i) {
+        storeBe32(hash_out + i * 4, state[i]);
+    }
+    wipe(state, sizeof(state));
+}
+
+bool aes128Ctr(const uint8_t key[kAes128KeyBytes],
+               const uint8_t iv[kAesBlockBytes],
+               const uint8_t* input,
+               size_t len,
+               uint8_t* output) {
+    if (key == NULL || iv == NULL) {
+        return false;
+    }
+    if (len > 0 && (input == NULL || output == NULL)) {
+        return false;
+    }
+    uint8_t round_keys[176];
+    aesKeyExpansion128(key, round_keys);
+    uint8_t counter[16];
+    std::memcpy(counter, iv, 16);
+    uint8_t keystream[16];
+
+    size_t offset = 0;
+    while (offset < len) {
+        aesEncryptBlock128(round_keys, counter, keystream);
+        const size_t chunk = (len - offset < 16U) ? (len - offset) : 16U;
+        for (size_t i = 0; i < chunk; ++i) {
+            output[offset + i] = input[offset + i] ^ keystream[i];
+        }
+        offset += chunk;
+        for (int i = 15; i >= 0; --i) {
+            if (++counter[i] != 0U) {
+                break;
+            }
+        }
+    }
+    wipe(round_keys, sizeof(round_keys));
+    wipe(counter, sizeof(counter));
+    wipe(keystream, sizeof(keystream));
+    return true;
+}
+
 }  // namespace crypto
 }  // namespace carplay

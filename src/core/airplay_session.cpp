@@ -6,6 +6,7 @@
 #include "carplay/airplay_session.hpp"
 
 #include "carplay/audio_rtp.hpp"
+#include "carplay/mfi_sap.hpp"
 
 #include <limits>
 
@@ -140,6 +141,7 @@ Session::Session(const info::AirPlayConfig& config,
       media_(media),
       transport_(transport),
       auth_(auth),
+      rng_(rng),
       policy_(policy),
       pair_setup_(identity, store, rng),
       pair_verify_(identity, store, rng),
@@ -342,11 +344,21 @@ bool Session::handle(const rtsp::Request& request, rtsp::Response& response) {
             pair_verify_.handle(request.body, response.body);
             response.headers.push_back(rtsp::Header("Content-Type", rtsp::kContentTypePairingTlv8));
             return true;
-        case kRouteAuthSetup:
-            // MFiSAP deferred to Phase 5: 400 with or without an AuthProvider (see AuthProvider).
-            (void)auth_;
-            response = rtsp::Response(400);
+        case kRouteAuthSetup: {
+            if (auth_ == NULL) {
+                response = rtsp::Response(400);
+                return true;
+            }
+            std::vector<uint8_t> auth_resp;
+            if (!mfi_sap::handleAuthSetup(request.body, *auth_, rng_, auth_resp)) {
+                response = rtsp::Response(400);
+                return true;
+            }
+            response = rtsp::Response(200);
+            response.headers.push_back(rtsp::Header("Content-Type", rtsp::kContentTypeOctetStream));
+            response.body.swap(auth_resp);
             return true;
+        }
         case kRouteInfo:
             if (!info::encodeInfo(config_, response.body)) return false;
             response.headers.push_back(rtsp::Header("Content-Type", rtsp::kContentTypeBinaryPlist));

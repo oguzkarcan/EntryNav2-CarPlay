@@ -521,6 +521,7 @@ public:
             AuthProvider& auth,
             SessionListener& listener,
             const SessionConfig& config = SessionConfig());
+    ~Session();
 
     void start();
     void reset(bool send_rst = true);
@@ -577,8 +578,28 @@ private:
         Session& owner_;
     };
 
+    class AuthAdapter : public AuthCallback {
+    public:
+        explicit AuthAdapter(Session& owner) : owner_(owner) {}
+        virtual void onCertificateComplete(uint64_t op_id,
+                                           bool ok,
+                                           const std::vector<uint8_t>& certificate);
+        virtual void onSignatureComplete(uint64_t op_id,
+                                         bool ok,
+                                         const std::vector<uint8_t>& signature);
+    private:
+        Session& owner_;
+    };
+
+    enum PendingAuthKind {
+        kPendingAuthNone = 0,
+        kPendingAuthCert = 1,
+        kPendingAuthSign = 2
+    };
+
     void setState(SessionState next);
     void failSession(const std::string& reason);
+    void cancelPendingAuth();
     void enterReadyState();
     void advanceWirelessStage(WirelessControlStage next);
     bool resolveWiFiConfiguration(WiFiConfiguration& out);
@@ -597,7 +618,11 @@ private:
     void handleCancelIdentification();
     void handleIdentificationUpdate(const Frame& frame);
     void handleRequestAuthCertificate();
+    void finishAuthCertificate(bool ok, const std::vector<uint8_t>& cert);
     void handleRequestAuthChallengeResponse(const Frame& frame);
+    void finishAuthChallengeResponse(bool ok, const std::vector<uint8_t>& sig);
+    void onAuthCertificateComplete(uint64_t op_id, bool ok, const std::vector<uint8_t>& cert);
+    void onAuthSignatureComplete(uint64_t op_id, bool ok, const std::vector<uint8_t>& sig);
     void handleAuthFailed();
     void handleAuthSucceeded();
     void handleRequestAccessoryWiFiConfig();
@@ -608,8 +633,12 @@ private:
     SessionListener& listener_;
     SessionConfig config_;
     LinkAdapter link_adapter_;
+    AuthAdapter auth_adapter_;
     Link link_;
     CsmFramer framer_;
+
+    PendingAuthKind pending_auth_kind_;
+    uint64_t pending_auth_op_id_;
 
     SessionState state_;
     uint8_t control_session_id_;

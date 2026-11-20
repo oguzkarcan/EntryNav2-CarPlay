@@ -33,6 +33,7 @@
 #include "carplay/platform/evo_touch.hpp"
 #include "carplay/platform/evo_video.hpp"
 #include "carplay/platform/media_engine.hpp"
+#include "carplay/platform/mfi_i2c.hpp"
 #include "carplay/platform/os_random.hpp"
 #include "carplay/platform/pairing_storage.hpp"
 #include "carplay/platform/peek_timing.hpp"
@@ -91,6 +92,7 @@ struct CarPlayDaemonConfig {
     SessionServerConfig server_config;
     MediaEngineConfig media_config;
     CarPlayConnectivityConfig connectivity_config;
+    MfiI2cConfig mfi_i2c_config;
 
     CarPlayDaemonConfig()
         : control_port(7000U),
@@ -124,7 +126,8 @@ struct CarPlayDaemonConfig {
           knob_config(),
           server_config(),
           media_config(),
-          connectivity_config() {}
+          connectivity_config(),
+          mfi_i2c_config() {}
 };
 
 class CarPlayDaemon : public session::SessionListener,
@@ -186,6 +189,11 @@ public:
     FilePairingStore* pairingStore() { return pairing_store_; }
     CarPlayConnectivity& connectivity() { return connectivity_; }
     const CarPlayConnectivity& connectivity() const { return connectivity_; }
+    I2cMfiAuthProvider* mfiAuth() { return mfi_auth_; }
+    const I2cMfiAuthProvider* mfiAuth() const { return mfi_auth_; }
+
+    /// Test hook: inject a non-owning fake I2cBackend before start() when mfi_i2c_config.enabled is true.
+    void setMfiI2cBackendForTest(I2cBackend* backend) { mfi_backend_override_ = backend; }
 
     // ---- TimerHandler (Reactor thread) ----
     virtual void onTimer(uint32_t timer_id);
@@ -249,6 +257,8 @@ private:
     EvoAudioMediaSink media_sink_;
 
     MediaEngine* media_engine_;
+    I2cBackend* mfi_backend_override_;
+    I2cMfiAuthProvider* mfi_auth_;
     SessionServer* server_;
     CarPlayConnectivity connectivity_;
 
