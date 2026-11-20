@@ -77,6 +77,8 @@ void printUsage(const char* argv0) {
         "  --no-wireless          Disable Wireless CarPlay (default)\n"
         "  --wired                Enable Wired USB CarPlay (usbfs + CDC-NCM/TAP)\n"
         "  --no-wired             Disable Wired USB CarPlay (default)\n"
+        "  --mfi-i2c DEV[:ADDR]   Enable I2C MFi coprocessor auth (e.g. /dev/i2c-0:0x10; default off)\n"
+        "  --no-mfi-i2c           Disable I2C MFi coprocessor auth (default)\n"
         "  --compat               Run dry-run vehicle compatibility self-check and exit\n"
         "  --self-check           Alias for --compat\n"
         "  --service              Supervisor compatibility flag (default mode)\n"
@@ -116,6 +118,8 @@ struct CliOverrides {
     bool wireless;
     bool has_wired;
     bool wired;
+    bool has_mfi_i2c;
+    carplay::platform::MfiI2cConfig mfi_i2c_config;
 
     CliOverrides()
         : compat_mode(false),
@@ -144,7 +148,9 @@ struct CliOverrides {
           has_wireless(false),
           wireless(false),
           has_wired(false),
-          wired(false) {}
+          wired(false),
+          has_mfi_i2c(false),
+          mfi_i2c_config() {}
 };
 
 }  // namespace
@@ -236,6 +242,21 @@ int main(int argc, char** argv) {
         } else if (strcmp(arg, "--no-wired") == 0) {
             cli.has_wired = true;
             cli.wired = false;
+        } else if (strncmp(arg, "--mfi-i2c=", 10) == 0 || (strcmp(arg, "--mfi-i2c") == 0 && val != NULL)) {
+            const char* spec = (strncmp(arg, "--mfi-i2c=", 10) == 0) ? (arg + 10) : val;
+            std::string mfi_err;
+            if (!carplay::platform::parseMfiI2cSpec(spec, cli.mfi_i2c_config, &mfi_err)) {
+                fprintf(stderr, "carplayd: invalid --mfi-i2c: %s\n", mfi_err.c_str());
+                return 2;
+            }
+            cli.has_mfi_i2c = true;
+            if (strncmp(arg, "--mfi-i2c=", 10) != 0) {
+                ++i;
+            }
+        } else if (strcmp(arg, "--no-mfi-i2c") == 0) {
+            cli.has_mfi_i2c = true;
+            cli.mfi_i2c_config = carplay::platform::MfiI2cConfig();
+            cli.mfi_i2c_config.enabled = false;
         } else {
             fprintf(stderr, "carplayd: unknown option: %s\n", arg);
             printUsage(argv[0]);
@@ -373,6 +394,9 @@ int main(int argc, char** argv) {
     if (cli.has_wired) {
         cfg.enable_wired = cli.wired;
         cfg.connectivity_config.enable_wired = cli.wired;
+    }
+    if (cli.has_mfi_i2c) {
+        cfg.mfi_i2c_config = cli.mfi_i2c_config;
     }
 
     signal(SIGINT, &onSignal);

@@ -172,17 +172,21 @@ public:
     virtual void closeAll() = 0;
 };
 
-/// Phase 5 seam for MFi / BAA authentication (/auth-setup).
+/// Phase 5 MFi authentication seam (/auth-setup).
 ///
-/// /auth-setup is currently ALWAYS answered with 400: without a provider exactly like the reference
-/// (mfi == null), and WITH a provider too, because the MFiSAP responder (X25519 + SHA-1/SHA-256 +
-/// AES-128-CTR, DiPlay MfiSapAuthSetup.kt) is deferred to Phase 5. The provider is stored but not yet
-/// called.
+/// When non-NULL on `Session`, `/auth-setup` runs MFiSAP (`MfiSapAuthSetup.kt`) and answers 200
+/// `application/octet-stream` (or 400 on malformed body / auth failure). When NULL, `/auth-setup`
+/// answers 400 matching DiPlay when `mfi == null`.
 class AuthProvider {
 public:
     virtual ~AuthProvider() {}
     virtual bool getCertificate(std::vector<uint8_t>& out) = 0;
     virtual bool signChallenge(const uint8_t* data, size_t len, std::vector<uint8_t>& signature_out) = 0;
+
+    /// Coprocessor protocol major version: 2 = CP 2.0C (SHA-1 digest), 3 = CP 3.0 (SHA-256 digest).
+    virtual int protocolMajor() const {
+        return 3;
+    }
 };
 
 /// Hardening knobs beyond the reference.
@@ -376,6 +380,7 @@ private:
     MediaHandler& media_;
     TransportHost& transport_;
     AuthProvider* auth_;
+    pairing::RandomSource& rng_;
     SessionPolicy policy_;
 
     pairing::PairSetup pair_setup_;

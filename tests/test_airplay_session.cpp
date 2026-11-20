@@ -370,17 +370,25 @@ struct FakeTransport : public session::TransportHost {
 
 struct FakeAuth : public session::AuthProvider {
     int calls;
-    FakeAuth() : calls(0) {}
+    int proto_major;
+    bool fail_cert;
+    bool fail_sign;
+    Bytes last_challenge;
+    FakeAuth() : calls(0), proto_major(3), fail_cert(false), fail_sign(false) {}
     virtual bool getCertificate(Bytes& out) {
         ++calls;
+        if (fail_cert) return false;
         out.assign(4, 1);
         return true;
     }
-    virtual bool signChallenge(const uint8_t*, size_t, Bytes& sig) {
+    virtual bool signChallenge(const uint8_t* data, size_t len, Bytes& sig) {
         ++calls;
+        last_challenge.assign(data, data + len);
+        if (fail_sign) return false;
         sig.assign(4, 2);
         return true;
     }
+    virtual int protocolMajor() const { return proto_major; }
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -1043,8 +1051,67 @@ TEST_CASE(teardownRules) {
     CHECK(!whole && types.empty());
 }
 
-TEST_CASE(authSetupAlways400) {
+uint32_t readBe32(const uint8_t* p) {
+    return (static_cast<uint32_t>(p[0]) << 24) |
+           (static_cast<uint32_t>(p[1]) << 16) |
+           (static_cast<uint32_t>(p[2]) << 8) |
+           static_cast<uint32_t>(p[3]);
+}
+
+void verifyMfiSapResponse(const Bytes& resp,
+                          const crypto::X25519KeyPair& client_kp,
+                          int proto_major,
+                          const Bytes& expected_challenge_sig,
+                          const Bytes& expected_signed_digest) {
+    REQUIRE(resp.size() >= 40U);
+    const uint8_t* acc_pk = &resp[0];
+    const uint32_t cert_len = readBe32(&resp[32]);
+    REQUIRE(36U + cert_len + 4U <= resp.size());
+    const Bytes cert(resp.begin() + 36, resp.begin() + 36 + cert_len);
+    CHECK(cert == Bytes(4, 1));
+
+    const uint32_t enc_sig_len = readBe32(&resp[36U + cert_len]);
+    REQUIRE(40U + cert_len + enc_sig_len == resp.size());
+    const Bytes enc_sig(resp.begin() + 40U + cert_len, resp.end());
+
+    uint8_t shared[crypto::kKeyBytes];
+    REQUIRE(crypto::x25519SharedSecret(client_kp.secret_key, acc_pk, shared));
+
+    std::vector<uint8_t> key_in;
+    const char* key_lbl = "AES-KEY";
+    key_in.insert(key_in.end(), key_lbl, key_lbl + 7);
+    key_in.insert(key_in.end(), shared, shared + crypto::kKeyBytes);
+    uint8_t aes_key_hash[crypto::kSha1Bytes];
+    crypto::sha1(&key_in[0], key_in.size(), aes_key_hash);
+
+    std::vector<uint8_t> iv_in;
+    const char* iv_lbl = "AES-IV";
+    iv_in.insert(iv_in.end(), iv_lbl, iv_lbl + 6);
+    iv_in.insert(iv_in.end(), shared, shared + crypto::kKeyBytes);
+    uint8_t aes_iv_hash[crypto::kSha1Bytes];
+    crypto::sha1(&iv_in[0], iv_in.size(), aes_iv_hash);
+
+    Bytes decrypted(enc_sig.size(), 0);
+    REQUIRE(crypto::aes128Ctr(aes_key_hash, aes_iv_hash, &enc_sig[0], enc_sig.size(), &decrypted[0]));
+    CHECK(decrypted == expected_challenge_sig);
+
+    std::vector<uint8_t> pk_pair;
+    pk_pair.insert(pk_pair.end(), acc_pk, acc_pk + crypto::kKeyBytes);
+    pk_pair.insert(pk_pair.end(), client_kp.public_key, client_kp.public_key + crypto::kKeyBytes);
+    if (proto_major == 2) {
+        uint8_t expected[crypto::kSha1Bytes];
+        crypto::sha1(&pk_pair[0], pk_pair.size(), expected);
+        CHECK(expected_signed_digest == Bytes(expected, expected + crypto::kSha1Bytes));
+    } else {
+        uint8_t expected[crypto::kSha256Bytes];
+        crypto::sha256(&pk_pair[0], pk_pair.size(), expected);
+        CHECK(expected_signed_digest == Bytes(expected, expected + crypto::kSha256Bytes));
+    }
+}
+
+TEST_CASE(authSetupMfiSap) {
     {
+        // Null AuthProvider always returns 400 (matches DiPlay mfi == null).
         Harness h;
         Phone p;
         Reply r;
@@ -1053,16 +1120,67 @@ TEST_CASE(authSetupAlways400) {
         CHECK_EQ(std::string("Bad Request"), r.reason);
     }
     {
+        // Bad length / bad version / low-order all-zero peer key return 400 without calling auth.
         FakeAuth auth;
         Harness h(session::SessionPolicy(), &auth);
         Phone p;
         Reply r;
-        REQUIRE(p.call(*h.s, "POST", "/auth-setup", rtsp::kContentTypeOctetStream, Bytes(33, 1), r));
+        REQUIRE(p.call(*h.s, "POST", "/auth-setup", rtsp::kContentTypeOctetStream, Bytes(10, 1), r));
         CHECK_EQ(400, r.status);
-        REQUIRE(p.pairVerify(h));
-        REQUIRE(p.call(*h.s, "POST", "/auth-setup", rtsp::kContentTypeOctetStream, Bytes(33, 1), r));
+        Bytes bad_ver(33, 2);
+        REQUIRE(p.call(*h.s, "POST", "/auth-setup", rtsp::kContentTypeOctetStream, bad_ver, r));
+        CHECK_EQ(400, r.status);
+        Bytes zero_pk(33, 0);
+        zero_pk[0] = 0x01;
+        REQUIRE(p.call(*h.s, "POST", "/auth-setup", rtsp::kContentTypeOctetStream, zero_pk, r));
         CHECK_EQ(400, r.status);
         CHECK_EQ(0, auth.calls);
+    }
+    {
+        // CP 3.0 (SHA-256 digest) before pair-verify.
+        FakeAuth auth;
+        auth.proto_major = 3;
+        Harness h(session::SessionPolicy(), &auth);
+        Phone p;
+        crypto::X25519KeyPair client_kp;
+        const Bytes seed = prefix(shaStr("mfi-sap-client-3"), 32);
+        crypto::x25519FromSecret(&seed[0], client_kp);
+        Bytes req(1, 0x01);
+        req.insert(req.end(), client_kp.public_key, client_kp.public_key + 32);
+
+        Reply r;
+        REQUIRE(p.call(*h.s, "POST", "/auth-setup", rtsp::kContentTypeOctetStream, req, r));
+        CHECK_EQ(200, r.status);
+        CHECK_EQ(2, auth.calls);
+        verifyMfiSapResponse(r.raw.body, client_kp, 3, Bytes(4, 2), auth.last_challenge);
+    }
+    {
+        // CP 2.0C (SHA-1 digest) after pair-verify, plus failure propagation.
+        FakeAuth auth;
+        auth.proto_major = 2;
+        Harness h(session::SessionPolicy(), &auth);
+        Phone p;
+        REQUIRE(p.pairVerify(h));
+
+        crypto::X25519KeyPair client_kp;
+        const Bytes seed = prefix(shaStr("mfi-sap-client-2"), 32);
+        crypto::x25519FromSecret(&seed[0], client_kp);
+        Bytes req(1, 0x01);
+        req.insert(req.end(), client_kp.public_key, client_kp.public_key + 32);
+
+        Reply r;
+        REQUIRE(p.call(*h.s, "POST", "/auth-setup", rtsp::kContentTypeOctetStream, req, r));
+        CHECK_EQ(200, r.status);
+        CHECK_EQ(2, auth.calls);
+        verifyMfiSapResponse(r.raw.body, client_kp, 2, Bytes(4, 2), auth.last_challenge);
+
+        auth.fail_sign = true;
+        REQUIRE(p.call(*h.s, "POST", "/auth-setup", rtsp::kContentTypeOctetStream, req, r));
+        CHECK_EQ(400, r.status);
+        auth.fail_sign = false;
+        auth.fail_cert = true;
+        REQUIRE(p.call(*h.s, "POST", "/auth-setup", rtsp::kContentTypeOctetStream, req, r));
+        CHECK_EQ(400, r.status);
     }
 }
 

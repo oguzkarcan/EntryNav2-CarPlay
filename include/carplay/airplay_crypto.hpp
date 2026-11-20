@@ -14,7 +14,11 @@ static const size_t kEd25519SeedBytes = 32;
 static const size_t kEd25519SecretKeyBytes = 64;
 static const size_t kEd25519PublicKeyBytes = 32;
 static const size_t kEd25519SignatureBytes = 64;
+static const size_t kSha1Bytes = 20;
+static const size_t kSha256Bytes = 32;
 static const size_t kSha512Bytes = 64;
+static const size_t kAes128KeyBytes = 16;
+static const size_t kAesBlockBytes = 16;
 static const size_t kNonceBytes = 12;
 static const size_t kTagBytes = 16;
 
@@ -65,6 +69,19 @@ bool ed25519Verify(const uint8_t public_key[kEd25519PublicKeyBytes],
                    const uint8_t* message,
                    size_t message_len,
                    const uint8_t signature[kEd25519SignatureBytes]);
+
+/// Computes SHA-1 digest over input bytes.
+void sha1(const uint8_t* data, size_t len, uint8_t hash_out[kSha1Bytes]);
+
+/// Computes SHA-256 digest over input bytes.
+void sha256(const uint8_t* data, size_t len, uint8_t hash_out[kSha256Bytes]);
+
+/// Encrypts or decrypts `len` bytes using AES-128 in CTR mode (big-endian 128-bit counter).
+bool aes128Ctr(const uint8_t key[kAes128KeyBytes],
+               const uint8_t iv[kAesBlockBytes],
+               const uint8_t* input,
+               size_t len,
+               uint8_t* output);
 
 /// Computes SHA-512 over input bytes.
 void sha512(const uint8_t* data, size_t len, uint8_t hash_out[kSha512Bytes]);

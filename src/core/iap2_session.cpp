@@ -607,6 +607,18 @@ void Session::LinkAdapter::onLinkError(const std::string& reason) {
     owner_.onLinkErrorImpl(reason);
 }
 
+void Session::AuthAdapter::onCertificateComplete(uint64_t op_id,
+                                                 bool ok,
+                                                 const std::vector<uint8_t>& certificate) {
+    owner_.onAuthCertificateComplete(op_id, ok, certificate);
+}
+
+void Session::AuthAdapter::onSignatureComplete(uint64_t op_id,
+                                               bool ok,
+                                               const std::vector<uint8_t>& signature) {
+    owner_.onAuthSignatureComplete(op_id, ok, signature);
+}
+
 Session::Session(ByteSink& sink,
                  AuthProvider& auth,
                  SessionListener& listener,
@@ -615,7 +627,10 @@ Session::Session(ByteSink& sink,
       listener_(listener),
       config_(config),
       link_adapter_(*this),
+      auth_adapter_(*this),
       link_(sink, link_adapter_, config.link),
+      pending_auth_kind_(kPendingAuthNone),
+      pending_auth_op_id_(0ULL),
       state_(kSessionIdle),
       control_session_id_(0),
       identified_(false),
@@ -628,6 +643,22 @@ Session::Session(ByteSink& sink,
       last_now_ms_(0),
       has_state_time_(false),
       state_entered_ms_(0) {}
+
+Session::~Session() {
+    cancelPendingAuth();
+}
+
+void Session::cancelPendingAuth() {
+    if (pending_auth_kind_ == kPendingAuthNone) {
+        return;
+    }
+    const uint64_t op_id = pending_auth_op_id_;
+    pending_auth_kind_ = kPendingAuthNone;
+    pending_auth_op_id_ = 0ULL;
+    if (op_id != 0ULL) {
+        auth_.cancelAuth(op_id);
+    }
+}
 
 void Session::setState(SessionState next) {
     if (state_ != next) {
@@ -646,6 +677,7 @@ void Session::advanceWirelessStage(WirelessControlStage next) {
 }
 
 void Session::failSession(const std::string& reason) {
+    cancelPendingAuth();
     if (state_ != kSessionFailed) {
         setState(kSessionFailed);
     }
@@ -653,6 +685,7 @@ void Session::failSession(const std::string& reason) {
 }
 
 void Session::start() {
+    cancelPendingAuth();
     framer_.reset();
     control_session_id_ = 0;
     identified_ = false;
@@ -668,6 +701,7 @@ void Session::start() {
 }
 
 void Session::reset(bool send_rst) {
+    cancelPendingAuth();
     framer_.reset();
     control_session_id_ = 0;
     identified_ = false;
@@ -727,6 +761,7 @@ void Session::onLinkConnectedImpl(const SynPayload& negotiated) {
 }
 
 void Session::onLinkResetImpl(bool by_peer) {
+    cancelPendingAuth();
     framer_.reset();
     control_session_id_ = 0;
     identified_ = false;
@@ -742,6 +777,7 @@ void Session::onLinkResetImpl(bool by_peer) {
 }
 
 void Session::onLinkErrorImpl(const std::string& reason) {
+    cancelPendingAuth();
     if (state_ != kSessionIdle && state_ != kSessionFailed) {
         setState(kSessionFailed);
     }
@@ -1157,9 +1193,46 @@ void Session::handleIdentificationUpdate(const Frame& frame) {
 }
 
 void Session::handleRequestAuthCertificate() {
+    cancelPendingAuth();
     setState(kSessionAuthenticating);
-    std::vector<uint8_t> cert;
-    if (!auth_.getCertificate(cert) || cert.empty() || cert.size() > kMaxCertificateBytes) {
+    if (!auth_.isAsync()) {
+        std::vector<uint8_t> cert;
+        finishAuthCertificate(auth_.getCertificate(cert), cert);
+        return;
+    }
+    pending_auth_kind_ = kPendingAuthCert;
+    pending_auth_op_id_ = 0ULL;
+    const uint64_t op_id = auth_.beginGetCertificate(auth_adapter_);
+    if (pending_auth_kind_ == kPendingAuthCert) {
+        if (op_id != 0ULL) {
+            pending_auth_op_id_ = op_id;
+        } else {
+            pending_auth_kind_ = kPendingAuthNone;
+            std::vector<uint8_t> empty;
+            finishAuthCertificate(false, empty);
+        }
+    }
+}
+
+void Session::onAuthCertificateComplete(uint64_t op_id,
+                                        bool ok,
+                                        const std::vector<uint8_t>& cert) {
+    if (pending_auth_kind_ != kPendingAuthCert) {
+        return;
+    }
+    if (pending_auth_op_id_ != 0ULL && op_id != pending_auth_op_id_) {
+        return;
+    }
+    pending_auth_kind_ = kPendingAuthNone;
+    pending_auth_op_id_ = 0ULL;
+    finishAuthCertificate(ok, cert);
+}
+
+void Session::finishAuthCertificate(bool ok, const std::vector<uint8_t>& cert) {
+    if (state_ == kSessionFailed || state_ == kSessionIdle) {
+        return;
+    }
+    if (!ok || cert.empty() || cert.size() > kMaxCertificateBytes) {
         const std::string msg = "failed to retrieve valid accessory authentication certificate";
         setState(kSessionFailed);
         listener_.onAuthenticationFailed(msg);
@@ -1179,6 +1252,7 @@ void Session::handleRequestAuthCertificate() {
 }
 
 void Session::handleRequestAuthChallengeResponse(const Frame& frame) {
+    cancelPendingAuth();
     setState(kSessionAuthenticating);
     ParameterList params;
     std::string err;
@@ -1198,8 +1272,44 @@ void Session::handleRequestAuthChallengeResponse(const Frame& frame) {
         listener_.onError(msg);
         return;
     }
-    std::vector<uint8_t> sig;
-    if (!auth_.signChallenge(&challenge[0], challenge.size(), sig) || sig.empty()) {
+    if (!auth_.isAsync()) {
+        std::vector<uint8_t> sig;
+        finishAuthChallengeResponse(auth_.signChallenge(&challenge[0], challenge.size(), sig), sig);
+        return;
+    }
+    pending_auth_kind_ = kPendingAuthSign;
+    pending_auth_op_id_ = 0ULL;
+    const uint64_t op_id = auth_.beginSignChallenge(&challenge[0], challenge.size(), auth_adapter_);
+    if (pending_auth_kind_ == kPendingAuthSign) {
+        if (op_id != 0ULL) {
+            pending_auth_op_id_ = op_id;
+        } else {
+            pending_auth_kind_ = kPendingAuthNone;
+            std::vector<uint8_t> empty;
+            finishAuthChallengeResponse(false, empty);
+        }
+    }
+}
+
+void Session::onAuthSignatureComplete(uint64_t op_id,
+                                      bool ok,
+                                      const std::vector<uint8_t>& sig) {
+    if (pending_auth_kind_ != kPendingAuthSign) {
+        return;
+    }
+    if (pending_auth_op_id_ != 0ULL && op_id != pending_auth_op_id_) {
+        return;
+    }
+    pending_auth_kind_ = kPendingAuthNone;
+    pending_auth_op_id_ = 0ULL;
+    finishAuthChallengeResponse(ok, sig);
+}
+
+void Session::finishAuthChallengeResponse(bool ok, const std::vector<uint8_t>& sig) {
+    if (state_ == kSessionFailed || state_ == kSessionIdle) {
+        return;
+    }
+    if (!ok || sig.empty()) {
         const std::string msg = "failed to sign authentication challenge";
         setState(kSessionFailed);
         listener_.onAuthenticationFailed(msg);
@@ -1210,6 +1320,7 @@ void Session::handleRequestAuthChallengeResponse(const Frame& frame) {
     ParameterList resp_params;
     resp_params.addRaw(param::kAuthChallengeResponseData, sig);
     Frame resp;
+    std::string err;
     if (!Frame::build(msg::kAuthenticationResponse, resp_params, resp, &err)) {
         failSession(err);
         return;

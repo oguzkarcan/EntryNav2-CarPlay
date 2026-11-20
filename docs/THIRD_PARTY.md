@@ -19,13 +19,13 @@ This document records the provenance and licensing of every file in `EntryNav2-C
 
 | Upstream Source | License | Header Files | Source Files | Test Files | Other Files | Total Files |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
-| DiPlay (derived only) | `GPL-3.0` | 17 | 16 | 6 | 0 | **39** |
+| DiPlay (derived only) | `GPL-3.0` | 19 | 18 | 6 | 0 | **43** |
 | DiPlay + EntryNav2-Android-Auto 0.12.0 (dual-derived) | `GPL-3.0` + `PolyForm-Noncommercial-1.0.0` | 2 | 2 | 0 | 0 | **4** |
 | EntryNav2-Android-Auto 0.12.0 / 0.13.0-rc.6 (derived only) | `PolyForm-Noncommercial-1.0.0` | 9 | 9 | 1 | 0 | **19** |
 | Monocypher (vendored) | `BSD-2-Clause OR CC0-1.0` | 2 | 2 | 0 | 1 | **5** |
-| **Total** | | **30** | **29** | **7** | **1** | **67** |
+| **Total** | | **32** | **31** | **7** | **1** | **71** |
 
-*(Note: Total derived files = 62 across `include/`, `src/`, and `tests/`; total third-party/derived files including vendored Monocypher = 67.)*
+*(Note: Total derived files = 66 across `include/`, `src/`, and `tests/`; total third-party/derived files including vendored Monocypher = 71.)*
 
 ---
 
@@ -57,6 +57,10 @@ This document records the provenance and licensing of every file in `EntryNav2-C
 | `tests/test_iap2_identification.cpp` | `shared/src/test/java/com/shilapi/xcertplay/transport/{Iap2WirelessControlClientTest,Iap2WiredControlClientTest,Iap2IdentificationRetryTest,Iap2WirelessLinkRoleTest}.kt` | `GPL-3.0` |
 | `include/carplay/iap2_wire.hpp` | `shared/src/main/java/com/shilapi/xcertplay/iap2/{catalog/Iap2Endpoint,message/Iap2Messages,wire/Iap2CsmFramer,wire/Iap2WireCodec}.kt`, `.../transport/Iap2VehicleStatus.kt` | `GPL-3.0` |
 | `src/core/iap2_wire.cpp` | `shared/src/main/java/com/shilapi/xcertplay/iap2/{catalog/Iap2Endpoint,message/Iap2Messages,wire/Iap2CsmFramer,wire/Iap2WireCodec}.kt`, `.../transport/Iap2VehicleStatus.kt` | `GPL-3.0` |
+| `include/carplay/platform/mfi_i2c.hpp` | `shared/src/main/java/com/shilapi/xcertplay/mfi/{MfiAuthenticationClient,MfiDeviceScanner}.kt`, `shared/src/main/java/com/shilapi/xcertplay/transport/LinuxI2cTransport.kt`, `shared/src/main/jni/linux_i2c_jni.c` | `GPL-3.0` |
+| `src/platform/mfi_i2c.cpp` | `shared/src/main/java/com/shilapi/xcertplay/mfi/{MfiAuthenticationClient,MfiDeviceScanner}.kt`, `shared/src/main/java/com/shilapi/xcertplay/transport/LinuxI2cTransport.kt`, `shared/src/main/jni/linux_i2c_jni.c` | `GPL-3.0` |
+| `include/carplay/mfi_sap.hpp` | `shared/src/main/java/com/shilapi/xcertplay/airplay/MfiSapAuthSetup.kt` | `GPL-3.0` |
+| `src/core/mfi_sap.cpp` | `shared/src/main/java/com/shilapi/xcertplay/airplay/MfiSapAuthSetup.kt` | `GPL-3.0` |
 | `include/carplay/mic_uplink.hpp` | `shared/src/main/java/com/shilapi/xcertplay/airplay/{CarPlayMediaEngine,MicrophonePacketizer}.kt`, `shared/src/main/java/com/shilapi/xcertplay/media/MicrophoneUplink.kt` | `GPL-3.0` |
 | `src/core/mic_uplink.cpp` | `shared/src/main/java/com/shilapi/xcertplay/airplay/{CarPlayMediaEngine,MicrophonePacketizer}.kt`, `shared/src/main/java/com/shilapi/xcertplay/media/MicrophoneUplink.kt` | `GPL-3.0` |
 | `tests/test_mic_uplink.cpp` | `shared/src/main/java/com/shilapi/xcertplay/airplay/{MicrophonePacketizer,CarPlayMediaEngine}.kt`, `shared/src/test/java/com/shilapi/xcertplay/airplay/MicrophonePacketizerTest.kt` | `GPL-3.0` |

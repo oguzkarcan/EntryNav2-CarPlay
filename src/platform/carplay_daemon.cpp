@@ -60,6 +60,8 @@ CarPlayDaemon::CarPlayDaemon(const CarPlayDaemonConfig& config)
       mic_(config.mic_config),
       media_sink_(audio_sink_, mic_, this),
       media_engine_(NULL),
+      mfi_backend_override_(NULL),
+      mfi_auth_(NULL),
       server_(NULL),
       connectivity_(reactor_, rng_),
       knob_(),
@@ -158,6 +160,18 @@ bool CarPlayDaemon::start() {
 
     media_engine_ = new MediaEngine(reactor_, media_sink_, config_.media_config);
 
+    if (config_.mfi_i2c_config.enabled) {
+        mfi_auth_ = new I2cMfiAuthProvider(reactor_, config_.mfi_i2c_config, mfi_backend_override_);
+        std::string mfi_err;
+        if (!mfi_auth_->start(NULL, &mfi_err)) {
+            CARPLAY_LOG_ERROR("daemon", "CarPlayDaemon: MFi I2C provider failed to start: %s",
+                              mfi_err.c_str());
+            stop();
+            return false;
+        }
+        connectivity_.setIap2AuthProvider(mfi_auth_);
+    }
+
     config_.server_config.control_port = config_.control_port;
     server_ = new SessionServer(reactor_,
                                 airplay_config_,
@@ -166,7 +180,7 @@ bool CarPlayDaemon::start() {
                                 rng_,
                                 *this,
                                 *media_engine_,
-                                NULL,
+                                static_cast<session::AuthProvider*>(mfi_auth_),
                                 config_.server_config);
 
     const bool server_ok = config_.bind_loopback_only
@@ -283,11 +297,18 @@ void CarPlayDaemon::stop() {
     }
 
     connectivity_.stop();
+    connectivity_.setIap2AuthProvider(NULL);
 
     if (server_ != NULL) {
         server_->stop();
         delete server_;
         server_ = NULL;
+    }
+
+    if (mfi_auth_ != NULL) {
+        mfi_auth_->stop();
+        delete mfi_auth_;
+        mfi_auth_ = NULL;
     }
 
     // Join the capture thread before the engine goes away: the worker calls
