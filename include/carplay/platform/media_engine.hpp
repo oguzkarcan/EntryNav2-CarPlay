@@ -209,6 +209,11 @@ public:
     void setControlPeer(const Address& peer);
     const Address& controlPeer() const { return control_peer_; }
 
+    /// Enables or disables Wi-Fi video QoS (IP_TOS / IPV6_TCLASS = 0x80) for subsequent
+    /// Screen TCP accepts and Audio UDP sockets (true for wireless, false for wired USB).
+    void setWifiVideoQos(bool enabled) { config_.wifi_video_qos = enabled; }
+    bool wifiVideoQos() const { return config_.wifi_video_qos; }
+
     /// Optional callback returning the session's current synchronized 64-bit NTP timestamp
     /// for POST /feedback responses. When unset, ntp::ntpFromNanos(reactor.now()) is used.
     void setSyncedNtpCallback(SyncedNtpFn fn, void* ctx);

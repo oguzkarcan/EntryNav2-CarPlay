@@ -528,9 +528,20 @@ bool hasDeviceOccurrenceWritten(void* ctx) {
     return mockState().copyWritten(c->device, c->occurrence).size() >= c->min_samples;
 }
 
-bool hasDeviceOccurrenceOpened(void* ctx) {
+bool hasDeviceOccurrenceConfigured(void* ctx) {
     const DeviceOccurrenceCtx* c = static_cast<const DeviceOccurrenceCtx*>(ctx);
-    return mockState().countByName(c->device) >= c->occurrence;
+    MockAlsaState& st = mockState();
+    plat::LockGuard lock(st.mu);
+    size_t seen = 0;
+    for (size_t i = 0; i < st.handles.size(); ++i) {
+        if (st.handles[i]->name == c->device) {
+            ++seen;
+            if (seen == c->occurrence) {
+                return st.handles[i]->params_set;
+            }
+        }
+    }
+    return false;
 }
 
 // =================================================================================================
@@ -1603,7 +1614,7 @@ TEST_CASE(sameDeviceOwnershipParkingAntiPingPongAndResume) {
     // 4. Stop speechRecognition -> parked tel_id resumes with its own format and fresh audio.
     sink.onAudioStopped(siri_id);
     DeviceOccurrenceCtx o2 = {"tel_out1", 3U, 0U};
-    REQUIRE(waitForCondition(&hasDeviceOccurrenceOpened, &o2));
+    REQUIRE(waitForCondition(&hasDeviceOccurrenceConfigured, &o2));
     CHECK_EQ(static_cast<size_t>(0), sink.stats().parked_streams);
 
     MockHandle* h2 = mockState().findByName("tel_out1", 2U);
@@ -1692,7 +1703,7 @@ TEST_CASE(threeStreamsOnOneDeviceResumeInMostRecentOrderAndConcurrentDevices) {
     // Stop S3 -> S2 (most recently started parked stream) resumes.
     sink.onAudioStopped(s3);
     DeviceOccurrenceCtx ent_o3 = {"entertainment", 4U, 0U};
-    REQUIRE(waitForCondition(&hasDeviceOccurrenceOpened, &ent_o3));
+    REQUIRE(waitForCondition(&hasDeviceOccurrenceConfigured, &ent_o3));
     MockHandle* h3 = mockState().findByName("entertainment", 3U);
     REQUIRE(h3 != NULL);
     {
@@ -1707,7 +1718,7 @@ TEST_CASE(threeStreamsOnOneDeviceResumeInMostRecentOrderAndConcurrentDevices) {
     // Stop S2 -> S1 resumes.
     sink.onAudioStopped(s2);
     DeviceOccurrenceCtx ent_o4 = {"entertainment", 5U, 0U};
-    REQUIRE(waitForCondition(&hasDeviceOccurrenceOpened, &ent_o4));
+    REQUIRE(waitForCondition(&hasDeviceOccurrenceConfigured, &ent_o4));
     MockHandle* h4 = mockState().findByName("entertainment", 4U);
     REQUIRE(h4 != NULL);
     {
@@ -1793,7 +1804,7 @@ TEST_CASE(implicitStartParkedStopOwnerFailAndParkedAltDucking) {
     sink.onAudioPcm(tel_id, mono16, s4, 1U, 2U, 1U);
     REQUIRE(waitForCondition(&hasWriteErrorAtLeast, &sink));
     DeviceOccurrenceCtx sh_o3 = {"shared_dev", 4U, 0U};
-    REQUIRE(waitForCondition(&hasDeviceOccurrenceOpened, &sh_o3));
+    REQUIRE(waitForCondition(&hasDeviceOccurrenceConfigured, &sh_o3));
     CHECK(sink.isDucked());
 
     sink.stop();

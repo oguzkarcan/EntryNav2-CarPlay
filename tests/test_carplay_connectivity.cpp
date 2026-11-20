@@ -7,10 +7,15 @@
 #include "carplay/platform/bt_transport.hpp"
 #include "carplay/platform/carplay_connectivity.hpp"
 #include "carplay/platform/carplay_daemon.hpp"
+#include "carplay/platform/log.hpp"
 #include "carplay/platform/media_engine.hpp"
+#include "carplay/platform/net_compat.hpp"
 #include "carplay/platform/os_random.hpp"
 #include "carplay/platform/reactor.hpp"
 #include "carplay/platform/session_server.hpp"
+#include "carplay/platform/spp_snapshot.hpp"
+#include "carplay/platform/tap_iface.hpp"
+#include "carplay/platform/usb_host.hpp"
 #include "test_support.hpp"
 
 #include <string.h>
@@ -469,6 +474,422 @@ TEST_CASE(wirelessHandoffTimeoutTearsDownApAndReturnsToWaiting) {
     CHECK_EQ(1ULL, conn.failureTeardowns());
 
     conn.stop();
+    server.stop();
+}
+
+class FakeGateSppMemory : public plat::SppMemoryBackend {
+public:
+    FakeGateSppMemory()
+        : open_calls(0),
+          is_open_(false),
+          pid_(777),
+          base_(0x10000000U),
+          identity_("999999") {
+        layout_.app = 0x20000U;
+        layout_.info = 0x24000U;
+        layout_.connections = 0x25000U;
+        layout_.app_got = 0x1000U;
+        layout_.info_got = 0x1004U;
+        layout_.connections_got = 0x1008U;
+        mem_.assign(0x26000U, 0U);
+        writeU32(layout_.app_got, base_ + layout_.app);
+        writeU32(layout_.info_got, base_ + layout_.info);
+        writeU32(layout_.connections_got, base_ + layout_.connections);
+        setSlot(plat::kAlpsBmwAppsSlot, plat::genericSppUuidPair(), 1U, 0U);
+        setSlot(plat::kAlpsNativeCarPlaySlot, plat::genericSppUuidPair(), 1U, 0U);
+        setSlot(plat::kAlpsSpareSlot, plat::genericSppUuidPair(), 1U, 0U);
+    }
+
+    virtual bool openProcess(plat::SppProcessTarget& target_out, std::string* /*error_out*/) {
+        ++open_calls;
+        is_open_ = true;
+        target_out.pid = pid_;
+        target_out.base_address = base_;
+        target_out.layout = layout_;
+        target_out.identity = identity_;
+        return true;
+    }
+    virtual void closeProcess() { is_open_ = false; }
+    virtual bool isOpen() const { return is_open_; }
+    virtual bool readStartIdentity(int req_pid, std::string& identity_out) {
+        if (req_pid != pid_) return false;
+        identity_out = identity_;
+        return true;
+    }
+    virtual bool readBytes(uint32_t address, void* out, size_t len) {
+        if (!is_open_ || address < base_) return false;
+        const uint32_t rel = address - base_;
+        if (rel >= mem_.size() || len > mem_.size() - rel) return false;
+        memcpy(out, &mem_[rel], len);
+        return true;
+    }
+    virtual void sleepMs(uint32_t /*ms*/) {}
+
+    void writeU32(uint32_t rel, uint32_t v) {
+        mem_[rel + 0U] = static_cast<uint8_t>(v & 0xffU);
+        mem_[rel + 1U] = static_cast<uint8_t>((v >> 8) & 0xffU);
+        mem_[rel + 2U] = static_cast<uint8_t>((v >> 16) & 0xffU);
+        mem_[rel + 3U] = static_cast<uint8_t>((v >> 24) & 0xffU);
+    }
+
+    void setSlot(unsigned slot, const Bytes& uuid_pair, uint32_t app_state, uint32_t conn_flag) {
+        writeU32(layout_.app + plat::kAlpsAppStateOffset + slot * 4U, app_state);
+        uint8_t* rec = &mem_[layout_.app + plat::kAlpsAppRecordOffset + slot * plat::kAlpsAppRecordStride];
+        memset(rec, 0, plat::kAlpsAppRecordStride);
+        uint8_t* inf = &mem_[layout_.info + slot * plat::kAlpsSppInfoStride];
+        memset(inf, 0, plat::kAlpsSppInfoStride);
+        uint8_t* conn = &mem_[layout_.connections + slot * plat::kAlpsSppConnectedStride];
+        memset(conn, 0, plat::kAlpsSppConnectedStride);
+        conn[0] = conn_flag ? 1U : 0U;
+
+        static const size_t kLen[4] = {0U, 2U, 4U, 16U};
+        static const uint8_t kTag[4] = {0U, 1U, 2U, 4U};
+        size_t pos = 0U;
+        for (unsigned i = 0U; i < 2U && pos < uuid_pair.size(); ++i) {
+            const uint8_t kind = uuid_pair[pos++];
+            if (kind < 1U || kind > 3U || kLen[kind] > uuid_pair.size() - pos) return;
+            rec[32U + i] = kind;
+            memcpy(rec + 16U * i, &uuid_pair[pos], kLen[kind]);
+            const unsigned tag_off = (i == 0U) ? 38U : 55U;
+            const unsigned dat_off = (i == 0U) ? 39U : 56U;
+            inf[tag_off] = kTag[kind];
+            memcpy(inf + dat_off, &uuid_pair[pos], kLen[kind]);
+            pos += kLen[kind];
+        }
+    }
+
+    int open_calls;
+    bool is_open_;
+    int pid_;
+    uint32_t base_;
+    plat::SppLayout layout_;
+    std::string identity_;
+    Bytes mem_;
+};
+
+class FakeGateBtSocketOps : public plat::BtSocketOps {
+public:
+    FakeGateBtSocketOps() : create_calls(0), bound_channel(5U) {}
+
+    virtual plat::SocketHandle createRfcommSocket(int& err_out) {
+        ++create_calls;
+        err_out = 0;
+        return plat::socketOpen(plat::Address::kIPv4, plat::kSockStream);
+    }
+    virtual bool bindRfcomm(plat::SocketHandle /*fd*/,
+                            const plat::BtAddr& /*addr*/,
+                            uint8_t channel,
+                            int& err_out) {
+        if (channel != 0U) {
+            bound_channel = channel;
+        }
+        err_out = 0;
+        return true;
+    }
+    virtual bool getRfcommChannel(plat::SocketHandle /*fd*/,
+                                  uint8_t& channel_out,
+                                  int& err_out) {
+        channel_out = bound_channel;
+        err_out = 0;
+        return true;
+    }
+    virtual bool listenSocket(plat::SocketHandle /*fd*/, int /*backlog*/, int& err_out) {
+        err_out = 0;
+        return true;
+    }
+    virtual plat::IoStatus acceptRfcomm(plat::SocketHandle /*listen_fd*/,
+                                        plat::SocketHandle& client_fd_out,
+                                        plat::BtAddr& /*peer_addr_out*/,
+                                        uint8_t& /*peer_channel_out*/,
+                                        int& err_out) {
+        client_fd_out = plat::kInvalidSocket;
+        err_out = 0;
+        return plat::kIoWouldBlock;
+    }
+    virtual plat::IoStatus recvBytes(plat::SocketHandle /*fd*/,
+                                     uint8_t* /*buf*/,
+                                     size_t /*cap*/,
+                                     size_t& got_out,
+                                     int& err_out) {
+        got_out = 0;
+        err_out = 0;
+        return plat::kIoWouldBlock;
+    }
+    virtual plat::IoStatus sendBytes(plat::SocketHandle /*fd*/,
+                                     const uint8_t* /*data*/,
+                                     size_t /*len*/,
+                                     size_t& sent_out,
+                                     int& err_out) {
+        sent_out = 0;
+        err_out = 0;
+        return plat::kIoWouldBlock;
+    }
+    virtual void closeSocket(plat::SocketHandle fd) {
+        plat::socketClose(fd);
+    }
+    virtual std::string errorString(int err) const {
+        return plat::socketErrorString(err);
+    }
+
+    int create_calls;
+    uint8_t bound_channel;
+};
+
+class FakeGateUsbHost : public plat::UsbHostInterface {
+public:
+    FakeGateUsbHost() : started(false) {}
+    virtual bool start(plat::Reactor&, plat::UsbHostListener*) { started = true; return true; }
+    virtual void stop() { started = false; }
+    virtual bool isDeviceOpen() const { return false; }
+    virtual const plat::UsbDeviceInfo& currentDevice() const { return info_; }
+    virtual const carplay::usb::DeviceDescriptor& deviceDescriptor() const { return dev_desc_; }
+    virtual const std::vector<carplay::usb::ConfigurationDescriptor>& configurations() const {
+        return configs_;
+    }
+    virtual bool setConfiguration(uint8_t) { return true; }
+    virtual bool claimInterface(uint8_t, bool) { return true; }
+    virtual bool claimInterfaceWithStatus(uint8_t, bool, bool,
+                                          plat::UsbClaimStatus& status_out,
+                                          std::string& driver_out) {
+        status_out = plat::kUsbClaimOk;
+        driver_out.clear();
+        return true;
+    }
+    virtual bool releaseInterface(uint8_t) { return true; }
+    virtual bool setInterface(uint8_t, uint8_t) { return true; }
+    virtual bool resetDevice() { return true; }
+    virtual bool controlTransfer(uint8_t, uint8_t, uint16_t, uint16_t, Bytes&, uint32_t, int*) { return true; }
+    virtual bool readStringDescriptor(uint8_t, std::string&) { return false; }
+    virtual bool queryActiveConfiguration(uint8_t& out) { out = 0U; return true; }
+    virtual bool queryAppleUsbMode(Bytes&) { return false; }
+    virtual bool requestCarPlayModeSwitch(const plat::AppleCarPlaySwitchRequest&) { return true; }
+    virtual uint64_t submitBulkIn(uint8_t, size_t, void*) { return 0U; }
+    virtual uint64_t submitBulkOut(uint8_t, const uint8_t*, size_t, bool, void*) { return 0U; }
+    virtual bool discardUrb(uint64_t) { return true; }
+    virtual void ignoreCurrentDevice() {}
+    virtual void closeCurrentDevice() {}
+    bool started;
+    plat::UsbDeviceInfo info_;
+    carplay::usb::DeviceDescriptor dev_desc_;
+    std::vector<carplay::usb::ConfigurationDescriptor> configs_;
+};
+
+class FakeGateTapPort : public plat::TapPortInterface {
+public:
+    virtual bool open(plat::Reactor&, plat::TapListener*) { return true; }
+    virtual void close() {}
+    virtual bool isOpen() const { return false; }
+    virtual const std::string& interfaceName() const { return name_; }
+    virtual uint32_t ifIndex() const { return 1U; }
+    virtual void getMacAddress(uint8_t mac_out[6]) const { memset(mac_out, 0, 6U); }
+    virtual plat::TapWriteResult writeFrame(const uint8_t*, size_t) { return plat::kTapWriteSent; }
+    virtual bool queryIpv6LinkLocal(plat::Address&) const { return false; }
+    std::string name_;
+};
+
+struct CapturedLogs {
+    std::vector<std::string> lines;
+    static void sink(void* ctx, plat::LogLevel /*level*/, const char* tag, const char* msg) {
+        CapturedLogs* self = static_cast<CapturedLogs*>(ctx);
+        self->lines.push_back(std::string(tag) + ": " + msg);
+    }
+    bool contains(const std::string& needle) const {
+        for (size_t i = 0U; i < lines.size(); ++i) {
+            if (lines[i].find(needle) != std::string::npos) {
+                return true;
+            }
+        }
+        return false;
+    }
+};
+
+TEST_CASE(alpsCompatGateFallsBackToRfcommOnUnknownBuildAndFailedChecks) {
+    plat::Reactor reactor(&fakeClockNs);
+    REQUIRE(reactor.init());
+    plat::OsRandomSource rng;
+    pairing::Identity id;
+    REQUIRE(pairing::generateIdentity(rng, id));
+    pairing::InMemoryPairingStore store;
+    info::AirPlayConfig ap_cfg = info::bmwEntryNav2_800x480(false);
+    NoopSessionListener sl;
+    NoopMediaHandler mh;
+    plat::SessionServerConfig scfg;
+    scfg.control_port = 0U;
+    plat::SessionServer server(reactor, ap_cfg, id, store, rng, sl, mh, NULL, scfg);
+    REQUIRE(server.start(plat::Address::ipv4Loopback(0U)));
+
+    // 1. Unknown libevo_btappl.so build (15024/480/36): must NOT open/read offsets,
+    //    must log formatted report, and must fall back to kernel RFCOMM.
+    {
+        CapturedLogs logs;
+        plat::setLogSink(&CapturedLogs::sink, &logs);
+
+        plat::CarPlayConnectivity conn(reactor, rng);
+        FakeGateSppMemory spp_mem;
+        FakeGateBtSocketOps rfcomm_ops;
+
+        plat::BtTransportCapability cap;
+        cap.alps_library_present = false;
+        cap.alps_detail = "unknown ALPS structure (app=15024, spp_info=480, spp_connected=36)";
+        cap.alps_dbus_ready = true;
+        cap.rfcomm.af_bluetooth_supported = true;
+        cap.rfcomm.has_hci_device = true;
+        cap.rfcomm.hci_devices.push_back("hci0");
+
+        conn.setBtCapabilityForTest(cap);
+        conn.setSppMemoryBackendForTest(&spp_mem);
+        conn.setRfcommSocketOpsForTest(&rfcomm_ops);
+
+        plat::CarPlayConnectivityConfig ccfg;
+        ccfg.enable_wireless = true;
+        ccfg.iap2_tick_interval_ms = 0;
+        REQUIRE(conn.start(server, ap_cfg, id, ccfg));
+
+        CHECK(conn.hasAlpsCompatReport());
+        CHECK(!conn.lastAlpsCompatReport().wireless_ready);
+        CHECK_EQ(plat::kCompatFail, conn.lastAlpsCompatReport().alps.level);
+        CHECK_EQ(0, spp_mem.open_calls);  // Never read offsets of an unknown build!
+        CHECK(conn.wirelessTransportReady());
+        CHECK_EQ(plat::kBtBackendRfcomm, conn.activeBtBackend());
+        CHECK_EQ(1, rfcomm_ops.create_calls);
+        CHECK(logs.contains("ALPS compat gate failed"));
+        CHECK(logs.contains("15024"));
+
+        conn.stop();
+        plat::setLogSink(NULL, NULL);
+    }
+
+    // 2. Known ALPS library sizes, but D-Bus/SPP check fails (alps_dbus_ready = false)
+    //    with RFCOMM available -> gate rejects ALPS SPP and falls back to RFCOMM.
+    {
+        plat::CarPlayConnectivity conn(reactor, rng);
+        FakeGateSppMemory spp_mem;
+        FakeGateBtSocketOps rfcomm_ops;
+
+        plat::BtTransportCapability cap;
+        cap.alps_library_present = true;
+        cap.alps_dbus_ready = false;
+        cap.alps_detail = "dbus_service_missing";
+        cap.rfcomm.af_bluetooth_supported = true;
+        cap.rfcomm.has_hci_device = true;
+        cap.rfcomm.hci_devices.push_back("hci0");
+
+        conn.setBtCapabilityForTest(cap);
+        conn.setSppMemoryBackendForTest(&spp_mem);
+        conn.setRfcommSocketOpsForTest(&rfcomm_ops);
+
+        plat::CarPlayConnectivityConfig ccfg;
+        ccfg.enable_wireless = true;
+        ccfg.iap2_tick_interval_ms = 0;
+        REQUIRE(conn.start(server, ap_cfg, id, ccfg));
+
+        CHECK(conn.hasAlpsCompatReport());
+        CHECK(!conn.lastAlpsCompatReport().wireless_ready);
+        CHECK_EQ(plat::kCompatFail, conn.lastAlpsCompatReport().spp.level);
+        CHECK(conn.wirelessTransportReady());
+        CHECK_EQ(plat::kBtBackendRfcomm, conn.activeBtBackend());
+        CHECK_EQ(1, rfcomm_ops.create_calls);
+
+        conn.stop();
+    }
+
+    // 3. Slot 5 busy & slot 0 protected -> alps/uuid checks fail; with RFCOMM absent,
+    //    wireless is disabled cleanly while wired USB still starts.
+    {
+        plat::CarPlayConnectivity conn(reactor, rng);
+        FakeGateSppMemory spp_mem;
+        spp_mem.setSlot(plat::kAlpsSpareSlot, plat::genericSppUuidPair(), 2U, 1U);  // busy
+        FakeGateUsbHost fake_usb;
+        FakeGateTapPort fake_tap;
+
+        plat::BtTransportCapability cap;
+        cap.alps_library_present = true;
+        cap.alps_dbus_ready = true;
+        cap.rfcomm.af_bluetooth_supported = false;
+        cap.rfcomm.has_hci_device = false;
+
+        conn.setBtCapabilityForTest(cap);
+        conn.setSppMemoryBackendForTest(&spp_mem);
+        conn.setUsbHostForTest(&fake_usb);
+        conn.setTapPortForTest(&fake_tap);
+
+        plat::CarPlayConnectivityConfig ccfg;
+        ccfg.enable_wireless = true;
+        ccfg.enable_wired = true;
+        ccfg.iap2_tick_interval_ms = 0;
+        REQUIRE(conn.start(server, ap_cfg, id, ccfg));
+
+        CHECK(conn.hasAlpsCompatReport());
+        CHECK(!conn.lastAlpsCompatReport().wireless_ready);
+        CHECK_EQ(plat::kCompatFail, conn.lastAlpsCompatReport().alps.level);
+        CHECK_EQ(plat::kCompatFail, conn.lastAlpsCompatReport().uuid.level);
+        CHECK(!conn.wirelessTransportReady());
+        CHECK_EQ(plat::kBtBackendNone, conn.activeBtBackend());
+        CHECK(conn.btTransport() == NULL);
+        CHECK(conn.wiredTransportReady());
+        CHECK(fake_usb.started);
+
+        conn.stop();
+    }
+
+    server.stop();
+}
+
+TEST_CASE(wiredOnlyModeRunsAlpsCompatAsInformational) {
+    plat::Reactor reactor(&fakeClockNs);
+    REQUIRE(reactor.init());
+    plat::OsRandomSource rng;
+    pairing::Identity id;
+    REQUIRE(pairing::generateIdentity(rng, id));
+    pairing::InMemoryPairingStore store;
+    info::AirPlayConfig ap_cfg = info::bmwEntryNav2_800x480(false);
+    NoopSessionListener sl;
+    NoopMediaHandler mh;
+    plat::SessionServerConfig scfg;
+    scfg.control_port = 0U;
+    plat::SessionServer server(reactor, ap_cfg, id, store, rng, sl, mh, NULL, scfg);
+    REQUIRE(server.start(plat::Address::ipv4Loopback(0U)));
+
+    CapturedLogs logs;
+    plat::setLogSink(&CapturedLogs::sink, &logs);
+
+    plat::CarPlayConnectivity conn(reactor, rng);
+    FakeGateSppMemory spp_mem;
+    FakeGateUsbHost fake_usb;
+    FakeGateTapPort fake_tap;
+
+    plat::BtTransportCapability cap;
+    cap.alps_library_present = false;
+    cap.alps_detail = "unknown ALPS structure (app=15024, spp_info=480, spp_connected=36)";
+    cap.alps_dbus_ready = false;
+    cap.rfcomm.af_bluetooth_supported = false;
+    cap.rfcomm.has_hci_device = false;
+
+    conn.setBtCapabilityForTest(cap);
+    conn.setSppMemoryBackendForTest(&spp_mem);
+    conn.setUsbHostForTest(&fake_usb);
+    conn.setTapPortForTest(&fake_tap);
+
+    plat::CarPlayConnectivityConfig ccfg;
+    ccfg.enable_wireless = false;
+    ccfg.enable_wired = true;
+    ccfg.iap2_tick_interval_ms = 0;
+    REQUIRE(conn.start(server, ap_cfg, id, ccfg));
+
+    CHECK(conn.isStarted());
+    CHECK(conn.wiredTransportReady());
+    CHECK(!conn.wirelessTransportReady());
+    CHECK_EQ(plat::kBtBackendNone, conn.activeBtBackend());
+    CHECK_EQ(0, spp_mem.open_calls);
+    CHECK(conn.hasAlpsCompatReport());
+    CHECK(conn.lastAlpsCompatReport().usb_mode);
+    CHECK_EQ(plat::kCompatInfo, conn.lastAlpsCompatReport().alps.level);
+    CHECK_EQ(plat::kCompatInfo, conn.lastAlpsCompatReport().spp.level);
+    CHECK(logs.contains("wired-only informational"));
+    CHECK(logs.contains("usb_mode=yes"));
+
+    conn.stop();
+    plat::setLogSink(NULL, NULL);
     server.stop();
 }
 

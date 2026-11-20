@@ -23,6 +23,7 @@
 #include "carplay/platform/evo_ap.hpp"
 #include "carplay/platform/evo_wlan.hpp"
 #include "carplay/platform/hostapd_ctrl.hpp"
+#include "carplay/platform/log.hpp"
 #include "carplay/platform/mdns_advertiser.hpp"
 #include "carplay/platform/net_compat.hpp"
 #include "carplay/platform/spp_snapshot.hpp"
@@ -1474,6 +1475,9 @@ TEST_CASE(wirelessE2eSimulationAndAlpsRestore) {
     CHECK(daemon.hasActiveSession());
     CHECK_EQ(plat::kConnActiveSession, daemon.connectivity().state());
     CHECK_EQ(plat::kActiveWireless, daemon.connectivity().activeTransport());
+    int ctrl_tos = -1;
+    CHECK(plat::getSocketTrafficClass(daemon.server()->controlSocketHandle(), ctrl_tos));
+    CHECK_EQ(plat::kWifiVideoTos, ctrl_tos);
 
     // Step 7: Phone closes TCP session -> AP restored, mDNS unregistered, state -> kConnWaiting.
     airplay_phone.control_conn.close();
@@ -1593,6 +1597,9 @@ TEST_CASE(wiredE2eSimulationAndTeardown) {
     CHECK(daemon.hasActiveSession());
     CHECK_EQ(plat::kConnActiveSession, daemon.connectivity().state());
     CHECK_EQ(plat::kActiveWired, daemon.connectivity().activeTransport());
+    int wired_ctrl_tos = -1;
+    CHECK(plat::getSocketTrafficClass(daemon.server()->controlSocketHandle(), wired_ctrl_tos));
+    CHECK_EQ(0, wired_ctrl_tos);
 
     // Step 5: USB unplugged mid-session -> AirPlay session closed, TAP closed, USB released!
     sim_usb.simulateRemoval();
@@ -1935,6 +1942,247 @@ TEST_CASE(failureInjectionMidSessionDisconnectAndConcurrencyPolicy) {
     CHECK(dns_state.deallocate_calls >= 1);
     CHECK(spp_mem.slotMatchesGeneric(plat::kAlpsSpareSlot));
 
+    g_sim_dnssd = NULL;
+    removeTempDir(dir);
+#endif
+}
+
+struct CapturedE2eLogs {
+    std::vector<std::string> lines;
+    static void sink(void* ctx, plat::LogLevel /*level*/, const char* tag, const char* msg) {
+        CapturedE2eLogs* self = static_cast<CapturedE2eLogs*>(ctx);
+        self->lines.push_back(std::string(tag) + ": " + msg);
+    }
+    bool contains(const std::string& needle) const {
+        for (size_t i = 0U; i < lines.size(); ++i) {
+            if (lines[i].find(needle) != std::string::npos) {
+                return true;
+            }
+        }
+        return false;
+    }
+};
+
+void driveAirPlaySessionWithMediaSockets(plat::CarPlayDaemon& daemon,
+                                         SimAirPlayPhone& phone,
+                                         const std::string& device_id,
+                                         const std::string& phone_name,
+                                         int expected_tos) {
+    REQUIRE(daemon.pairingStore() != NULL);
+    REQUIRE(daemon.pairingStore()->save(phone.id, phone.ltsk.public_key));
+    REQUIRE(phone.connectTcp(phone.control_conn,
+                             plat::Address::ipv4Loopback(daemon.controlPort())));
+    REQUIRE(phone.pairVerify());
+
+    int tos = -1;
+    CHECK(plat::getSocketTrafficClass(daemon.server()->controlSocketHandle(), tos));
+    CHECK_EQ(expected_tos, tos);
+
+    REQUIRE(phone.timing_sock.open(plat::Address::ipv4Loopback(0U)));
+    carplay::bplist::Value setup_sess = carplay::bplist::Value::makeDict();
+    setup_sess.set("deviceID", carplay::bplist::Value::makeString(device_id));
+    setup_sess.set("name", carplay::bplist::Value::makeString(phone_name));
+    setup_sess.set("model", carplay::bplist::Value::makeString("iPhone16,2"));
+    setup_sess.set("timingPort", carplay::bplist::Value::makeInt(phone.timing_sock.port()));
+    int status = 0;
+    rtsp::Request setup_resp;
+    REQUIRE(phone.request("SETUP", "rtsp://127.0.0.1/session",
+                          rtsp::kContentTypeBinaryPlist,
+                          encodeBplist(setup_sess), status, setup_resp));
+    REQUIRE(status == 200);
+
+    carplay::bplist::Value setup_plist;
+    REQUIRE(carplay::bplist::decode(setup_resp.body, setup_plist));
+    const carplay::bplist::Value* ev_port_val = setup_plist.find("eventPort");
+    REQUIRE(ev_port_val != NULL);
+    const uint16_t ev_port = static_cast<uint16_t>(ev_port_val->asInt());
+    REQUIRE(phone.connectTcp(phone.event_conn, plat::Address::ipv4Loopback(ev_port)));
+
+    tos = -1;
+    CHECK(plat::getSocketTrafficClass(daemon.server()->eventSocketHandle(), tos));
+    CHECK_EQ(expected_tos, tos);
+
+    carplay::bplist::Value streams_arr = carplay::bplist::Value::makeArray();
+    carplay::bplist::Value s_screen = carplay::bplist::Value::makeDict();
+    s_screen.set("type", carplay::bplist::Value::makeInt(110));
+    s_screen.set("streamConnectionID", carplay::bplist::Value::makeInt(6001));
+    streams_arr.asArray().push_back(s_screen);
+
+    carplay::bplist::Value s_audio = carplay::bplist::Value::makeDict();
+    s_audio.set("type", carplay::bplist::Value::makeInt(100));
+    s_audio.set("audioType", carplay::bplist::Value::makeString("speechrecognition"));
+    s_audio.set("audioFormat", carplay::bplist::Value::makeInt(0x10));
+    s_audio.set("spf", carplay::bplist::Value::makeInt(480));
+    s_audio.set("streamConnectionID", carplay::bplist::Value::makeInt(6002));
+    streams_arr.asArray().push_back(s_audio);
+
+    carplay::bplist::Value streams_req = carplay::bplist::Value::makeDict();
+    streams_req.set("streams", streams_arr);
+    rtsp::Request streams_resp;
+    REQUIRE(phone.request("SETUP", "rtsp://127.0.0.1/streams",
+                          rtsp::kContentTypeBinaryPlist,
+                          encodeBplist(streams_req), status, streams_resp));
+    REQUIRE(status == 200);
+
+    carplay::bplist::Value streams_plist;
+    REQUIRE(carplay::bplist::decode(streams_resp.body, streams_plist));
+    const carplay::bplist::Value* resp_arr = streams_plist.find("streams");
+    REQUIRE(resp_arr != NULL && resp_arr->isArray() && resp_arr->asArray().size() == 2U);
+    const carplay::bplist::Value* screen_port_val = resp_arr->asArray()[0].find("dataPort");
+    REQUIRE(screen_port_val != NULL);
+    const uint16_t screen_port = static_cast<uint16_t>(screen_port_val->asInt());
+
+    plat::TcpConnection screen_conn;
+    REQUIRE(phone.connectTcp(screen_conn, plat::Address::ipv4Loopback(screen_port)));
+
+    tos = -1;
+    CHECK(plat::getSocketTrafficClass(daemon.mediaEngine()->firstScreenSocketHandle(), tos));
+    CHECK_EQ(expected_tos, tos);
+    tos = -1;
+    CHECK(plat::getSocketTrafficClass(daemon.mediaEngine()->firstAudioDataSocketHandle(), tos));
+    CHECK_EQ(expected_tos, tos);
+
+    screen_conn.close();
+}
+
+TEST_CASE(wirelessAndWiredSocketQosAndBmwAppsE2e) {
+#ifdef _WIN32
+    return;
+#else
+    const std::string dir = makeTempDir("cp_sim_qos_apps");
+    plat::CarPlayDaemonConfig cfg = makeSimDaemonConfig(dir);
+    cfg.enable_wireless = true;
+    cfg.enable_wired = true;
+    // Defaults leave wifi_video_qos=false; CarPlayConnectivity toggles per active transport.
+    CHECK(!cfg.server_config.wifi_video_qos);
+    CHECK(!cfg.media_config.wifi_video_qos);
+    cfg.connectivity_config.wireless_ips_override.push_back("127.0.0.1");
+    cfg.connectivity_config.wifi_ap_config.backend = plat::kWifiApBackendNative;
+    cfg.connectivity_config.alps_config.double_read_delay_ms = 0U;
+    cfg.connectivity_config.alps_config.restore_poll_interval_ms = 0U;
+
+    plat::CarPlayDaemon daemon(cfg);
+
+    SimSppMemoryBackend spp_mem;
+    // Mark BMW Apps (slot 0) connected to exercise read-only WifiLinkLog::setAppsProbe().
+    spp_mem.setSlotUuid(plat::kAlpsBmwAppsSlot, plat::genericSppUuidPair(), 2U, 1U);
+    SimAlpsSppLink alps_link(&spp_mem);
+
+    plat::BtTransportCapability cap;
+    cap.alps_library_present = true;
+    cap.alps_dbus_ready = true;
+    cap.alps_service_owned = true;
+    cap.alps_detail = "found";
+
+    SimWlanController sim_wlan;
+    SimAccessPointReader sim_ap_reader;
+    SimHostapdCtrl sim_ctrl;
+    SimDnsSdState dns_state;
+    g_sim_dnssd = &dns_state;
+    const plat::DnsSdApi dns_api = makeSimDnsSdApi();
+    SimUsbHost sim_usb;
+    SimTapPort sim_tap;
+    SimAuthProvider sim_auth;
+
+    CapturedE2eLogs logs;
+    plat::setLogSink(&CapturedE2eLogs::sink, &logs);
+
+    daemon.connectivity().setBtCapabilityForTest(cap);
+    daemon.connectivity().setSppMemoryBackendForTest(&spp_mem);
+    daemon.connectivity().setAlpsLinkForTest(&alps_link);
+    daemon.connectivity().setUsbHostForTest(&sim_usb);
+    daemon.connectivity().setTapPortForTest(&sim_tap);
+    daemon.connectivity().setIap2AuthProvider(&sim_auth);
+    daemon.connectivity().wifiAp().setWlanControllerForTest(&sim_wlan);
+    daemon.connectivity().wifiAp().setAccessPointReaderForTest(&sim_ap_reader);
+    daemon.connectivity().wifiAp().setHostapdCtrlForTest(&sim_ctrl);
+    daemon.connectivity().wifiAp().setNativeCapabilityForTest(1);
+    daemon.connectivity().mdnsAdvertiser().setApiOverride(&dns_api);
+
+    REQUIRE(daemon.start());
+    CHECK(daemon.connectivity().hasAlpsCompatReport());
+    CHECK(daemon.connectivity().lastAlpsCompatReport().wireless_ready);
+    CHECK_EQ(plat::kCompatWarn, daemon.connectivity().lastAlpsCompatReport().alps.level);
+    CHECK_EQ(plat::kBtBackendAlpsSpp, daemon.connectivity().activeBtBackend());
+    CHECK(!daemon.server()->wifiVideoQos());
+    CHECK(!daemon.mediaEngine()->wifiVideoQos());
+
+    // 1. Wireless session -> control, event, screen TCP, and audio UDP carry TOS 0x80.
+    plat::BtAddr peer;
+    REQUIRE(plat::BtAddr::parse("11:22:33:44:55:99", peer));
+    alps_link.simulateConnect(peer);
+
+    ScriptedIap2Phone wl_iap2;
+    auto deliverBt = [&alps_link](const Bytes& b) { alps_link.simulateRx(b); };
+    driveIap2SyncAndAuth(wl_iap2, alps_link.tx_to_phone, deliverBt, sim_auth, true);
+    daemon.reactor().runOnce(10);
+
+    iap2::ParameterList wl_grp;
+    wl_grp.addU8(0U, 1U);
+    iap2::ParameterList wl_avail;
+    wl_avail.addGroup(1U, wl_grp);
+    wl_iap2.sendControlFrame(iap2::msg::kCarPlayAvailability, wl_avail);
+    deliverBt(wl_iap2.tx_to_accessory);
+    wl_iap2.tx_to_accessory.clear();
+    wl_iap2.consumeFromAccessory(alps_link.tx_to_phone);
+    alps_link.simulateDisconnect("handoff to wifi");
+
+    {
+        SimAirPlayPhone wl_phone(daemon.reactor(), "WL-QOS-001");
+        driveAirPlaySessionWithMediaSockets(
+            daemon, wl_phone, "11:22:33:44:55:99", "Wireless QoS iPhone", plat::kWifiVideoTos);
+        CHECK_EQ(plat::kActiveWireless, daemon.connectivity().activeTransport());
+        CHECK(daemon.server()->wifiVideoQos());
+        CHECK(daemon.mediaEngine()->wifiVideoQos());
+        // WifiLinkLog sampled on session start and logged read-only BMW Apps slot 0 status.
+        CHECK(logs.contains("wifi-link: ") &&
+              logs.contains("BMW Apps Bluetooth link connected"));
+        CHECK(spp_mem.slotMatchesGeneric(plat::kAlpsBmwAppsSlot));
+
+        wl_phone.event_conn.close();
+        wl_phone.control_conn.close();
+        const int64_t dl = plat::monotonicMillis() + 2000;
+        while (plat::monotonicMillis() < dl && daemon.connectivity().state() != plat::kConnWaiting) {
+            daemon.reactor().runOnce(10);
+        }
+    }
+    CHECK_EQ(plat::kConnWaiting, daemon.connectivity().state());
+    CHECK(!daemon.server()->wifiVideoQos());
+    CHECK(!daemon.mediaEngine()->wifiVideoQos());
+
+    // 2. Wired USB session on the SAME daemon -> all 4 sockets carry TOS 0.
+    sim_usb.simulateArrival(buildCarPlayUsbBlob());
+    CHECK_EQ(plat::kConnWiredIap2, daemon.connectivity().state());
+    CHECK(!daemon.server()->wifiVideoQos());
+    CHECK(!daemon.mediaEngine()->wifiVideoQos());
+
+    ScriptedIap2Phone usb_iap2;
+    auto deliverUsb = [&sim_usb](const Bytes& b) { sim_usb.deliverIap2In(b); };
+    driveIap2SyncAndAuth(usb_iap2, sim_usb.iap2_out, deliverUsb, sim_auth, false);
+
+    iap2::ParameterList usb_grp;
+    usb_grp.addU8(0U, 1U);
+    iap2::ParameterList usb_avail;
+    usb_avail.addGroup(0U, usb_grp);
+    usb_iap2.sendControlFrame(iap2::msg::kCarPlayAvailability, usb_avail);
+    deliverUsb(usb_iap2.tx_to_accessory);
+    usb_iap2.tx_to_accessory.clear();
+    usb_iap2.consumeFromAccessory(sim_usb.iap2_out);
+    CHECK_EQ(plat::kConnWiredWaitingAirPlay, daemon.connectivity().state());
+
+    {
+        SimAirPlayPhone usb_phone(daemon.reactor(), "USB-QOS-001");
+        driveAirPlaySessionWithMediaSockets(
+            daemon, usb_phone, "AA:BB:CC:DD:EE:11", "Wired QoS iPhone", 0);
+        CHECK_EQ(plat::kActiveWired, daemon.connectivity().activeTransport());
+    }
+
+    sim_usb.simulateRemoval();
+    CHECK_EQ(plat::kConnWaiting, daemon.connectivity().state());
+
+    daemon.stop();
+    CHECK(spp_mem.slotMatchesGeneric(plat::kAlpsSpareSlot));
+    plat::setLogSink(NULL, NULL);
     g_sim_dnssd = NULL;
     removeTempDir(dir);
 #endif

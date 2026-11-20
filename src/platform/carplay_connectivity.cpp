@@ -186,9 +186,18 @@ CarPlayConnectivity::CarPlayConnectivity(Reactor& reactor, pairing::RandomSource
       wired_iap2_listener_(this),
       timer_handler_(this),
       bt_transport_override_(NULL),
+      bt_cap_override_(),
+      has_bt_cap_override_(false),
+      spp_mem_override_(NULL),
+      alps_link_override_(NULL),
+      rfcomm_socket_ops_override_(NULL),
       bt_transport_(NULL),
       bt_adapter_(NULL, NULL, &bt_downstream_),
       wireless_iap2_session_(NULL),
+      has_compat_report_(false),
+      last_compat_report_(),
+      alps_snapshot_safe_(false),
+      wifi_link_log_(),
       wifi_ap_(reactor_, rng_),
       wifi_creds_adapter_(&wifi_ap_, &wifi_downstream_),
       mdns_(reactor_),
@@ -220,6 +229,7 @@ CarPlayConnectivity::CarPlayConnectivity(Reactor& reactor, pairing::RandomSource
       rejected_concurrent_attempts_(0U),
       failure_teardowns_(0U) {
     memset(wired_tap_mac_, 0, sizeof(wired_tap_mac_));
+    wifi_link_log_.setAppsProbe(&CarPlayConnectivity::appsProbeThunk, this);
 }
 
 CarPlayConnectivity::~CarPlayConnectivity() {
@@ -235,6 +245,38 @@ void CarPlayConnectivity::setIap2AuthProvider(iap2::AuthProvider* auth) {
 void CarPlayConnectivity::setBtTransportForTest(BtTransport* transport) {
     if (!started_) {
         bt_transport_override_ = transport;
+    }
+}
+
+void CarPlayConnectivity::setBtCapabilityForTest(const BtTransportCapability& cap) {
+    if (!started_) {
+        bt_cap_override_ = cap;
+        has_bt_cap_override_ = true;
+    }
+}
+
+void CarPlayConnectivity::clearBtCapabilityForTest() {
+    if (!started_) {
+        bt_cap_override_ = BtTransportCapability();
+        has_bt_cap_override_ = false;
+    }
+}
+
+void CarPlayConnectivity::setSppMemoryBackendForTest(SppMemoryBackend* mem) {
+    if (!started_) {
+        spp_mem_override_ = mem;
+    }
+}
+
+void CarPlayConnectivity::setAlpsLinkForTest(AlpsSppLink* link) {
+    if (!started_) {
+        alps_link_override_ = link;
+    }
+}
+
+void CarPlayConnectivity::setRfcommSocketOpsForTest(BtSocketOps* ops) {
+    if (!started_) {
+        rfcomm_socket_ops_override_ = ops;
     }
 }
 
@@ -347,6 +389,9 @@ bool CarPlayConnectivity::start(SessionServer& server,
     active_mode_ = kActiveNone;
     active_wifi_creds_ = WifiCredentials();
     last_advertised_wireless_ssid_.clear();
+    has_compat_report_ = false;
+    last_compat_report_ = AlpsCompatReport();
+    alps_snapshot_safe_ = false;
 
     if (!config_.enable_wireless && !config_.enable_wired) {
         CARPLAY_LOG_INFO(kTag, "wireless and wired transports both disabled by config");
@@ -354,9 +399,18 @@ bool CarPlayConnectivity::start(SessionServer& server,
     }
 
     started_ = true;
+    server_->setWifiVideoQos(false);
 
     if (config_.enable_wireless) {
         startWirelessSubsystem();
+    } else if (config_.enable_wired) {
+        const BtTransportCapability cap =
+            has_bt_cap_override_ ? bt_cap_override_ : probeBtTransportCapability();
+        last_compat_report_ = probeAlpsSppCompat(
+            cap, spp_mem_override_, true, config_.alps_config.slot_policy);
+        has_compat_report_ = true;
+        CARPLAY_LOG_INFO(kTag, "BT/ALPS compat (wired-only informational): %s",
+                         formatAlpsCompatReport(last_compat_report_).c_str());
     }
     if (config_.enable_wired) {
         startWiredSubsystem();
@@ -400,29 +454,93 @@ bool CarPlayConnectivity::startWirelessSubsystem() {
     if (bt_transport_override_ != NULL) {
         bt_transport_ = bt_transport_override_;
         bt_transport_->setListener(&bt_adapter_);
+        if (has_bt_cap_override_) {
+            last_compat_report_ = probeAlpsSppCompat(
+                bt_cap_override_, spp_mem_override_, false, config_.alps_config.slot_policy);
+            has_compat_report_ = true;
+            alps_snapshot_safe_ = last_compat_report_.wireless_ready &&
+                                  (last_compat_report_.alps.level == kCompatPass ||
+                                   last_compat_report_.alps.level == kCompatWarn);
+        }
     } else {
-        const BtTransportCapability cap = probeBtTransportCapability();
+        const BtTransportCapability cap =
+            has_bt_cap_override_ ? bt_cap_override_ : probeBtTransportCapability();
         logBtTransportCapability(cap);
-        owned_bt_transport_ = createBtTransport(reactor_,
-                                                bt_adapter_,
-                                                cap,
-                                                config_.alps_config,
-                                                config_.rfcomm_config,
-                                                config_.sdp_socket_path);
+        last_compat_report_ = probeAlpsSppCompat(
+            cap, spp_mem_override_, false, config_.alps_config.slot_policy);
+        has_compat_report_ = true;
+
+        if (last_compat_report_.wireless_ready) {
+            alps_snapshot_safe_ = true;
+            CARPLAY_LOG_INFO(kTag, "ALPS compat gate passed: %s",
+                             formatAlpsCompatReport(last_compat_report_).c_str());
+            if (spp_mem_override_ != NULL || alps_link_override_ != NULL) {
+                owned_bt_transport_.reset(new AlpsBtTransport(
+                    reactor_,
+                    bt_adapter_,
+                    config_.alps_config,
+                    spp_mem_override_,
+                    alps_link_override_));
+            } else {
+                owned_bt_transport_ = createBtTransport(reactor_,
+                                                        bt_adapter_,
+                                                        cap,
+                                                        config_.alps_config,
+                                                        config_.rfcomm_config,
+                                                        config_.sdp_socket_path);
+            }
+        } else {
+            alps_snapshot_safe_ = false;
+            CARPLAY_LOG_WARN(kTag,
+                             "ALPS compat gate failed (%s); falling back to kernel RFCOMM if available",
+                             formatAlpsCompatReport(last_compat_report_).c_str());
+            if (cap.rfcommCapable()) {
+                if (rfcomm_socket_ops_override_ != NULL) {
+                    owned_bt_transport_.reset(new RfcommBtTransport(
+                        reactor_,
+                        bt_adapter_,
+                        config_.rfcomm_config,
+                        rfcomm_socket_ops_override_,
+                        createBtSdpRegistrar(cap.rfcomm, config_.sdp_socket_path)));
+                } else {
+                    BtTransportCapability rfcomm_cap = cap;
+                    rfcomm_cap.alps_library_present = false;
+                    rfcomm_cap.alps_dbus_ready = false;
+                    rfcomm_cap.alps_service_owned = false;
+                    owned_bt_transport_ = createBtTransport(reactor_,
+                                                            bt_adapter_,
+                                                            rfcomm_cap,
+                                                            config_.alps_config,
+                                                            config_.rfcomm_config,
+                                                            config_.sdp_socket_path);
+                }
+            } else {
+                owned_bt_transport_.reset();
+            }
+        }
         bt_transport_ = owned_bt_transport_.get();
     }
     bt_adapter_.setTransport(bt_transport_);
 
-    if (bt_transport_ == NULL) {
-        CARPLAY_LOG_WARN(kTag, "wireless enabled, but no BT backend (ALPS SPP / RFCOMM) is available");
-        wireless_transport_ready_ = false;
-        return false;
-    }
-
     std::string bt_err;
-    if (!bt_transport_->start(&bt_err)) {
-        CARPLAY_LOG_WARN(kTag, "BT transport (%s) failed to start: %s",
-                         bt_transport_->backendName(), bt_err.c_str());
+    if (bt_transport_ == NULL || !bt_transport_->start(&bt_err)) {
+        if (bt_transport_ == NULL) {
+            CARPLAY_LOG_WARN(kTag,
+                             "wireless disabled: ALPS incompatible/unavailable and kernel RFCOMM unavailable");
+        } else {
+            CARPLAY_LOG_WARN(kTag, "BT transport (%s) failed to start: %s",
+                             bt_transport_->backendName(), bt_err.c_str());
+        }
+        bt_adapter_.setSession(NULL);
+        bt_adapter_.setDownstreamListener(NULL);
+        bt_adapter_.setTransport(NULL);
+        if (wireless_iap2_session_ != NULL) {
+            delete wireless_iap2_session_;
+            wireless_iap2_session_ = NULL;
+        }
+        bt_transport_ = NULL;
+        owned_bt_transport_.reset();
+        alps_snapshot_safe_ = false;
         wireless_transport_ready_ = false;
         return false;
     }
@@ -507,8 +625,14 @@ void CarPlayConnectivity::stop() {
     if (server_ != NULL && server_->hasActiveSession()) {
         server_->closeActiveSession();
     }
+    if (server_ != NULL) {
+        server_->setWifiVideoQos(false);
+    }
 
-    // Tear down wireless side (mDNS, AP restore, iAP2, BT + ALPS slot 5 restore).
+    // Tear down wireless side (Wi-Fi link log, mDNS, AP restore, iAP2, BT + ALPS slot 5 restore).
+    wifi_link_log_.turn(static_cast<uint32_t>(reactor_.now() / 1000000LL), false);
+    wifi_link_log_.enable("");
+    alps_snapshot_safe_ = false;
     mdns_.setListener(NULL);
     mdns_.stop();
 
@@ -583,7 +707,15 @@ void CarPlayConnectivity::onAirPlaySessionStarted() {
     if (!started_ || stopping_ || state_ == kConnStopped) {
         return;
     }
+    const bool entering_active = (state_ != kConnActiveSession);
     setState(kConnActiveSession, "AirPlay session active");
+    if (entering_active && active_mode_ == kActiveWireless && server_ != NULL) {
+        const SocketHandle sock = server_->controlSocketHandle();
+        if (sock != kInvalidSocket) {
+            wifi_link_log_.connected(static_cast<int>(sock));
+            wifi_link_log_.turn(static_cast<uint32_t>(reactor_.now() / 1000000LL), true);
+        }
+    }
 }
 
 void CarPlayConnectivity::onAirPlaySessionEnded() {
@@ -599,9 +731,15 @@ void CarPlayConnectivity::onAirPlaySessionEnded() {
             teardownWiredSession("AirPlay session ended", false, true);
         } else {
             active_mode_ = kActiveNone;
+            if (server_ != NULL) {
+                server_->setWifiVideoQos(false);
+            }
             setState(kConnWaiting, "AirPlay session ended");
         }
     } else {
+        if (server_ != NULL) {
+            server_->setWifiVideoQos(false);
+        }
         setState(kConnWaiting, "direct AirPlay session ended");
     }
 }
@@ -637,6 +775,9 @@ void CarPlayConnectivity::handleBtConnected(const BtAddr& peer) {
     CARPLAY_LOG_INFO(kTag, "BT peer connected (%s); starting wireless iAP2 bootstrap",
                      peer.toString().c_str());
     active_mode_ = kActiveWireless;
+    if (server_ != NULL) {
+        server_->setWifiVideoQos(true);
+    }
     pending_wifi_config_request_ = false;
     pending_wireless_start_session_ = false;
     wireless_station_seen_ = false;
@@ -817,6 +958,10 @@ void CarPlayConnectivity::handleWifiApStarted(const WifiCredentials& creds) {
         return;
     }
     active_wifi_creds_ = creds;
+    const std::string& ap_iface = (wifi_ap_.activeBackend() == kWifiApBackendNative)
+        ? config_.wifi_ap_config.native_interface_name
+        : config_.wifi_ap_config.interface_name;
+    wifi_link_log_.enable(ap_iface.c_str());
     if (listener_ != NULL) {
         listener_->onWirelessCredentialsReady(creds);
     }
@@ -923,7 +1068,12 @@ void CarPlayConnectivity::teardownWirelessSession(const std::string& reason, boo
     if (server_ != NULL && server_->hasActiveSession()) {
         server_->closeActiveSession();
     }
+    if (server_ != NULL) {
+        server_->setWifiVideoQos(false);
+    }
 
+    wifi_link_log_.turn(static_cast<uint32_t>(reactor_.now() / 1000000LL), false);
+    wifi_link_log_.enable("");
     mdns_.stop();
     wifi_creds_adapter_.clearCredentials();
     wifi_ap_.stopSync();
@@ -972,6 +1122,9 @@ void CarPlayConnectivity::handleUsbIap2Ready(const usb::Iap2InterfaceSelection& 
     }
 
     active_mode_ = kActiveWired;
+    if (server_ != NULL) {
+        server_->setWifiVideoQos(false);
+    }
     wired_ncm_ready_ = false;
     pending_wired_start_session_ = false;
 
@@ -1134,6 +1287,9 @@ void CarPlayConnectivity::teardownWiredSession(const std::string& reason,
     if (server_ != NULL && server_->hasActiveSession()) {
         server_->closeActiveSession();
     }
+    if (server_ != NULL) {
+        server_->setWifiVideoQos(false);
+    }
 
     if (wired_iap2_session_ != NULL &&
         wired_iap2_session_->state() != iap2::kSessionIdle) {
@@ -1191,6 +1347,9 @@ void CarPlayConnectivity::handleTimer(uint32_t timer_id) {
     }
 
     const int64_t now_ms = reactor_.now() / 1000000LL;
+    if (state_ == kConnActiveSession && active_mode_ == kActiveWireless) {
+        wifi_link_log_.turn(static_cast<uint32_t>(now_ms), true);
+    }
     if (wireless_iap2_session_ != NULL &&
         wireless_iap2_session_->state() != iap2::kSessionIdle &&
         wireless_iap2_session_->state() != iap2::kSessionFailed) {
@@ -1215,6 +1374,17 @@ void CarPlayConnectivity::handleTimer(uint32_t timer_id) {
             }
         }
     }
+}
+
+bool CarPlayConnectivity::appsProbeThunk(void* user, AppsSlot& out) {
+    CarPlayConnectivity* self = static_cast<CarPlayConnectivity*>(user);
+    if (self == NULL || self->bt_transport_ == NULL) {
+        return false;
+    }
+    if (!self->alps_snapshot_safe_ && self->bt_transport_override_ == NULL) {
+        return false;
+    }
+    return self->bt_transport_->readBmwAppsSlot(out);
 }
 
 }  // namespace platform
