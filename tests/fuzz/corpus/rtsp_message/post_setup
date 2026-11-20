@@ -1,0 +1,6 @@
+POST /setup RTSP/1.0
+CSeq: 1
+Content-Type: application/x-apple-binary-plist
+Content-Length: 4
+
+TEST
