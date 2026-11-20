@@ -23,6 +23,7 @@
 
 library libasound required any
   source src/platform/evo_audio.cpp
+  source src/platform/compat_check.cpp
   soname libasound.so.2
   symbol required snd_pcm_open
   symbol required snd_pcm_set_params
@@ -37,6 +38,7 @@ library libasound required any
 
 library libxsvideo required any
   source src/platform/evo_video.cpp
+  source src/platform/compat_check.cpp
   source include/carplay/platform/evo_video.hpp
   soname libxsvideo.so.4
   symbol required xsv_open
@@ -56,6 +58,7 @@ library libxsvideo required any
 
 library libdrm required any handle=drm_handle_
   source src/platform/omap_dmabuf.cpp
+  source src/platform/compat_check.cpp
   source include/carplay/platform/evo_video.hpp
   soname libdrm.so.2
   symbol required drmOpen
@@ -63,6 +66,7 @@ library libdrm required any handle=drm_handle_
 
 library libdrm_omap required any handle=omap_handle_
   source src/platform/omap_dmabuf.cpp
+  source src/platform/compat_check.cpp
   source include/carplay/platform/evo_video.hpp
   soname libdrm_omap.so.1
   symbol required omap_device_new
@@ -74,6 +78,7 @@ library libdrm_omap required any handle=omap_handle_
 
 library libvmostclient required any
   source src/platform/vmost_client.cpp
+  source src/platform/compat_check.cpp
   soname libvmostclient.so.1
   symbol required vmostConnect
   symbol required vmostFblockShadowRegister
@@ -85,6 +90,7 @@ library libvmostclient required any
 
 library libdns_sd required any
   source src/platform/mdns_advertiser.cpp
+  source src/platform/compat_check.cpp
   soname libdns_sd.so.0
   soname libdns_sd.so.1
   soname libdns_sd.so
@@ -96,12 +102,14 @@ library libdns_sd required any
 
 library libbluetooth optional any
   source src/platform/bt_rfcomm.cpp
+  source src/platform/compat_check.cpp
   soname libbluetooth.so.3
   soname libbluetooth.so
 
 library libdbus required any
   source src/platform/alps_spp.cpp
   source src/platform/bt_rfcomm.cpp
+  source src/platform/compat_check.cpp
   soname libdbus-1.so.3
   soname libdbus-1.so
   symbol required dbus_threads_init_default

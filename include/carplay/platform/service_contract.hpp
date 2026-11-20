@@ -36,6 +36,8 @@ static const char* const kVehicle = "/var/local/data/CarPlay/vehicle";
 static const char* const kAppLog = "/var/local/data/CarPlay/app.log";
 static const char* const kAppLogOld = "/var/local/data/CarPlay/app.old.log";
 static const char* const kAppDisable = "/var/local/data/CarPlay/app.disable";
+static const char* const kKillSwitch = "/var/local/data/CarPlay/killswitch";
+static const char* const kConfigFile = "/var/local/data/CarPlay/carplay.conf";
 static const char* const kAppGuard = "/var/local/data/CarPlay/app-guard";
 static const char* const kBootGuard = "/var/local/data/CarPlay/bootguard";
 
@@ -43,6 +45,8 @@ static const char* const kBootGuard = "/var/local/data/CarPlay/bootguard";
 static const char* const kServiceDir = "/tmp/entry-carplay-service";
 static const char* const kServiceStop = "/tmp/entry-carplay-service/STOP";
 static const char* const kServiceLog = "/tmp/entry-carplay-service.log";
+static const char* const kCrashGuardFile = "/tmp/entry-carplay-crash-guard";
+static const char* const kCrashDisabledFile = "/tmp/entry-carplay-disabled-until-reboot";
 static const char* const kStateFile = "/tmp/entry-carplayd-state";
 static const char* const kAppKeyFile = "/tmp/entry-carplayd-appkey";
 static const char* const kDayNightFile = "/tmp/entry-carplayd-daynight";

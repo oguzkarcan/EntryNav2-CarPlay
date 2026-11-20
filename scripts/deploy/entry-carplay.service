@@ -1,0 +1,21 @@
+[Unit]
+Description=EntryNav2-CarPlay AirPlay/iAP2 Receiver Daemon
+After=dbus.service network.target
+ConditionPathExists=!/var/local/data/CarPlay/killswitch
+ConditionPathExists=!/var/local/data/CarPlay/app.disable
+
+[Service]
+Type=simple
+Environment=XDG_RUNTIME_DIR=/run/system/0
+Environment=WAYLAND_DISPLAY=wayland-0
+Environment=LD_LIBRARY_PATH=/usr/local/lib:/opt/hmi/lib:/usr/lib:/lib
+Environment=HOME=/tmp
+ExecStart=/opt/carplay/carplayd --service --config /var/local/data/CarPlay/carplay.conf
+Restart=on-failure
+RestartSec=5
+StartLimitInterval=120
+StartLimitBurst=3
+RestartPreventExitStatus=78
+
+[Install]
+WantedBy=multi-user.target
