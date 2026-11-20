@@ -21,11 +21,11 @@ This document records the provenance and licensing of every file in `EntryNav2-C
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
 | DiPlay (derived only) | `GPL-3.0` | 17 | 16 | 6 | 0 | **39** |
 | DiPlay + EntryNav2-Android-Auto 0.12.0 (dual-derived) | `GPL-3.0` + `PolyForm-Noncommercial-1.0.0` | 2 | 2 | 0 | 0 | **4** |
-| EntryNav2-Android-Auto 0.12.0 / 0.13.0-rc.6 (derived only) | `PolyForm-Noncommercial-1.0.0` | 8 | 8 | 1 | 0 | **17** |
+| EntryNav2-Android-Auto 0.12.0 / 0.13.0-rc.6 (derived only) | `PolyForm-Noncommercial-1.0.0` | 9 | 9 | 1 | 0 | **19** |
 | Monocypher (vendored) | `BSD-2-Clause OR CC0-1.0` | 2 | 2 | 0 | 1 | **5** |
-| **Total** | | **29** | **28** | **7** | **1** | **65** |
+| **Total** | | **30** | **29** | **7** | **1** | **67** |
 
-*(Note: Total derived files = 60 across `include/`, `src/`, and `tests/`; total third-party/derived files including vendored Monocypher = 65.)*
+*(Note: Total derived files = 62 across `include/`, `src/`, and `tests/`; total third-party/derived files including vendored Monocypher = 67.)*
 
 ---
 
@@ -96,6 +96,8 @@ Required Notice: `Copyright (c) 2026 Jiraiya43 - EntryNav2 (EntryEvo) Android Au
 | `src/platform/alps_spp.cpp` | `platform/alps_spp.cpp`, `platform/spp_advertisement.hpp`, `tools/aa_supervisor.cpp` | `PolyForm-Noncommercial-1.0.0` |
 | `include/carplay/platform/bt_transport.hpp` | `tools/aa_supervisor.cpp` (`0.13.0-rc.6` `alps`/`uuid`/`spp` compat probe additions) | `PolyForm-Noncommercial-1.0.0` |
 | `src/platform/bt_transport.cpp` | `tools/aa_supervisor.cpp` (`0.13.0-rc.6` `alps`/`uuid`/`spp` compat probe additions) | `PolyForm-Noncommercial-1.0.0` |
+| `include/carplay/platform/compat_check.hpp` | `tools/aa_supervisor.cpp` (`0.13.0-rc.6` `@ok\|@info\|@warn\|@block` compat format & `bmw::PluginApp` vtable ABI check) | `PolyForm-Noncommercial-1.0.0` |
+| `src/platform/compat_check.cpp` | `tools/aa_supervisor.cpp` (`0.13.0-rc.6` `@ok\|@info\|@warn\|@block` compat format & `bmw::PluginApp` vtable ABI check) | `PolyForm-Noncommercial-1.0.0` |
 | `include/carplay/platform/elf_symbols.hpp` | `platform/evo_elf.hpp` | `PolyForm-Noncommercial-1.0.0` |
 | `src/platform/elf_symbols.cpp` | `platform/evo_elf.hpp` | `PolyForm-Noncommercial-1.0.0` |
 | `include/carplay/platform/evo_ap.hpp` | `platform/evo_ap.hpp`, `platform/evo_ap.cpp`, `platform/evo_ap_config.cpp` | `PolyForm-Noncommercial-1.0.0` |

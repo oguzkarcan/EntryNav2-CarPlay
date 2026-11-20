@@ -280,6 +280,10 @@ if [ "$BUILD_RC" -ne 0 ] || [ "$failed" -ne 0 ] || [ "$missing" -ne 0 ] || [ "$A
     echo "::error::$PROFILE: build or tests FAILED (see summary above and $LOG_DIR)"
     exit 1
 fi
+if [ "$PROFILE" = "host" ] && [ -f scripts/ci/check_probe_scripts.sh ]; then
+    section "Probe and deploy scripts check"
+    sh scripts/ci/check_probe_scripts.sh
+fi
 if [ "${CHECK_SYSROOT:-0}" = "1" ]; then
     section "Sysroot symbol/soname check"
     sh scripts/ci/check_sysroot_symbols.sh

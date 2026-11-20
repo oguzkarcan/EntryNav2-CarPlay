@@ -1,8 +1,11 @@
 #!/bin/sh
 # Read-only USB / UDC / configfs / usbfs / tun probe for BMW HU_ENTRYNAV2 (BusyBox POSIX sh).
 # NEVER writes to /sys, /proc, /dev, or disk.
+# Optional: PROBE_ROOT=/path/to/fake_root (defaults to empty = live root /).
 
 set -u
+
+R=${PROBE_ROOT:-}
 
 section() {
     echo
@@ -19,56 +22,56 @@ read_attr() {
 
 section "System / Kernel"
 uname -a 2>/dev/null || true
-if [ -r /etc/version ]; then
+if [ -r "$R/etc/version" ]; then
     printf "etc_version: "
-    read_attr /etc/version
+    read_attr "$R/etc/version"
     echo
 fi
-if [ -r /proc/uptime ]; then
+if [ -r "$R/proc/uptime" ]; then
     printf "uptime: "
-    cat /proc/uptime 2>/dev/null || true
+    cat "$R/proc/uptime" 2>/dev/null || true
 fi
 
 section "USB Modules & Net USB Drivers"
 if command -v lsmod >/dev/null 2>&1; then
     lsmod 2>/dev/null || true
-elif [ -r /proc/modules ]; then
-    cat /proc/modules 2>/dev/null || true
+elif [ -r "$R/proc/modules" ]; then
+    cat "$R/proc/modules" 2>/dev/null || true
 fi
 KREL=$(uname -r 2>/dev/null || echo unknown)
-if [ -d "/lib/modules/$KREL/kernel/drivers/net/usb" ]; then
+if [ -d "$R/lib/modules/$KREL/kernel/drivers/net/usb" ]; then
     echo "--- /lib/modules/$KREL/kernel/drivers/net/usb ---"
-    ls -la "/lib/modules/$KREL/kernel/drivers/net/usb" 2>/dev/null || true
+    ls -la "$R/lib/modules/$KREL/kernel/drivers/net/usb" 2>/dev/null || true
 fi
-if [ -r "/lib/modules/$KREL/modules.builtin" ]; then
+if [ -r "$R/lib/modules/$KREL/modules.builtin" ]; then
     echo "--- modules.builtin (usb/ncm/tun/ffs) ---"
-    grep -E 'ncm|cdc|tun|ffs|dwc3|xhci|ehci|musb|gadget|ipheth' "/lib/modules/$KREL/modules.builtin" 2>/dev/null || true
+    grep -E 'ncm|cdc|tun|ffs|dwc3|xhci|ehci|musb|gadget|ipheth' "$R/lib/modules/$KREL/modules.builtin" 2>/dev/null || true
 fi
 
 section "/dev/net/tun & Network Interfaces"
-ls -la /dev/net/tun 2>/dev/null || echo "/dev/net/tun: not present"
-if [ -r /proc/net/dev ]; then
-    cat /proc/net/dev 2>/dev/null || true
+ls -la "$R/dev/net/tun" 2>/dev/null || echo "/dev/net/tun: not present"
+if [ -r "$R/proc/net/dev" ]; then
+    cat "$R/proc/net/dev" 2>/dev/null || true
 fi
-if [ -r /proc/net/if_inet6 ]; then
+if [ -r "$R/proc/net/if_inet6" ]; then
     echo "--- /proc/net/if_inet6 ---"
-    cat /proc/net/if_inet6 2>/dev/null || true
+    cat "$R/proc/net/if_inet6" 2>/dev/null || true
 fi
 
 section "/dev/bus/usb (usbfs)"
-if [ -d /dev/bus/usb ]; then
-    ls -laR /dev/bus/usb 2>/dev/null || true
+if [ -d "$R/dev/bus/usb" ]; then
+    ls -laR "$R/dev/bus/usb" 2>/dev/null || true
 else
     echo "/dev/bus/usb: not present"
 fi
-if [ -r /proc/mounts ]; then
+if [ -r "$R/proc/mounts" ]; then
     echo "--- usb/configfs/ffs mounts ---"
-    grep -E 'usbfs|usbdev|configfs|functionfs|debugfs' /proc/mounts 2>/dev/null || true
+    grep -E 'usbfs|usbdev|configfs|functionfs|debugfs' "$R/proc/mounts" 2>/dev/null || true
 fi
 
 section "/sys/bus/usb/devices Tree"
-if [ -d /sys/bus/usb/devices ]; then
-    for d in /sys/bus/usb/devices/*; do
+if [ -d "$R/sys/bus/usb/devices" ]; then
+    for d in "$R/sys/bus/usb/devices"/*; do
         [ -e "$d" ] || continue
         name=${d##*/}
         if [ -r "$d/idVendor" ]; then
@@ -111,8 +114,8 @@ else
 fi
 
 section "/sys/class/udc & State"
-if [ -d /sys/class/udc ]; then
-    for u in /sys/class/udc/*; do
+if [ -d "$R/sys/class/udc" ]; then
+    for u in "$R/sys/class/udc"/*; do
         [ -e "$u" ] || continue
         uname_u=${u##*/}
         echo "UDC: $uname_u"
@@ -134,8 +137,8 @@ else
 fi
 
 section "ConfigFS USB Gadget Layout (/sys/kernel/config/usb_gadget)"
-if [ -d /sys/kernel/config/usb_gadget ]; then
-    find /sys/kernel/config/usb_gadget -maxdepth 4 2>/dev/null | while IFS= read -r p; do
+if [ -d "$R/sys/kernel/config/usb_gadget" ]; then
+    find "$R/sys/kernel/config/usb_gadget" -maxdepth 4 2>/dev/null | while IFS= read -r p; do
         if [ -L "$p" ]; then
             ls -ld "$p" 2>/dev/null || true
         elif [ -f "$p" ] && [ -r "$p" ]; then
@@ -151,28 +154,29 @@ fi
 
 section "Process Owning /dev/bus/usb/* (read-only proc scan)"
 usb_fd_found=0
-for fdpath in /proc/[0-9]*/fd/*; do
-    [ -e "$fdpath" ] || continue
+for fdpath in "$R"/proc/[0-9]*/fd/*; do
+    [ -e "$fdpath" ] || [ -L "$fdpath" ] || continue
     line=$(ls -l "$fdpath" 2>/dev/null || true)
     case "$line" in
         */dev/bus/usb/*)
             usb_fd_found=1
-            pid=$(echo "$fdpath" | cut -d/ -f3)
+            rest=${fdpath#"$R/proc/"}
+            pid=${rest%%/*}
             comm=""
             cmdline=""
             uid=""
             exe=""
-            if [ -r "/proc/$pid/comm" ]; then
-                comm=$(read_attr "/proc/$pid/comm")
+            if [ -r "$R/proc/$pid/comm" ]; then
+                comm=$(read_attr "$R/proc/$pid/comm")
             fi
-            if [ -r "/proc/$pid/cmdline" ]; then
-                cmdline=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)
+            if [ -r "$R/proc/$pid/cmdline" ]; then
+                cmdline=$(tr '\0' ' ' < "$R/proc/$pid/cmdline" 2>/dev/null || true)
             fi
-            if [ -r "/proc/$pid/status" ]; then
-                uid=$(grep '^Uid:' "/proc/$pid/status" 2>/dev/null | head -n 1 || true)
+            if [ -r "$R/proc/$pid/status" ]; then
+                uid=$(grep '^Uid:' "$R/proc/$pid/status" 2>/dev/null | head -n 1 || true)
             fi
-            if [ -L "/proc/$pid/exe" ]; then
-                exe=$(ls -ld "/proc/$pid/exe" 2>/dev/null || true)
+            if [ -L "$R/proc/$pid/exe" ]; then
+                exe=$(ls -ld "$R/proc/$pid/exe" 2>/dev/null || true)
             fi
             echo "$line"
             echo "  pid=$pid comm=${comm:-unknown} $uid cmdline=$cmdline"
@@ -187,7 +191,7 @@ if [ "$usb_fd_found" -eq 0 ]; then
 fi
 
 section "MediaPlayer / CARPLAY Process & Binary Status (read-only)"
-for p in /opt/app/usr/MediaPlayer/bin/CARPLAY /opt/app/usr/MediaPlayer/bin/MediaPlayer /usr/local/lib/libauxin-apple.so.0 /lib/libusb-1.0.so.0; do
+for p in "$R/opt/app/usr/MediaPlayer/bin/CARPLAY" "$R/opt/app/usr/MediaPlayer/bin/MediaPlayer" "$R/usr/local/lib/libauxin-apple.so.0" "$R/lib/libusb-1.0.so.0"; do
     if [ -e "$p" ] || [ -L "$p" ]; then
         ls -ld "$p" 2>/dev/null || true
     else
@@ -196,7 +200,7 @@ for p in /opt/app/usr/MediaPlayer/bin/CARPLAY /opt/app/usr/MediaPlayer/bin/Media
 done
 echo "--- matching processes (/proc scan) ---"
 mp_found=0
-for pdir in /proc/[0-9]*; do
+for pdir in "$R"/proc/[0-9]*; do
     [ -d "$pdir" ] || continue
     pid=${pdir##*/}
     comm=""
@@ -217,26 +221,27 @@ if [ "$mp_found" -eq 0 ]; then
 fi
 
 section "Process Owning /dev/ffs-carlife (read-only proc scan)"
-ls -la /dev/ffs-carlife 2>/dev/null || echo "/dev/ffs-carlife: not present"
-for fdpath in /proc/[0-9]*/fd/*; do
-    [ -e "$fdpath" ] || continue
+ls -la "$R/dev/ffs-carlife" 2>/dev/null || echo "/dev/ffs-carlife: not present"
+for fdpath in "$R"/proc/[0-9]*/fd/*; do
+    [ -e "$fdpath" ] || [ -L "$fdpath" ] || continue
     line=$(ls -l "$fdpath" 2>/dev/null || true)
     case "$line" in
         *ffs-carlife*|*carlife*)
             echo "$line"
-            pid=$(echo "$fdpath" | cut -d/ -f3)
-            if [ -r "/proc/$pid/comm" ]; then
-                echo "  pid=$pid comm=$(read_attr "/proc/$pid/comm")"
+            rest=${fdpath#"$R/proc/"}
+            pid=${rest%%/*}
+            if [ -r "$R/proc/$pid/comm" ]; then
+                echo "  pid=$pid comm=$(read_attr "$R/proc/$pid/comm")"
             fi
-            if [ -r "/proc/$pid/cmdline" ]; then
-                echo "  pid=$pid cmdline=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)"
+            if [ -r "$R/proc/$pid/cmdline" ]; then
+                echo "  pid=$pid cmdline=$(tr '\0' ' ' < "$R/proc/$pid/cmdline" 2>/dev/null || true)"
             fi
             ;;
     esac
 done
 
 section "Dual-Role / Host vs Peripheral Hints"
-for base in /sys/devices/platform /sys/bus/platform/devices /sys/class/extcon /sys/class/usb_role; do
+for base in "$R/sys/devices/platform" "$R/sys/bus/platform/devices" "$R/sys/class/extcon" "$R/sys/class/usb_role"; do
     [ -d "$base" ] || continue
     for p in "$base"/*usb* "$base"/*dwc* "$base"/*otg* "$base"/*4889* "$base"/*488d* "$base"/*extcon*; do
         [ -e "$p" ] || continue
@@ -249,11 +254,11 @@ for base in /sys/devices/platform /sys/bus/platform/devices /sys/class/extcon /s
         done
     done
 done
-if [ -d /sys/kernel/debug/usb ]; then
+if [ -d "$R/sys/kernel/debug/usb" ]; then
     echo "--- /sys/kernel/debug/usb ---"
-    ls -la /sys/kernel/debug/usb 2>/dev/null || true
+    ls -la "$R/sys/kernel/debug/usb" 2>/dev/null || true
 fi
-for dbg in /sys/kernel/debug/*4889* /sys/kernel/debug/dwc3*; do
+for dbg in "$R"/sys/kernel/debug/*4889* "$R"/sys/kernel/debug/dwc3*; do
     [ -e "$dbg" ] || continue
     echo "--- $dbg ---"
     ls -la "$dbg" 2>/dev/null || true
