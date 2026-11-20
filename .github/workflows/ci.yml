@@ -83,7 +83,8 @@ jobs:
           docker version
           ls -l /proc/sys/fs/binfmt_misc/ | grep -i arm || true
           docker pull --platform linux/arm/v7 "$ARMHF_IMAGE"
-          docker image inspect --format 'id={{.Id}} digests={{.RepoDigests}} os={{.Os}} arch={{.Architecture}} created={{.Created}}' "$ARMHF_IMAGE"
+          # Diagnostic only: field names differ between Docker versions/image stores.
+          docker image inspect "$ARMHF_IMAGE" | head -n 60 || true
 
       - name: Build and run all tests with g++-4.7 (armhf, native in emulated container)
         run: |
