@@ -1,9 +1,11 @@
-// Derived from EntryNav2-Android-Auto 0.12.0 platform/wifi_link.hpp, PolyForm Noncommercial License 1.0.0
+// Derived from EntryNav2-Android-Auto 0.12.0 & 0.13.0-rc.6 platform/wifi_link.hpp,
+// PolyForm Noncommercial License 1.0.0
 //
-// Read-only kernel Wi-Fi link & TCP diagnostics:
-//   * nl80211 generic netlink: connected station stats (signal, bitrates, frame counters) and
+// Read-only kernel Wi-Fi link, BMW Apps ALPS BT slot 0, & TCP diagnostics:
+//   * nl80211 generic netlink: connected station stats (signal, rx bitrate, frame counters) and
 //     AP operating frequency (`NL80211_CMD_GET_STATION`, `NL80211_CMD_GET_INTERFACE`).
 //   * TCP_INFO on an active TCP socket: smoothed RTT and total retransmits.
+//   * Optional read-only BMW Apps (slot 0) Bluetooth probe sharing the WL18xx coex chip.
 // No addresses/credentials are written to logs.
 
 #ifndef CARPLAY_PLATFORM_WIFI_LINK_HPP
@@ -20,7 +22,23 @@
 namespace carplay {
 namespace platform {
 
+class SppSnapshotReader;
+
 static const int64_t kNoFigure = -0x7fffffffffffffffLL - 1;  // figure not reported by driver
+
+/// Read-only status of the ALPS BMW Apps Bluetooth link (slot 0, My BMW / AAIdrive) that
+/// shares the WL18xx chip with Wi-Fi (upstream #71, #111).
+struct AppsSlot {
+    bool read;
+    bool connected;
+    uint32_t state;
+    uint8_t transport;
+
+    AppsSlot() : read(false), connected(false), state(0U), transport(0U) {}
+};
+
+/// Queries slot 0 (`kAlpsBmwAppsSlot`) on an already-open `SppSnapshotReader` (read-only).
+bool readBmwAppsSlot(SppSnapshotReader& reader, AppsSlot& out);
 
 /// One station entry on the access point as reported by nl80211.
 struct WifiStation {
@@ -69,6 +87,7 @@ struct WifiSample {
     WifiStation station;
     bool has_tcp;
     TcpLink tcp;
+    AppsSlot apps;
 
     WifiSample();
 };
@@ -80,10 +99,13 @@ std::string describeWifiLink(const WifiSample& now, const WifiSample* before);
 /// until the session stops (or `kStartGraceMs` elapses without an active session).
 class WifiLinkLog {
 public:
+    typedef bool (*AppsProbe)(void* user, AppsSlot& out);
+
     WifiLinkLog();
     ~WifiLinkLog();
 
     void enable(const char* interface_name);
+    void setAppsProbe(AppsProbe probe, void* user);
     void connected(int fd);
     void turn(uint32_t now_ms, bool session_active);
 
@@ -98,6 +120,8 @@ private:
     std::string interface_;
     int fd_;
     bool first_;
+    AppsProbe apps_probe_;
+    void* apps_user_;
     bool seen_active_;
     bool has_before_;
     bool radio_gone_;

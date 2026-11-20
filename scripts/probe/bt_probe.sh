@@ -96,6 +96,18 @@ section "ALPS Evolution library, config & /proc/*/maps (read-only)"
 ls -la /usr/local/lib/alps /usr/local/lib/alps/evolution \
     /opt/app/usr/BTMedia/evolution/stack/lib/libevo_btappl.so \
     /opt/app/usr/BTMedia/evolution/stack/etc/evo_config.xml 2>/dev/null || printf '(ALPS paths not found)\n'
+if [ -r /opt/app/usr/BTMedia/evolution/stack/lib/libevo_btappl.so ]; then
+    printf 'libevo_btappl.so .dynsym sizes (expected 15032/480/36; F20 2017 variant 15024/480/36):\n'
+    if command -v readelf >/dev/null 2>&1; then
+        readelf -Ws /opt/app/usr/BTMedia/evolution/stack/lib/libevo_btappl.so 2>/dev/null | \
+            grep -E ' (app|spp_info|spp_connected)$' || true
+    elif command -v nm >/dev/null 2>&1; then
+        nm -D -S /opt/app/usr/BTMedia/evolution/stack/lib/libevo_btappl.so 2>/dev/null | \
+            grep -E ' (app|spp_info|spp_connected)$' || true
+    else
+        printf '  (readelf/nm not installed; inspect ELF on host)\n'
+    fi
+fi
 if [ -r /opt/app/usr/BTMedia/evolution/stack/etc/evo_config.xml ]; then
     grep -iE 'spp|uuid|6203|instance|carplay' /opt/app/usr/BTMedia/evolution/stack/etc/evo_config.xml 2>/dev/null | head -n 40 || true
 fi
@@ -128,5 +140,16 @@ else
     printf 'dbus-send: not installed\n'
 fi
 
-section "Native CarPlay / iAP binaries (stat only)"
-ls -la /opt/app/usr/MediaPlayer/bin/CARPLAY /usr/local/lib/libpiapom.so* 2>/dev/null || printf '(not found at known paths)\n'
+section "Native CarPlay / iAP binaries & Wi-Fi AP paths (stat only)"
+ls -la /opt/app/usr/MediaPlayer/bin/CARPLAY /usr/local/lib/libpiapom.so* \
+    /usr/local/lib/libNmeCarPlay.so* /usr/lib/libdns_sd.so.0* \
+    /tmp/wland /var/run/hostapd /var/run/vmostd* 2>/dev/null || printf '(not found at known paths)\n'
+if command -v iw >/dev/null 2>&1; then
+    iw dev 2>/dev/null || true
+    for iface in wl0 wlan0; do
+        if [ -e "/sys/class/net/$iface" ]; then
+            printf '[iw %s station dump]\n' "$iface"
+            iw dev "$iface" station dump 2>/dev/null || true
+        fi
+    done
+fi

@@ -126,12 +126,19 @@ SocketHandle socketOpen(Address::Family family, SocketType type);
 void socketClose(SocketHandle& handle);
 bool socketSetNonBlocking(SocketHandle handle);
 
+static const int kWifiVideoTos = 0x80;  // Wi-Fi WMM AC_VI (IP_TOS/IPV6_TCLASS 0x80)
+
 bool setReuseAddress(SocketHandle handle);
 bool setV6Only(SocketHandle handle, bool v6only);
 bool setNoDelay(SocketHandle handle, bool on);
 bool setKeepAlive(SocketHandle handle, bool on);
 /// SO_LINGER {on, 0}: close() sends RST and drops unsent data.
 bool setLingerZero(SocketHandle handle);
+/// Sets Wi-Fi video access-category QoS (IP_TOS / IPV6_TCLASS = 0x80, WMM AC_VI) as BMW's
+/// native CarPlay SocketSetQoS does on wireless sockets. Do not use on wired USB sockets.
+bool setWifiVideoTos(SocketHandle handle);
+/// Reads IP_TOS (IPv4) or IPV6_TCLASS (IPv6) from the socket for diagnostics / tests.
+bool getSocketTrafficClass(SocketHandle handle, int& tos_out);
 /// Requests SO_RCVBUF / SO_SNDBUF and reports what the kernel actually granted (Linux reports the
 /// doubled bookkeeping value, capped by net.core.rmem_max / wmem_max).
 bool setReceiveBuffer(SocketHandle handle, size_t requested, size_t& granted_out);

@@ -59,7 +59,7 @@ make arm-core
 4. **Phase 4:** Transport bring-up — **Wired** (`iAP2` over USB bulk/NCM + link-local IPv6) and **Wireless** (`Bluetooth` RFCOMM iAP2 + Wi-Fi credential exchange `0x5701`/`0x5703` + Bonjour/mDNS `_airplay._tcp`).
 5. **Phase 5:** Authentication provider abstraction (`MFi` coprocessor / `BAA` local-or-proxy sign interface) and live in-vehicle bench testing.
 
-## Third-Party Attributions
+## Third-Party Attributions & Vehicle Facts
 
 - **Monocypher 4.0.3** (`third_party/monocypher/`): Copyright (c) 2017–2020 Loup Vaillant, dual-licensed under **BSD-2-Clause OR CC0-1.0**. See [third_party/monocypher/LICENCE.md](third_party/monocypher/LICENCE.md).
-- Reference architectures & protocol documentation studied from [DiPlay](https://github.com/shihabal3amri/DiPlay) and [EntryNav2-Android-Auto](https://github.com/Jiraiya43/EntryNav2-Android-Auto).
+- Reference architectures & protocol documentation studied from [DiPlay](https://github.com/shihabal3amri/DiPlay) and [EntryNav2-Android-Auto](https://github.com/Jiraiya43/EntryNav2-Android-Auto) — see [docs/THIRD_PARTY.md](docs/THIRD_PARTY.md) and the audited head-unit ledger in [docs/VEHICLE_FACTS.md](docs/VEHICLE_FACTS.md).

@@ -35,6 +35,7 @@ public:
     /// Requests SO_RCVBUF; granted_out is what the kernel reports back (Linux: doubled value,
     /// capped by net.core.rmem_max).
     bool setReceiveBuffer(size_t requested, size_t& granted_out);
+    bool setWifiVideoTos();
 
     bool isOpen() const { return handle_ != kInvalidSocket; }
     SocketHandle handle() const { return handle_; }

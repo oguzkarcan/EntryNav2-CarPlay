@@ -121,7 +121,7 @@ Thanks to the dlopen policy, the sysroot is **not needed to build**. It is only 
 
 ## 7. Verifying runtime `dlopen()` / `dlsym()` against a sysroot
 
-`scripts/ci/check_sysroot_symbols.sh` verifies that every runtime-resolved soname and symbol in C++ sources matches `scripts/ci/sysroot_symbols.txt`, and (when `SYSROOT` exists) confirms each soname resolves inside the sysroot and exports the expected symbols. See [docs/SYSROOT_CHECK.md](SYSROOT_CHECK.md) for the manifest format and current findings.
+`scripts/ci/check_sysroot_symbols.sh` verifies that every runtime-resolved soname and symbol in C++ sources matches `scripts/ci/sysroot_symbols.txt`, and (when `SYSROOT` exists) confirms each soname resolves inside the sysroot and exports the expected symbols. See [docs/SYSROOT_CHECK.md](SYSROOT_CHECK.md) for the manifest format and current findings, and [docs/VEHICLE_FACTS.md](VEHICLE_FACTS.md) for the full audit ledger of head-unit constants, library variants, and live-car checks.
 
 ```sh
 sh scripts/ci/check_sysroot_symbols.sh --sync-only             # source <-> manifest sync only

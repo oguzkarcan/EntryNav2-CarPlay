@@ -22,6 +22,7 @@
 #include "carplay/platform/reactor.hpp"
 #include "carplay/platform/spp_snapshot.hpp"
 #include "carplay/platform/thread.hpp"
+#include "carplay/platform/wifi_link.hpp"
 #include "carplay/sdp_record.hpp"
 
 namespace {
@@ -1893,6 +1894,164 @@ TEST_CASE(probeBtTransportCapabilityWithSyntheticProc) {
     ::rmdir(proc_dir.c_str());
     ::rmdir(tmp_dir);
 #endif
+}
+
+TEST_CASE(alpsCompatProbeAndUnknownVariant15024) {
+#ifdef _WIN32
+    std::printf("    [SKIP] ALPS compat /proc probe test skipped on Windows\n");
+#else
+    // 1. Unknown library build (F20 2017 variant 15024/480/36 reported in upstream #106) is
+    //    rejected safely before reading memory offsets, and falls back cleanly without blocking
+    //    USB mode.
+    std::vector<SynthSymSpec> syms15024;
+    SynthSymSpec a;
+    a.name = "app";
+    a.value = 0x20000U;
+    a.size = 15024U;
+    a.shndx = 1U;
+    a.got_offset = 0x1000U;
+    syms15024.push_back(a);
+    SynthSymSpec i;
+    i.name = "spp_info";
+    i.value = 0x24000U;
+    i.size = kAlpsSppInfoSymbolSize;
+    i.shndx = 1U;
+    i.got_offset = 0x1004U;
+    syms15024.push_back(i);
+    SynthSymSpec c;
+    c.name = "spp_connected";
+    c.value = 0x25000U;
+    c.size = kAlpsSppConnectedSymbolSize;
+    c.shndx = 1U;
+    c.got_offset = 0x1008U;
+    syms15024.push_back(c);
+    const std::vector<uint8_t> elf_15024 = buildSyntheticArmElf(syms15024);
+
+    char tmp_template[] = "/tmp/carplay_alps_15024_XXXXXX";
+    char* tmp_dir = ::mkdtemp(tmp_template);
+    REQUIRE(tmp_dir != NULL);
+    const std::string proc_dir = std::string(tmp_dir) + "/proc";
+    const std::string pid_dir = proc_dir + "/888";
+    const std::string root_dir = pid_dir + "/root";
+    const std::string lib_dir = root_dir + "/opt";
+    REQUIRE(::mkdir(proc_dir.c_str(), 0700) == 0);
+    REQUIRE(::mkdir(pid_dir.c_str(), 0700) == 0);
+    REQUIRE(::mkdir(root_dir.c_str(), 0700) == 0);
+    REQUIRE(::mkdir(lib_dir.c_str(), 0700) == 0);
+    const std::string elf_path = lib_dir + "/libevo_btappl.so";
+    {
+        const int fd = ::open(elf_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        REQUIRE(fd >= 0);
+        REQUIRE(::write(fd, &elf_15024[0], elf_15024.size()) ==
+                static_cast<ssize_t>(elf_15024.size()));
+        ::close(fd);
+    }
+    const std::string maps_path = pid_dir + "/maps";
+    {
+        const std::string map_line =
+            "b6000000-b6040000 r-xp 00000000 b3:02 123 /opt/libevo_btappl.so\n";
+        const int fd = ::open(maps_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        REQUIRE(fd >= 0);
+        REQUIRE(::write(fd, map_line.data(), map_line.size()) ==
+                static_cast<ssize_t>(map_line.size()));
+        ::close(fd);
+    }
+
+    BtTransportProbePaths paths;
+    paths.proc_root = proc_dir;
+    paths.probe_alps_dbus = false;
+    paths.rfcomm_paths.sys_class_bluetooth = std::string(tmp_dir) + "/missing_sys";
+    paths.rfcomm_paths.sdpd_socket = std::string(tmp_dir) + "/missing_sdp";
+    paths.rfcomm_paths.bluetoothd_socket = std::string(tmp_dir) + "/missing_btd";
+    paths.rfcomm_paths.dbus_socket = std::string(tmp_dir) + "/missing_dbus";
+    paths.rfcomm_paths.probe_af_bluetooth = false;
+
+    const BtTransportCapability cap_unknown =
+        carplay::platform::probeBtTransportCapability(paths);
+    CHECK(!cap_unknown.alps_library_present);
+    CHECK(cap_unknown.alps_detail.find("15024/480/36") != std::string::npos);
+    CHECK_EQ(kBtBackendNone, carplay::platform::selectBtBackend(cap_unknown));
+
+    const carplay::platform::AlpsCompatReport rep_wireless =
+        carplay::platform::probeAlpsSppCompat(cap_unknown, NULL, false);
+    CHECK(!rep_wireless.wireless_ready);
+    CHECK_EQ(carplay::platform::kCompatFail, rep_wireless.alps.level);
+    CHECK(rep_wireless.alps.detail.find("15024/480/36") != std::string::npos);
+    CHECK(rep_wireless.alps.detail.find("wireless only") != std::string::npos);
+    CHECK_EQ(carplay::platform::kCompatInfo, rep_wireless.uuid.level);
+    CHECK_EQ(carplay::platform::kCompatFail, rep_wireless.spp.level);
+
+    const carplay::platform::AlpsCompatReport rep_usb =
+        carplay::platform::probeAlpsSppCompat(cap_unknown, NULL, true);
+    CHECK(!rep_usb.wireless_ready);
+    CHECK(rep_usb.usb_mode);
+    CHECK_EQ(carplay::platform::kCompatInfo, rep_usb.alps.level);
+    CHECK_EQ(carplay::platform::kCompatInfo, rep_usb.uuid.level);
+    CHECK_EQ(carplay::platform::kCompatInfo, rep_usb.spp.level);
+    CHECK(carplay::platform::formatAlpsCompatReport(rep_usb).find("[alps:info ") !=
+          std::string::npos);
+
+    ::unlink(maps_path.c_str());
+    ::unlink(elf_path.c_str());
+    ::rmdir(lib_dir.c_str());
+    ::rmdir(root_dir.c_str());
+    ::rmdir(pid_dir.c_str());
+    ::rmdir(proc_dir.c_str());
+    ::rmdir(tmp_dir);
+#endif
+
+    // 2. Compatible ALPS library + snapshot + readBmwAppsSlot (slot 0 idle vs connected).
+    FakeSppMemoryBackend mem;
+    for (unsigned s = 0U; s < kAlpsMaxInstances; ++s) {
+        mem.setSlotDisconnectedGeneric(s);
+    }
+    mem.setSlotUniform(kAlpsNativeCarPlaySlot,
+                       1U,
+                       0U,
+                       false,
+                       carplay::platform::carPlayIap2UuidPair());
+
+    BtTransportCapability cap_ok;
+    cap_ok.alps_library_present = true;
+    cap_ok.alps_dbus_ready = true;
+    cap_ok.alps_service_owned = true;
+    cap_ok.alps_detail = "found";
+
+    const carplay::platform::AlpsCompatReport rep_ok =
+        carplay::platform::probeAlpsSppCompat(cap_ok, &mem, false);
+    CHECK(rep_ok.wireless_ready);
+    CHECK_EQ(carplay::platform::kCompatPass, rep_ok.alps.level);
+    CHECK_EQ(carplay::platform::kCompatPass, rep_ok.uuid.level);
+    CHECK_EQ(carplay::platform::kCompatPass, rep_ok.spp.level);
+
+    SppSnapshotReader apps_reader(&mem);
+    REQUIRE(apps_reader.open());
+    carplay::platform::AppsSlot apps;
+    REQUIRE(carplay::platform::readBmwAppsSlot(apps_reader, apps));
+    CHECK(apps.read);
+    CHECK(!apps.connected);
+    CHECK_EQ(1U, apps.state);
+    CHECK_EQ(0U, static_cast<unsigned>(apps.transport));
+
+    // When BMW Apps slot 0 is connected and native slot 1 holds generic UUID, slot 5 is borrowed
+    // and compat report marks alps with kCompatWarn mentioning slot0_apps=connected.
+    mem.setSlotUniform(kAlpsBmwAppsSlot,
+                       2U,
+                       4U,
+                       true,
+                       carplay::platform::genericSppUuidPair());
+    mem.setSlotDisconnectedGeneric(kAlpsNativeCarPlaySlot);
+    REQUIRE(carplay::platform::readBmwAppsSlot(apps_reader, apps));
+    CHECK(apps.read);
+    CHECK(apps.connected);
+    CHECK_EQ(2U, apps.state);
+    CHECK_EQ(4U, static_cast<unsigned>(apps.transport));
+
+    const carplay::platform::AlpsCompatReport rep_apps =
+        carplay::platform::probeAlpsSppCompat(cap_ok, &mem, false);
+    CHECK(rep_apps.wireless_ready);
+    CHECK_EQ(carplay::platform::kCompatWarn, rep_apps.alps.level);
+    CHECK(rep_apps.alps.detail.find("slot0_apps=connected") != std::string::npos);
 }
 
 int main() {

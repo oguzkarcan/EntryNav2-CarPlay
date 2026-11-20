@@ -63,5 +63,9 @@ bool UdpSocket::setReceiveBuffer(size_t requested, size_t& granted_out) {
     return handle_ != kInvalidSocket && platform::setReceiveBuffer(handle_, requested, granted_out);
 }
 
+bool UdpSocket::setWifiVideoTos() {
+    return handle_ != kInvalidSocket && platform::setWifiVideoTos(handle_);
+}
+
 }  // namespace platform
 }  // namespace carplay

@@ -1,6 +1,8 @@
 #ifndef CARPLAY_PLATFORM_EVO_TOUCH_FRAME_HPP
 #define CARPLAY_PLATFORM_EVO_TOUCH_FRAME_HPP
 
+// Derived from EntryNav2-Android-Auto 0.12.0 & 0.13.0-rc.6 platform/evo_touch_frame.hpp,
+// PolyForm Noncommercial License 1.0.0.
 // BMW NBT Evo / EntryNav2 touchscreen PDU reassembler and stream parser (UDP port 30567).
 //
 // Wire layout (observed on vehicle, 160.48.199.115:30501 -> 30567):
@@ -116,7 +118,9 @@ inline int parseTouchStream(const TouchMsg& m, RawTouchContact* out, int max, in
         contact.x = (static_cast<int>(at[0]) << 8) | static_cast<int>(at[1]);
         contact.y = (static_cast<int>(at[2]) << 8) | static_cast<int>(at[3]);
         contact.size = static_cast<int>(at[4]);
-        contact.state = (at[5] >> 4) & 0x0F;
+        // CTouchDataClient::decodeTouchScreenPduData splits at[5] into bits 6-7, 4-5 (state),
+        // and 0-3 (id). On G20 bits 6-7 are 0; F45/some panels set them (upstream #60).
+        contact.state = (at[5] >> 4) & 0x03;
         contact.id = at[5] & 0x0F;
         if (contact.state >= 1 && contact.state <= 3 &&
             contact.id >= 0 && contact.id < kTouchMaxContacts) {

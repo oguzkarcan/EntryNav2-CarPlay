@@ -1,4 +1,5 @@
-// Derived from EntryNav2-Android-Auto 0.12.0 platform/wifi_link.cpp, PolyForm Noncommercial License 1.0.0
+// Derived from EntryNav2-Android-Auto 0.12.0 & 0.13.0-rc.6 platform/wifi_link.cpp,
+// PolyForm Noncommercial License 1.0.0
 
 #include "carplay/platform/wifi_link.hpp"
 
@@ -8,6 +9,7 @@
 #include <string.h>
 
 #include "carplay/platform/log.hpp"
+#include "carplay/platform/spp_snapshot.hpp"
 
 #ifndef _WIN32
 #include <fcntl.h>
@@ -111,7 +113,12 @@ int64_t readUnsignedNumber(const Attr& a) {
 }
 
 int64_t readSignalDbm(const Attr& a) {
-    return a.len == 1U ? static_cast<int8_t>(a.data[0]) : kNoFigure;
+    if (a.len != 1U) {
+        return kNoFigure;
+    }
+    // WL18xx leaves NL80211_STA_INFO_SIGNAL as 0 when the last packet was not measured (#80).
+    const int64_t dbm = static_cast<int8_t>(a.data[0]);
+    return dbm < 0 ? dbm : kNoFigure;
 }
 
 int64_t readBitrate(const Attr& nested) {
@@ -138,9 +145,7 @@ void parseStationInfo(const Attr& nested, WifiStation& out) {
             case NL80211_STA_INFO_SIGNAL_AVG:
                 out.signal_avg_dbm = readSignalDbm(a);
                 break;
-            case NL80211_STA_INFO_TX_BITRATE:
-                out.tx_rate = readBitrate(a);
-                break;
+            // NL80211_STA_INFO_TX_BITRATE omitted: wlcore firmware always reports 1.0 Mbit/s (#80).
             case NL80211_STA_INFO_RX_BITRATE:
                 out.rx_rate = readBitrate(a);
                 break;
@@ -505,11 +510,9 @@ std::string describeWifiLink(const WifiSample& now, const WifiSample* before) {
                        static_cast<long long>(phone.signal_avg_dbm));
         } else if (phone.signal_dbm != kNoFigure) {
             appendFmt1(line, "; ", "signal %lld dBm", static_cast<long long>(phone.signal_dbm));
-        }
-        if (phone.tx_rate != kNoFigure) {
-            appendFmt2(line, "; ", "to the phone %lld.%lld Mbit/s",
-                       static_cast<long long>(phone.tx_rate / 10),
-                       static_cast<long long>(phone.tx_rate % 10));
+        } else if (phone.signal_avg_dbm != kNoFigure) {
+            appendFmt1(line, "; ", "average signal %lld dBm",
+                       static_cast<long long>(phone.signal_avg_dbm));
         }
         if (phone.rx_rate != kNoFigure) {
             appendFmt2(line, "; ", "from the phone %lld.%lld Mbit/s",
@@ -554,12 +557,47 @@ std::string describeWifiLink(const WifiSample& now, const WifiSample* before) {
                        static_cast<long long>(now.tcp.resent));
         }
     }
+    if (now.apps.read) {
+        if (now.apps.connected) {
+            if (!line.empty()) {
+                line += "; ";
+            }
+            line += "BMW Apps Bluetooth link connected";
+        } else if (now.apps.state == 1U && now.apps.transport == 0U) {
+            if (!line.empty()) {
+                line += "; ";
+            }
+            line += "BMW Apps Bluetooth link idle";
+        } else {
+            appendFmt2(line, "; ", "BMW Apps Bluetooth slot state %lld, link state %lld",
+                       static_cast<long long>(now.apps.state),
+                       static_cast<long long>(now.apps.transport));
+        }
+    }
     return line;
+}
+
+bool readBmwAppsSlot(SppSnapshotReader& reader, AppsSlot& out) {
+    out = AppsSlot();
+    if (!reader.isOpen()) {
+        return false;
+    }
+    SppSlotSnapshot snap;
+    if (!reader.read(kAlpsBmwAppsSlot, snap)) {
+        return false;
+    }
+    out.read = true;
+    out.connected = snap.connected;
+    out.state = snap.state;
+    out.transport = snap.transport_state;
+    return true;
 }
 
 WifiLinkLog::WifiLinkLog()
     : fd_(-1),
       first_(false),
+      apps_probe_(NULL),
+      apps_user_(NULL),
       seen_active_(false),
       has_before_(false),
       radio_gone_(false),
@@ -575,6 +613,12 @@ WifiLinkLog::~WifiLinkLog() {
 void WifiLinkLog::enable(const char* interface_name) {
     LockGuard lock(lock_);
     interface_ = interface_name != NULL ? interface_name : "";
+}
+
+void WifiLinkLog::setAppsProbe(AppsProbe probe, void* user) {
+    LockGuard lock(lock_);
+    apps_probe_ = probe;
+    apps_user_ = user;
 }
 
 void WifiLinkLog::forget() {
@@ -661,6 +705,12 @@ void WifiLinkLog::sample(uint32_t now_ms) {
         }
     }
 #endif
+    if (apps_probe_ != NULL) {
+        AppsSlot probed;
+        if (apps_probe_(apps_user_, probed)) {
+            now.apps = probed;
+        }
+    }
     const std::string line = describeWifiLink(now, has_before_ ? &before_ : NULL);
     if (!line.empty()) {
         CARPLAY_LOG_INFO(kTag, "%s", line.c_str());

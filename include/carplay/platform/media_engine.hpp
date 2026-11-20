@@ -177,6 +177,10 @@ struct MediaEngineConfig {
     /// When true (default), screen TCP accepts, iAP2 TCP accepts, and audio UDP packets must
     /// originate from the active control connection's host address.
     bool enforce_peer_address;
+    /// When true (wireless Wi-Fi AP sessions), mark screen TCP and audio UDP sockets with
+    /// IP_TOS / IPV6_TCLASS = 0x80 (WMM AC_VI) as BMW's native CarPlay SocketSetQoS does.
+    /// Leave false for wired USB (NCM/TAP) sessions.
+    bool wifi_video_qos;
 
     MediaEngineConfig()
         : microphone_enabled(true),
@@ -186,7 +190,8 @@ struct MediaEngineConfig {
           max_audio_streams(16),
           max_screen_payload_bytes(8U * 1024U * 1024U),
           max_iap_package_bytes(4U * 1024U * 1024U),
-          enforce_peer_address(true) {}
+          enforce_peer_address(true),
+          wifi_video_qos(false) {}
 };
 
 class MediaEngine : public session::MediaHandler {
@@ -260,6 +265,8 @@ public:
     uint64_t audioAuthFailures() const { return audio_auth_failures_; }
     uint64_t audioStrangerDrops() const { return audio_stranger_drops_; }
     uint64_t screenRejectedPeers() const { return screen_rejected_peers_; }
+    SocketHandle firstScreenSocketHandle() const;
+    SocketHandle firstAudioDataSocketHandle() const;
 
 private:
     MediaEngine(const MediaEngine&) = delete;

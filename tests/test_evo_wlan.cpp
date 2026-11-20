@@ -815,12 +815,33 @@ TEST_CASE(wifiLinkParsersFormattingAndLog) {
                    std::vector<uint8_t>(st.mac, st.mac + 6U));
     CHECK_EQ(static_cast<int64_t>(-52), st.signal_dbm);
     CHECK_EQ(static_cast<int64_t>(-55), st.signal_avg_dbm);
-    CHECK_EQ(static_cast<int64_t>(8667), st.tx_rate);
+    // wlcore firmware always reports 1.0 Mbit/s TX bitrate, so tx_rate is omitted (#80).
+    CHECK_EQ(plat::kNoFigure, st.tx_rate);
     CHECK_EQ(static_cast<int64_t>(4333), st.rx_rate);
     CHECK_EQ(static_cast<int64_t>(1000), st.tx_frames);
     CHECK_EQ(static_cast<int64_t>(12), st.tx_retries);
     CHECK_EQ(static_cast<int64_t>(1), st.tx_failed);
     CHECK_EQ(static_cast<int64_t>(42), st.connected_s);
+
+    // WL18xx leaves NL80211_STA_INFO_SIGNAL as 0 dBm when the last frame was unmeasured (#80).
+    {
+        std::vector<uint8_t> unmeasured_sta;
+        appendAttrI8(unmeasured_sta, NL80211_STA_INFO_SIGNAL, 0);
+        appendAttrI8(unmeasured_sta, NL80211_STA_INFO_SIGNAL_AVG, -58);
+        std::vector<uint8_t> unmeasured_attrs;
+        appendAttr(unmeasured_attrs, NL80211_ATTR_MAC, mac, 6U);
+        appendAttr(unmeasured_attrs, NL80211_ATTR_STA_INFO,
+                   &unmeasured_sta[0], unmeasured_sta.size());
+        plat::WifiStation st0;
+        REQUIRE(plat::parseWifiStation(&unmeasured_attrs[0], unmeasured_attrs.size(), st0));
+        CHECK_EQ(plat::kNoFigure, st0.signal_dbm);
+        CHECK_EQ(static_cast<int64_t>(-58), st0.signal_avg_dbm);
+
+        plat::WifiSample avg_only;
+        avg_only.has_station = true;
+        avg_only.station = st0;
+        CHECK_EQ(std::string("average signal -58 dBm"), plat::describeWifiLink(avg_only, NULL));
+    }
 
     // Missing MAC fails; truncated / malformed nla_len fails cleanly.
     CHECK(!plat::parseWifiStation(&sta_info[0], sta_info.size(), st));
@@ -858,11 +879,38 @@ TEST_CASE(wifiLinkParsersFormattingAndLog) {
     s1.tcp.resent = 0U;
 
     const std::string line1 = plat::describeWifiLink(s1, NULL);
-    CHECK_EQ(std::string("5180 MHz; signal -52 dBm (average -55); to the phone 866.7 Mbit/s; "
+    CHECK_EQ(std::string("5180 MHz; signal -52 dBm (average -55); "
                          "from the phone 433.3 Mbit/s; since it joined: 100 frames sent, "
                          "1 retried; on the Wi-Fi for 15 s; TCP round trip 2.3 ms, "
                          "0 segment(s) sent again since it opened"),
              line1);
+
+    // BMW Apps slot 0 status formatting (#111).
+    {
+        plat::WifiSample apps_conn;
+        apps_conn.apps.read = true;
+        apps_conn.apps.connected = true;
+        apps_conn.apps.state = 3U;
+        apps_conn.apps.transport = 4U;
+        CHECK_EQ(std::string("BMW Apps Bluetooth link connected"),
+                 plat::describeWifiLink(apps_conn, NULL));
+
+        plat::WifiSample apps_idle;
+        apps_idle.apps.read = true;
+        apps_idle.apps.connected = false;
+        apps_idle.apps.state = 1U;
+        apps_idle.apps.transport = 0U;
+        CHECK_EQ(std::string("BMW Apps Bluetooth link idle"),
+                 plat::describeWifiLink(apps_idle, NULL));
+
+        plat::WifiSample apps_other;
+        apps_other.apps.read = true;
+        apps_other.apps.connected = false;
+        apps_other.apps.state = 2U;
+        apps_other.apps.transport = 3U;
+        CHECK_EQ(std::string("BMW Apps Bluetooth slot state 2, link state 3"),
+                 plat::describeWifiLink(apps_other, NULL));
+    }
 
     plat::WifiSample s2 = s1;
     s2.at_ms = 11000U;
@@ -925,13 +973,30 @@ TEST_CASE(wifiLinkParsersFormattingAndLog) {
 
     CHECK(plat::readTcpLink(cli_fd, tcp_info));
 
+    struct ProbeState {
+        int calls;
+    } probe_state = {0};
+    struct ProbeFn {
+        static bool run(void* user, plat::AppsSlot& out) {
+            ProbeState* st = static_cast<ProbeState*>(user);
+            st->calls += 1;
+            out.read = true;
+            out.connected = false;
+            out.state = 1U;
+            out.transport = 0U;
+            return true;
+        }
+    };
+
     plat::WifiLinkLog log;
     log.enable("lo");
+    log.setAppsProbe(&ProbeFn::run, &probe_state);
     log.connected(cli_fd);
     ::close(cli_fd);  // WifiLinkLog holds its own F_DUPFD_CLOEXEC fd.
     log.turn(0xfffffff0U, true);
     log.turn(0xfffffff5U, true);
     log.turn(0x00002710U, true);
+    CHECK_EQ(2, probe_state.calls);
     log.turn(0x00002720U, false);  // stops & closes internal dup fd after seen_active_
 
     ::close(acc_fd);

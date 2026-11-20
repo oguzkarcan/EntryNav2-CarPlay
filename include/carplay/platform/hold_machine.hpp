@@ -198,6 +198,8 @@ private:
 // ---- HoldMachine: keeps iDrive on blank state 13 while CarPlay is on screen ----
 static const int kReverseGear = 2;
 static const int kGearUnknown = -1000;
+static const int kPdcUnknown = -1000;
+static const int kParkAssistOn = 1;
 
 class HoldIo {
 public:
@@ -220,6 +222,7 @@ public:
     static const int kDriveModeQuietS = 15;
     static const int kAppKeyS = 2;
     static const int kCallEndS = 10;
+    static const int kCameraWaitS = 15;
     static const long kMenuRefireMs = 300;
 
     explicit HoldMachine(HoldIo& io);
@@ -227,6 +230,10 @@ public:
     // CDS car signals
     void callChanged(bool in_call, long now);
     void gearChanged(int gear);
+    /// Returns true if the caller should forward `gear` immediately; false while waiting
+    /// for the reverse camera to finish leaving the screen (upstream #114).
+    bool gearChanged(int gear, long now);
+    void pdcChanged(int status);
     void driveModeChanged(long now);
 
     // User / menu requests
@@ -246,12 +253,15 @@ public:
     bool blankShown() const { return cp_visible_ && !menu_focused_; }
     bool popupPeek() const { return popup_.active(); }
     bool waiting() const { return waiting_; }
+    bool parkAssistOwns() const { return pdc_ == kParkAssistOn && !park_dismissed_; }
+    bool cameraWins() const { return gear_ == kReverseGear || gear_pending_ || parkAssistOwns(); }
 
 private:
     void fireHold(const char* why, long now);
     void holdViaMenu(const char* why, long now);
     bool appKeyRecent();
     bool keepForAppKey(const char* why, long now);
+    void flushGear(const char* why);
     void updatePopupPeek(bool covered, long now);
     void beginWait(long now);
     void askWithoutHold(long now);
@@ -290,6 +300,11 @@ private:
     bool in_call_;
     long call_end_;
     int gear_;
+    bool reverse_held_;
+    bool gear_pending_;
+    long gear_pending_since_;
+    int pdc_;
+    bool park_dismissed_;
     long drive_mode_at_;
 
     bool service_reachable_;

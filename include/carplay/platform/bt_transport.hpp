@@ -8,6 +8,9 @@
 //   2. Kernel AF_BLUETOOTH / BTPROTO_RFCOMM + BlueZ sdpd (`RfcommBtTransport`,
 //      fallback when ALPS is absent).
 //
+// ALPS/UUID/SPP compatibility report derived from EntryNav2-Android-Auto 0.13.0-rc.6
+// tools/aa_supervisor.cpp, PolyForm Noncommercial License 1.0.0.
+//
 // `BtTransportByteSink` adapts `BtTransport::sendBytes()` directly to
 // `carplay::iap2::ByteSink` (`include/carplay/iap2_link.hpp`).
 
@@ -242,6 +245,48 @@ BtBackendKind selectBtBackend(const BtTransportCapability& cap);
 
 std::string formatBtTransportCapability(const BtTransportCapability& cap);
 void logBtTransportCapability(const BtTransportCapability& cap);
+
+// ------------------------------------------------------------------------------------------------
+// ALPS / UUID / SPP Compatibility Probe (wireless vs USB-only fallback)
+// ------------------------------------------------------------------------------------------------
+
+enum CompatStatusLevel {
+    kCompatPass = 0,
+    kCompatWarn = 1,
+    kCompatInfo = 2,
+    kCompatFail = 3
+};
+
+struct CompatCheckResult {
+    std::string name;
+    CompatStatusLevel level;
+    std::string detail;
+
+    CompatCheckResult() : level(kCompatFail) {}
+    CompatCheckResult(const std::string& n, CompatStatusLevel l, const std::string& d)
+        : name(n), level(l), detail(d) {}
+};
+
+struct AlpsCompatReport {
+    bool wireless_ready;
+    bool usb_mode;
+    CompatCheckResult alps;
+    CompatCheckResult uuid;
+    CompatCheckResult spp;
+
+    AlpsCompatReport() : wireless_ready(false), usb_mode(false) {}
+};
+
+/// Evaluates ALPS library structure, iAP2 SPP baseline/slot policy, and ALPS D-Bus readiness
+/// without mutating head-unit state. Unknown ALPS library builds (e.g. F20 2017 15024/480/36)
+/// fail cleanly instead of reading wrong memory offsets, and are downgraded to `kCompatInfo`
+/// ("wireless only") when `usb_mode` is true so wired USB CarPlay is never blocked.
+AlpsCompatReport probeAlpsSppCompat(const BtTransportCapability& cap,
+                                    SppMemoryBackend* mem_backend = NULL,
+                                    bool usb_mode = false,
+                                    const CarPlaySlotPolicy& policy = CarPlaySlotPolicy());
+std::string formatAlpsCompatReport(const AlpsCompatReport& report);
+const char* compatStatusLevelName(CompatStatusLevel level);
 
 /// Instantiates the selected backend (or returns NULL when `kBtBackendNone`).
 std::unique_ptr<BtTransport> createBtTransport(

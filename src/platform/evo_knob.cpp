@@ -108,6 +108,9 @@ bool decodeVolumeLevel(const VmostMsgView& m, VolumeLevel& out) {
         m.fkt != kVolumeLevelFkt || m.op != kMostOpStatus || m.data == NULL || m.len < 5U) {
         return false;
     }
+    if (m.data[0] > 1U || m.data[1] != 0U) {  // another display's record, or not a whole record
+        return false;
+    }
     const unsigned value = m.data[2];
     const unsigned min = m.data[3];
     const unsigned max = m.data[4];

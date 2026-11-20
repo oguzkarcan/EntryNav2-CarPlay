@@ -514,6 +514,16 @@ TEST_CASE(testPeekTimingAndMediaDoublePress) {
     CHECK(!mdp.feed(1U, 1700U, allow));
     CHECK(!mdp.feed(0U, 1800U, allow));
 
+    // Another physical key (kOtherInput = 8) cancels a single click without resetting baseline
+    // (upstream #65), so the next two quick clicks succeed cleanly.
+    CHECK(!mdp.feed(1U, 3000U, allow));
+    CHECK(!mdp.feed(0U, 3100U, allow));
+    CHECK(!mdp.feed(plat::MediaDoublePress::kOtherInput, 3150U, allow));
+    CHECK(!mdp.feed(1U, 3200U, allow));
+    CHECK(!mdp.feed(0U, 3250U, allow));
+    CHECK(!mdp.feed(1U, 3300U, allow));
+    CHECK(mdp.feed(0U, 3350U, allow));
+
     // writeMediaRecall / takeMediaRecall atomic file lifecycle
     const std::string dir = makeTempDir("cp_recall");
     const std::string rfile = dir + "/recall";
@@ -649,6 +659,55 @@ TEST_CASE(testHoldMachineAndCdsParsers) {
     hold.poll(io.service, 21L);
     REQUIRE(io.sent.size() == 1U);
     CHECK_EQ(std::string("hide"), io.sent[0]);
+
+    // 6. Park assist (PDC) and deferred reverse exit (#93, #114)
+    {
+        MockHoldIo io2;
+        plat::HoldMachine h2(io2);
+        io2.service = plat::ServiceState("connected", 2002, 1);
+        h2.gearChanged(0, 100L);
+        h2.tellService(io2.service);
+        h2.showAndHold("start", 100L);
+        h2.carPlayVisible(true, 101L);
+        h2.carPlayFocus(true);
+        h2.poll(io2.service, 101L);
+        io2.clearOutputs();
+
+        // Engaging reverse keeps hold state; losing focus and shifting back to 0 defers
+        // forwarding gear 0 while cameraWins() remains true until focus returns or timeout.
+        CHECK(h2.gearChanged(plat::kReverseGear, 102L));
+        h2.carPlayFocus(false);
+        CHECK(!h2.gearChanged(0, 103L));
+        CHECK(h2.cameraWins());
+        CHECK(io2.sent.empty());
+        // Regaining focus flushes the pending gear immediately.
+        h2.carPlayFocus(true);
+        REQUIRE(io2.sent.size() == 1U);
+        CHECK_EQ(std::string("gear 0"), io2.sent[0]);
+        CHECK(!h2.cameraWins());
+        io2.clearOutputs();
+
+        // Park assist (sensors.PDCStatus = 1) owns the screen without reverse; choosing CarPlay
+        // via showAndHold dismisses it until PDCStatus changes.
+        h2.pdcChanged(plat::kParkAssistOn);
+        CHECK(h2.parkAssistOwns());
+        REQUIRE(io2.sent.size() == 1U);
+        CHECK_EQ(std::string("pdc 1"), io2.sent[0]);
+        io2.clearOutputs();
+
+        h2.showAndHold("user picked CarPlay", 105L);
+        CHECK(!h2.parkAssistOwns());
+        REQUIRE(io2.sent.size() == 2U);
+        CHECK_EQ(std::string("pdc 0"), io2.sent[0]);
+        CHECK_EQ(std::string("show"), io2.sent[1]);
+        io2.clearOutputs();
+
+        h2.pdcChanged(0);
+        h2.pdcChanged(plat::kParkAssistOn);
+        CHECK(h2.parkAssistOwns());
+        REQUIRE(io2.sent.size() == 1U);
+        CHECK_EQ(std::string("pdc 1"), io2.sent[0]);
+    }
 }
 
 // =================================================================================================

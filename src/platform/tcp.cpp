@@ -279,6 +279,10 @@ bool TcpConnection::setKeepAlive(bool on) {
 
 bool TcpConnection::setLingerZero() { return handle_ != kInvalidSocket && platform::setLingerZero(handle_); }
 
+bool TcpConnection::setWifiVideoTos() {
+    return handle_ != kInvalidSocket && platform::setWifiVideoTos(handle_);
+}
+
 Address TcpConnection::localAddress() const {
     Address a;
     if (handle_ != kInvalidSocket) {
