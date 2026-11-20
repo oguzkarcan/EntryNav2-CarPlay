@@ -27,7 +27,7 @@ Linux 3.12 ARMv7).
        `/sys/class/net/<iface>/address`)
      - `SSID` (`<= 32` UTF-8 bytes)
      - `Passphrase` (WPA2-PSK ASCII passphrase, `8–63` bytes — never logged)
-     - `SecurityType` (`3` = WPA2-PSK)
+     - `SecurityType` (`kIap2WifiSecurityWpa2 = 2` = WPA/WPA2-PSK, verified against `DiPlay-main` `AccessoryWiFiConfigurationInformation`; legacy reference value `3` rejected)
      - `Channel` (e.g. `36` for 5 GHz or `6` for 2.4 GHz)
 
 2. **Wi-Fi Access Point Backend Selection (`WifiAp`):**
@@ -142,10 +142,13 @@ Linux 3.12 ARMv7).
    without `APConnectionTimeout` interfering during CarPlay association.
 2. **Car-native AP channel & band:** Confirm whether `wland` brings `wlan0` up on 5 GHz (`36`+) or
    2.4 GHz and that `STATUS` / `nl80211` reports the real operating frequency before `0x5703` is sent.
-3. **iAP2 `WiFiSecurityType` (`kIap2WifiSecurityWpa2 = 3`) & `_airplay._tcp` TXT keys:** Confirm
+3. **iAP2 `WiFiSecurityType` (`kIap2WifiSecurityWpa2 = 2`) & `_airplay._tcp` TXT keys:** Confirm
    against a real iPhone pairing trace (`0x5702`/`0x5703` + `dns-sd -B _airplay._tcp local.`).
 4. **IPv6 link-local on `wlan0`:** CarPlay uses IPv6 `fe80::/64` over the car AP even when no
    IPv4 address is assigned to `wlan0` (`EvoApInfo::ip` empty is explicitly permitted).
+5. **Wireless Socket QoS (`IP_TOS 0x80`) & WL18xx BT-Coex Monitoring:**
+   - Verified in BMW's built-in `libNmeCarPlay.so` (`SocketSetQoS`, reported in `EntryNav2-Android-Auto` `v0.13.0-rc.6`): wireless session sockets set `IP_TOS` / `IPV6_TCLASS = 0x80` (Wi-Fi WMM `AC_VI` video priority) via `SessionServerConfig::wifi_video_qos` and `MediaEngineConfig::wifi_video_qos` (left `false` on wired USB).
+   - `WifiLinkLog` supports optional read-only ALPS slot 0 (`kAlpsBmwAppsSlot`) probing via `readBmwAppsSlot()` / `WifiLinkLog::setAppsProbe()` because BMW Apps (`My BMW`) Bluetooth shares the WL18xx chip with Wi-Fi (`upstream #71`, `#111`), and omits `NL80211_STA_INFO_TX_BITRATE` (`wlcore` always reports `1.0 Mbit/s`) plus unmeasured `0 dBm` RSSI values (`upstream #80`).
 
 ---
 

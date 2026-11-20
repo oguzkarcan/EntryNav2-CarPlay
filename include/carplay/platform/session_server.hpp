@@ -72,6 +72,10 @@ struct SessionServerConfig {
     /// When true, a new control connection from the SAME host replaces even a verified session.
     /// Connections from a DIFFERENT host while a verified session is active are always rejected.
     bool replace_verified_from_same_host;
+    /// When true (wireless Wi-Fi AP sessions), mark accepted control/event TCP sockets with
+    /// IP_TOS / IPV6_TCLASS = 0x80 (WMM AC_VI) as BMW's native CarPlay SocketSetQoS does.
+    /// Leave false for wired USB (NCM/TAP) sessions.
+    bool wifi_video_qos;
 
     SessionServerConfig()
         : control_port(7000),
@@ -85,7 +89,8 @@ struct SessionServerConfig {
           max_accepts_per_window(16),
           accept_window_ms(1000),
           replace_unverified_session(true),
-          replace_verified_from_same_host(false) {}
+          replace_verified_from_same_host(false),
+          wifi_video_qos(false) {}
 };
 
 class SessionServer : public session::TransportHost {
@@ -174,6 +179,8 @@ public:
     bool controlReadPaused() const { return control_read_paused_; }
     size_t controlQueuedBytes() const { return control_conn_.queuedBytes(); }
     size_t eventQueuedBytes() const { return event_conn_.queuedBytes(); }
+    SocketHandle controlSocketHandle() const { return control_conn_.handle(); }
+    SocketHandle eventSocketHandle() const { return event_conn_.handle(); }
 
 private:
     SessionServer(const SessionServer&) = delete;

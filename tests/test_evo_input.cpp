@@ -3016,6 +3016,34 @@ TEST_CASE(testEvoTouchConcurrentDisplaySizeAndScaleOffsetUnderWorker) {
     touch.stop();
 }
 
+TEST_CASE(touchDecodeMasksStateUpperBitsF45) {
+    // Regression test for upstream #60 / F45 panel: CTouchDataClient sets bits 6-7 of at[5],
+    // while bits 4-5 hold state (1=down, 2=move, 3=up) and bits 0-3 hold contact id.
+    uint8_t frame[plat::touchpdu::kFrameBytes];
+    plat::RawTouchContact c_out[plat::kTouchMaxContacts];
+    plat::TouchReassembler reassembler;
+    int got_counter = 0;
+
+    // Raw state nibbles 0x5 (down | 4), 0x6 (move | 4), 0xB (up | 8) with id 2.
+    const int expected_states[3] = {1, 2, 3};
+    const int raw_states[3] = {0x5, 0x6, 0xB};
+    for (int i = 0; i < 3; ++i) {
+        plat::RawTouchContact c_in;
+        c_in.x = 100 + i * 20;
+        c_in.y = 200 + i * 10;
+        c_in.size = 12;
+        c_in.state = raw_states[i];
+        c_in.id = 2;
+        plat::buildTouchFrame(frame, &c_in, 1, static_cast<uint8_t>(i + 1),
+                              static_cast<uint8_t>(i * 12));
+        plat::TouchMsg m;
+        REQUIRE(reassembler.feed(frame, sizeof(frame), &m, 1) == 1);
+        CHECK_EQ(1, plat::parseTouchStream(m, c_out, plat::kTouchMaxContacts, &got_counter));
+        CHECK_EQ(expected_states[i], c_out[0].state);
+        CHECK_EQ(2, c_out[0].id);
+    }
+}
+
 int main() {
     return test_support::runAll("test_evo_input");
 }

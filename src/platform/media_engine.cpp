@@ -286,6 +286,9 @@ struct MediaEngine::ScreenSlot : public IoHandler, public SlotLifetime {
             unregisterAndClose(engine->reactor_, listener);
             conn.setLingerZero();
             conn.setNoDelay(true);
+            if (engine->config_.wifi_video_qos) {
+                conn.setWifiVideoTos();
+            }
             if (!engine->reactor_.add(conn.handle(), this, kPollIn)) {
                 terminate();
             }
@@ -894,6 +897,14 @@ bool MediaEngine::peerAllowed(const Address& from) const {
     return from.sameHost(control_peer_);
 }
 
+SocketHandle MediaEngine::firstScreenSocketHandle() const {
+    return screens_.empty() ? kInvalidSocket : screens_[0]->conn.handle();
+}
+
+SocketHandle MediaEngine::firstAudioDataSocketHandle() const {
+    return audios_.empty() ? kInvalidSocket : audios_[0]->data_sock.handle();
+}
+
 uint64_t MediaEngine::currentSyncedNtp() const {
     if (synced_ntp_fn_ != NULL) {
         return synced_ntp_fn_(synced_ntp_ctx_);
@@ -1021,6 +1032,9 @@ bool MediaEngine::onAudio(session::Session& session,
     }
     size_t granted = 0;
     slot->data_sock.setReceiveBuffer(UdpSocket::kAudioReceiveBuffer, granted);
+    if (config_.wifi_video_qos) {
+        slot->data_sock.setWifiVideoTos();
+    }
 
     if (!reactor_.add(slot->data_sock.handle(), slot, kPollIn) ||
         !reactor_.add(slot->ctrl_sock.handle(), &slot->ctrl_handler, kPollIn)) {

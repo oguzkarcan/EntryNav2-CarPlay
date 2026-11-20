@@ -1,4 +1,6 @@
 // Portability shim: the only file that includes the OS socket headers. See net_compat.hpp.
+// IP_TOS 0x80 Wi-Fi WMM AC_VI helper derived from EntryNav2-Android-Auto 0.13.0-rc.6
+// core/tcp_server.cpp, PolyForm Noncommercial License 1.0.0.
 
 #ifdef _WIN32
 #ifndef _WIN32_WINNT
@@ -711,6 +713,33 @@ bool setLingerZero(SocketHandle h) {
 #else
     return setsockopt(h, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg)) == 0;
 #endif
+}
+
+bool setWifiVideoTos(SocketHandle h) {
+    if (h == kInvalidSocket) {
+        return false;
+    }
+    const Address::Family af = socketFamily(h);
+    if (af == Address::kIPv6) {
+        const bool ok6 = setIntOption(h, IPPROTO_IPV6, IPV6_TCLASS, kWifiVideoTos);
+        // On Linux dual-stack sockets serving an IPv4-mapped client, also attempt IP_TOS
+        // best-effort; kernels that reject IPPROTO_IP on AF_INET6 still honor IPV6_TCLASS.
+        (void)setIntOption(h, IPPROTO_IP, IP_TOS, kWifiVideoTos);
+        return ok6;
+    }
+    return setIntOption(h, IPPROTO_IP, IP_TOS, kWifiVideoTos);
+}
+
+bool getSocketTrafficClass(SocketHandle h, int& tos_out) {
+    tos_out = 0;
+    if (h == kInvalidSocket) {
+        return false;
+    }
+    const Address::Family af = socketFamily(h);
+    if (af == Address::kIPv6) {
+        return getIntOption(h, IPPROTO_IPV6, IPV6_TCLASS, tos_out);
+    }
+    return getIntOption(h, IPPROTO_IP, IP_TOS, tos_out);
 }
 
 static bool setBufferOption(SocketHandle h, int name, size_t requested, size_t& granted_out) {

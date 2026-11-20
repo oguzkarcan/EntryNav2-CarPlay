@@ -168,6 +168,8 @@ All Phase 1 protocol primitives are implemented in portable C++11 (`-std=gnu++0x
 
 **Verified test status (2026-11-18, after Phase 4 Wave B):** **34 test binaries (409 tests)** passing on host `g++` 16.2.1 and `clang++` 23.1.3 and on Debian 7 wheezy `armhf` `g++-4.7` 4.7.2 under QEMU (`ARM checks: 0`); `check_repo_content.sh` and `check_sysroot_symbols.sh` passed.
 
+**Upstream Vehicle-Fact Audit (2026-11-20, vs `EntryNav2-Android-Auto v0.13.0-rc.6`):** Audited all Phase 3/4 vehicle assumptions and compiled the full verification ledger in [docs/VEHICLE_FACTS.md](docs/VEHICLE_FACTS.md). Ported `IP_TOS 0x80` Wi-Fi WMM `AC_VI` QoS on wireless session sockets (`SessionServerConfig::wifi_video_qos` / `MediaEngineConfig::wifi_video_qos`, wired USB unchanged), defensive ALPS `alps`/`uuid`/`spp` compat probing (`probeAlpsSppCompat()`, safe `15024/480/36` F20 2017 rejection & USB-only downgrade), BMW Apps BT slot 0 monitoring (`readBmwAppsSlot()` / `WifiLinkLog::setAppsProbe()`) + WL18xx `0 dBm` / bogus `tx_rate` fixes, F45 touch state mask `(at[5] >> 4) & 0x03`, `MediaDoublePress::kOtherInput`, AudioMaster `data[0..1]` display filter, and `HoldMachine` `pdcChanged()` + reverse-camera settle delay (`kCameraWaitS = 15`).
+
 Remaining for Phase 4:
 - [ ] **Wired USB Transport:** `usb_device` / `devfs` host -> USB role/configuration switch (`0x12a8`/`0x12a*` iPhone CarPlay USB config) -> `usbmuxd`-less direct USB bulk iAP2 + `CDC NCM` virtual Ethernet + link-local IPv6 (`fe80::/64`) socket binding.
 - [ ] **Wireless Transport:** `Bluetooth` RFCOMM iAP2 channel (SDP CarPlay service discovery) -> `0x5700/0x5701` & `0x5702/0x5703` Wi-Fi AP credential handoff -> hostapd/Wi-Fi AP interface management + lightweight mDNS/DNS-SD responder (`_airplay._tcp.local`).

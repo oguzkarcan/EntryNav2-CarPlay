@@ -123,6 +123,7 @@ public:
     bool setNoDelay(bool on);
     bool setKeepAlive(bool on);
     bool setLingerZero();
+    bool setWifiVideoTos();
 
     bool isOpen() const { return handle_ != kInvalidSocket; }
     SocketHandle handle() const { return handle_; }

@@ -35,6 +35,11 @@ HoldMachine::HoldMachine(HoldIo& io)
       in_call_(false),
       call_end_(0),
       gear_(kGearUnknown),
+      reverse_held_(false),
+      gear_pending_(false),
+      gear_pending_since_(0),
+      pdc_(kPdcUnknown),
+      park_dismissed_(false),
       drive_mode_at_(0),
       service_reachable_(false) {
     memset(prev_state_, 0, sizeof(prev_state_));
@@ -59,6 +64,55 @@ void HoldMachine::callChanged(bool in_call, long now) {
 
 void HoldMachine::gearChanged(int gear) {
     gear_ = gear;
+    if (gear == kReverseGear) {
+        gear_pending_ = false;
+    }
+}
+
+bool HoldMachine::gearChanged(int gear, long now) {
+    const bool was_reverse = (gear_ == kReverseGear);
+    gear_ = gear;
+    if (gear == kReverseGear) {
+        gear_pending_ = false;
+        reverse_held_ = holding_;
+        return true;
+    }
+    if (was_reverse && (reverse_held_ || holding_) && !cp_focused_ && !menu_focused_) {
+        gear_pending_ = true;
+        gear_pending_since_ = now;
+        reverse_held_ = false;
+        say("hold: left reverse (gear %d): keeping picture aside until camera lets go", gear);
+        return false;
+    }
+    reverse_held_ = false;
+    gear_pending_ = false;
+    return true;
+}
+
+void HoldMachine::pdcChanged(int status) {
+    if (status == pdc_) {
+        return;
+    }
+    const bool owned = parkAssistOwns();
+    pdc_ = status;
+    park_dismissed_ = false;
+    if (parkAssistOwns() != owned) {
+        io_.send(owned ? "pdc 0" : "pdc 1");
+        say("park assist %s: CarPlay picture %s",
+            owned ? "ended" : "on",
+            owned ? "back" : "aside");
+    }
+}
+
+void HoldMachine::flushGear(const char* why) {
+    if (!gear_pending_) {
+        return;
+    }
+    gear_pending_ = false;
+    char msg[32];
+    snprintf(msg, sizeof(msg), "gear %d", gear_);
+    io_.send(msg);
+    say("hold: reverse wait ended (%s): forwarded gear %d", why, gear_);
 }
 
 void HoldMachine::driveModeChanged(long now) {
@@ -89,6 +143,12 @@ void HoldMachine::holdViaMenu(const char* why, long now) {
 }
 
 void HoldMachine::showAndHold(const char* why, long now) {
+    flushGear("driver chose CarPlay");
+    if (parkAssistOwns()) {
+        park_dismissed_ = true;
+        io_.send("pdc 0");
+        say("park assist: CarPlay chosen over it, kept until park assist changes");
+    }
     waiting_ = false;
     unheld_ = false;
     if (popup_open_) {
@@ -117,7 +177,7 @@ bool HoldMachine::appKeyRecent() {
 }
 
 bool HoldMachine::keepForAppKey(const char* why, long now) {
-    if (!appKeyRecent() || in_call_ || gear_ == kReverseGear) {
+    if (!appKeyRecent() || in_call_ || cameraWins()) {
         return false;
     }
     const ServiceState d = io_.readService();
@@ -141,6 +201,7 @@ void HoldMachine::carPlayFocus(bool focused) {
         popup_tried_ = false;
         hold_gave_up_ = false;
         under_popup_ = false;
+        flushGear("blank state regained focus");
     }
     say("hold: state %u focus -> %d", rhmi::kCarPlayState, static_cast<int>(focused));
 }
@@ -157,7 +218,7 @@ void HoldMachine::carPlayVisible(bool visible, long now) {
     if (!visible && keepForAppKey("a key kept CarPlay on screen", now)) {
         return;
     }
-    if (visible && !holding_ && !in_call_ && gear_ != kReverseGear) {
+    if (visible && !holding_ && !in_call_ && !cameraWins()) {
         const ServiceState d = io_.readService();
         if (d.pid > 0 && !d.onScreen() && d.is("connected")) {
             say("hold: iDrive went back to the CarPlay screen: asking the service to come to the front");
@@ -170,12 +231,13 @@ void HoldMachine::menuFocus(unsigned state, bool focused, long now, long now_ms)
     menu_focused_ = focused;
     if (focused) {
         cp_focused_ = false;
+        flushGear("our menu has the focus");
     }
     say("menu state %u focus -> %d", state, static_cast<int>(focused));
     if (focused && unheld_ && !waiting_) {
         say("hold: iDrive opened our menu after %d request(s): taking the hold", asks_);
     }
-    if (focused && waiting_ && !in_call_ && gear_ != kReverseGear) {
+    if (focused && waiting_ && !in_call_ && !cameraWins()) {
         say("hold: our menu is open after %ld s and %d request(s): CarPlay comes up",
             now - wait_since_, asks_);
         showAndHold("our menu opened for CarPlay", now);
@@ -200,8 +262,11 @@ void HoldMachine::tellService(const ServiceState& service) {
         io_.send(in_call_ ? "call 1" : "call 0");
         if (gear_ != kGearUnknown) {
             char msg[32];
-            snprintf(msg, sizeof(msg), "gear %d", gear_);
+            snprintf(msg, sizeof(msg), "gear %d", gear_pending_ ? kReverseGear : gear_);
             io_.send(msg);
+        }
+        if (pdc_ != kPdcUnknown) {
+            io_.send(parkAssistOwns() ? "pdc 1" : "pdc 0");
         }
     }
     service_reachable_ = reachable;
@@ -243,7 +308,7 @@ void HoldMachine::bringIdrive(const ServiceState& service, long now) {
         }
         return;
     }
-    if (in_call_ || gear_ == kReverseGear) {
+    if (in_call_ || cameraWins()) {
         return;
     }
     if (menu_focused_ || cp_focused_) {
@@ -289,7 +354,7 @@ void HoldMachine::bringIdrive(const ServiceState& service, long now) {
 }
 
 void HoldMachine::askWithoutHold(long now) {
-    if (in_call_ || gear_ == kReverseGear || (asked_at_ != 0 && now - asked_at_ < 1)) {
+    if (in_call_ || cameraWins() || (asked_at_ != 0 && now - asked_at_ < 1)) {
         return;
     }
     asked_at_ = now;
@@ -303,13 +368,16 @@ void HoldMachine::askWithoutHold(long now) {
 }
 
 void HoldMachine::poll(const ServiceState& service, long now) {
+    if (gear_pending_ && now - gear_pending_since_ >= kCameraWaitS) {
+        flushGear("camera focus wait timed out");
+    }
     const bool overlay = service.onScreen();
     const bool rose = overlay && !prev_overlay_;
     const bool fell = !overlay && prev_overlay_;
     prev_overlay_ = overlay;
     const bool blank = blankShown();
     updatePopupPeek(!rose && !fell && overlay && holding_ && blank &&
-                        !cp_focused_ && !in_call_ && gear_ != kReverseGear && !under_popup_,
+                        !cp_focused_ && !in_call_ && !cameraWins() && !under_popup_,
                     now);
     if (rose) {
         waiting_ = false;
@@ -337,10 +405,10 @@ void HoldMachine::poll(const ServiceState& service, long now) {
             popup_open_ = false;
             io_.ownPopup(false);
         }
-        if (blank && !cp_focused_ && gear_ != kReverseGear) {
+        if (blank && !cp_focused_ && !cameraWins()) {
             io_.triggerEvent(rhmi::kEvOpenMenu);
             say("hold: OPTION: event %u -> CarPlay menu", rhmi::kEvOpenMenu);
-        } else if (blank && !hide_sent_ && gear_ != kReverseGear) {
+        } else if (blank && !hide_sent_ && !cameraWins()) {
             io_.triggerEvent(rhmi::kEvGoHome);
             say("hold: CarPlay stepped aside: event %u -> iDrive main menu", rhmi::kEvGoHome);
         } else {
@@ -383,7 +451,7 @@ void HoldMachine::poll(const ServiceState& service, long now) {
         if (popup_.active() || (drive_mode_at_ != 0 && now - drive_mode_at_ < kDriveModeQuietS)) {
             return;
         }
-        if (gear_ == kReverseGear) {
+        if (cameraWins()) {
             unfocused_polls_ = 0;
             return;
         }
@@ -455,7 +523,7 @@ void HoldMachine::poll(const ServiceState& service, long now) {
         }
         return;
     }
-    if (gear_ == kReverseGear) {
+    if (cameraWins()) {
         return;
     }
     if (keepForAppKey("a key kept CarPlay on screen (poll)", now)) {

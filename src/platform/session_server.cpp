@@ -269,6 +269,9 @@ void SessionServer::onControlAcceptReadable() {
 
         control_conn_.setNoDelay(true);
         control_conn_.setKeepAlive(true);
+        if (server_cfg_.wifi_video_qos) {
+            control_conn_.setWifiVideoTos();
+        }
         control_conn_.setWriteQueueLimit(server_cfg_.control_write_queue_limit);
         control_read_paused_ = false;
 
@@ -509,6 +512,9 @@ void SessionServer::onEventAcceptReadable() {
 
         event_conn_.setLingerZero();
         event_conn_.setNoDelay(true);
+        if (server_cfg_.wifi_video_qos) {
+            event_conn_.setWifiVideoTos();
+        }
         event_conn_.setWriteQueueLimit(server_cfg_.event_write_queue_limit);
 
         std::vector<uint8_t> wire_out;

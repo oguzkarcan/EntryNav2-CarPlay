@@ -7,7 +7,7 @@ This document records the provenance and licensing of every file in `EntryNav2-C
 1. **DiPlay (`GPL-3.0`)**:
    - Copyright (c) DiPlay contributors.
    - Licensed under the GNU General Public License v3.0.
-2. **EntryNav2-Android-Auto 0.12.0 (`PolyForm-Noncommercial-1.0.0`)**:
+2. **EntryNav2-Android-Auto 0.12.0 & 0.13.0-rc.6 (`PolyForm-Noncommercial-1.0.0`)**:
    - Required Notice: `Copyright (c) 2026 Jiraiya43 - EntryNav2 (EntryEvo) Android Auto`
    - Licensed under the PolyForm Noncommercial License 1.0.0.
    - **Important License Incompatibility Note**: `PolyForm Noncommercial License 1.0.0` restricts use to noncommercial purposes and is **not compatible with GPL-3.0** (which forbids additional noncommercial restrictions on redistributed combined works under Section 7 / Section 10). The EntryNav2-Android-Auto-derived platform modules (and dual-derived USB usbfs/bridge modules) were ported here **with the repository owner's explicit authorisation** for personal/noncommercial head-unit research and integration in this repository; downstream redistributors cannot redistribute combined binaries under GPL-3.0 without separate permission from all relevant copyright holders.
@@ -21,11 +21,11 @@ This document records the provenance and licensing of every file in `EntryNav2-C
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
 | DiPlay (derived only) | `GPL-3.0` | 17 | 16 | 6 | 0 | **39** |
 | DiPlay + EntryNav2-Android-Auto 0.12.0 (dual-derived) | `GPL-3.0` + `PolyForm-Noncommercial-1.0.0` | 2 | 2 | 0 | 0 | **4** |
-| EntryNav2-Android-Auto 0.12.0 (derived only) | `PolyForm-Noncommercial-1.0.0` | 6 | 6 | 1 | 0 | **13** |
+| EntryNav2-Android-Auto 0.12.0 / 0.13.0-rc.6 (derived only) | `PolyForm-Noncommercial-1.0.0` | 8 | 8 | 1 | 0 | **17** |
 | Monocypher (vendored) | `BSD-2-Clause OR CC0-1.0` | 2 | 2 | 0 | 1 | **5** |
-| **Total** | | **27** | **26** | **7** | **1** | **61** |
+| **Total** | | **29** | **28** | **7** | **1** | **65** |
 
-*(Note: Total derived files = 56 across `include/`, `src/`, and `tests/`; total third-party/derived files including vendored Monocypher = 61.)*
+*(Note: Total derived files = 60 across `include/`, `src/`, and `tests/`; total third-party/derived files including vendored Monocypher = 65.)*
 
 ---
 
@@ -86,25 +86,29 @@ This document records the provenance and licensing of every file in `EntryNav2-C
 
 ---
 
-## Derived Files: EntryNav2-Android-Auto 0.12.0 (`PolyForm-Noncommercial-1.0.0`)
+## Derived Files: EntryNav2-Android-Auto 0.12.0 & 0.13.0-rc.6 (`PolyForm-Noncommercial-1.0.0`)
 
 Required Notice: `Copyright (c) 2026 Jiraiya43 - EntryNav2 (EntryEvo) Android Auto`
 
-| Repository File | Upstream Source File(s) in `EntryNav2-Android-Auto-0.12.0` | License |
+| Repository File | Upstream Source File(s) in `EntryNav2-Android-Auto` (`0.12.0` / `0.13.0-rc.6`) | License |
 | --- | --- | --- |
 | `include/carplay/platform/alps_spp.hpp` | `platform/alps_spp.hpp`, `platform/alps_spp.cpp`, `platform/spp_advertisement.hpp`, `tools/aa_supervisor.cpp` | `PolyForm-Noncommercial-1.0.0` |
 | `src/platform/alps_spp.cpp` | `platform/alps_spp.cpp`, `platform/spp_advertisement.hpp`, `tools/aa_supervisor.cpp` | `PolyForm-Noncommercial-1.0.0` |
+| `include/carplay/platform/bt_transport.hpp` | `tools/aa_supervisor.cpp` (`0.13.0-rc.6` `alps`/`uuid`/`spp` compat probe additions) | `PolyForm-Noncommercial-1.0.0` |
+| `src/platform/bt_transport.cpp` | `tools/aa_supervisor.cpp` (`0.13.0-rc.6` `alps`/`uuid`/`spp` compat probe additions) | `PolyForm-Noncommercial-1.0.0` |
 | `include/carplay/platform/elf_symbols.hpp` | `platform/evo_elf.hpp` | `PolyForm-Noncommercial-1.0.0` |
 | `src/platform/elf_symbols.cpp` | `platform/evo_elf.hpp` | `PolyForm-Noncommercial-1.0.0` |
 | `include/carplay/platform/evo_ap.hpp` | `platform/evo_ap.hpp`, `platform/evo_ap.cpp`, `platform/evo_ap_config.cpp` | `PolyForm-Noncommercial-1.0.0` |
 | `src/platform/evo_ap.cpp` | `platform/evo_ap.cpp`, `platform/evo_ap_config.cpp` | `PolyForm-Noncommercial-1.0.0` |
+| `include/carplay/platform/evo_touch_frame.hpp` | `platform/evo_touch_frame.hpp` (`0.13.0-rc.6` `#60` state bitmask `(at[5] >> 4) & 0x03`) | `PolyForm-Noncommercial-1.0.0` |
 | `include/carplay/platform/evo_wlan.hpp` | `platform/evo_wlan.hpp` | `PolyForm-Noncommercial-1.0.0` |
 | `src/platform/evo_wlan.cpp` | `platform/evo_wlan.cpp` | `PolyForm-Noncommercial-1.0.0` |
-| `tests/test_evo_wlan.cpp` | `tests/test_wifi_link.cpp`, `platform/evo_wlan` tests | `PolyForm-Noncommercial-1.0.0` |
+| `src/platform/net_compat.cpp` | `core/tcp_server.cpp` (`0.13.0-rc.6` `IP_TOS 0x80` Wi-Fi WMM `AC_VI` helper) | `PolyForm-Noncommercial-1.0.0` |
+| `tests/test_evo_wlan.cpp` | `tests/test_wifi_link.cpp` (`0.12.0` / `0.13.0-rc.6`), `platform/evo_wlan` tests | `PolyForm-Noncommercial-1.0.0` |
 | `include/carplay/platform/spp_snapshot.hpp` | `platform/evo_spp_snapshot.hpp`, `platform/evo_spp_snapshot.cpp`, `platform/spp_baseline.hpp`, `platform/alps_spp_codec.cpp` | `PolyForm-Noncommercial-1.0.0` |
 | `src/platform/spp_snapshot.cpp` | `platform/evo_spp_snapshot.cpp`, `platform/spp_baseline.hpp`, `platform/alps_spp_codec.cpp` | `PolyForm-Noncommercial-1.0.0` |
-| `include/carplay/platform/wifi_link.hpp` | `platform/wifi_link.hpp` | `PolyForm-Noncommercial-1.0.0` |
-| `src/platform/wifi_link.cpp` | `platform/wifi_link.cpp` | `PolyForm-Noncommercial-1.0.0` |
+| `include/carplay/platform/wifi_link.hpp` | `platform/wifi_link.hpp` (`0.12.0` / `0.13.0-rc.6` `AppsSlot` probe) | `PolyForm-Noncommercial-1.0.0` |
+| `src/platform/wifi_link.cpp` | `platform/wifi_link.cpp` (`0.12.0` / `0.13.0-rc.6` WL18xx & `AppsSlot` fixes) | `PolyForm-Noncommercial-1.0.0` |
 
 ---
 

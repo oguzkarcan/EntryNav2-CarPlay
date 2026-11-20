@@ -92,6 +92,9 @@ class MediaDoublePress {
 public:
     static const uint32_t kShortMs = 500U;
     static const uint32_t kPairMs = 500U;
+    /// Sentinel state indicating another physical key was pressed (cancels pairing without
+    /// forgetting `seen_` / `down_`, matching EntryNav2-Android-Auto 0.13.0-rc.6 #65).
+    static const unsigned kOtherInput = 8U;
 
     MediaDoublePress()
         : seen_(false),
@@ -106,9 +109,13 @@ public:
         first_ = false;
     }
 
-    /// Raw button state: 0 released, 1 pressed, 4 capacitive rest.
+    /// Raw button state: 0 released, 1 pressed, 4 capacitive rest, or kOtherInput (8).
     /// Returns true on the release of the second short click within kPairMs.
     bool feed(unsigned state, uint32_t now, bool allowed) {
+        if (state == kOtherInput) {
+            cancel();
+            return false;
+        }
         if (state != 0U && state != 1U && state != 4U) {
             cancel();
             seen_ = false;

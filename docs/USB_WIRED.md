@@ -126,12 +126,16 @@ Inspection of the head unit sysroot (`/home/ozzy/Projects/EntryNav2-CarPlay-Asse
 
 ### Safe Coexistence Policy in `UsbHost` & `UsbCarPlayBridge`
 
-- **Never hijack `"usbfs"` by default:** `UsbHostConfig::detach_usbfs_driver` and `UsbCarPlayBridgeConfig::detach_usbfs_driver` both default to `false`.
+- **Never hijack `"usbfs"` by default:** `UsbHostConfig::detach_usbfs_driver` and `UsbCarPlayBridgeConfig::detach_usbfs_driver` both default to `false` (confirmed in-car policy in `EntryNav2-Android-Auto` `docs/USB.md`: never detach a BMW driver/process).
 - **Pre-claim check (`USBDEVFS_GETDRIVER`):** Before claiming any iAP2 or CDC-NCM interface, `UsbHost::claimInterfaceWithStatus()` queries `USBDEVFS_GETDRIVER`.
   - If the bound driver is `"usbfs"` and `detach_usbfs_driver == false`, `claimInterfaceWithStatus()` refuses immediately with `kUsbClaimBusyUserspace` (`USBDEVFS_DISCONNECT` is **not** issued).
   - If `USBDEVFS_CLAIMINTERFACE` fails with `EBUSY` (race condition or residual binding), it re-queries `USBDEVFS_GETDRIVER` and classifies `kUsbClaimBusyUserspace` vs `kUsbClaimBusyKernel`.
   - If a kernel driver (e.g. `snd-usb-audio`, `usbhid`, `cdc_ncm`) is bound and `detach_kernel_driver` is disabled, it refuses with `kUsbClaimBusyKernel`.
 - **Clear reporting & anti-retry loop:** On `kUsbClaimBusyUserspace` or `kUsbClaimBusyKernel`, `UsbCarPlayBridge` increments `stats_.ownership_conflicts`, emits an explicit `onBridgeError` message naming `"usbfs"` (`MediaPlayer`/`CARPLAY`) or the kernel driver, calls `usb_->ignoreCurrentDevice()` so the device is left untouched until physical unplug or address change (`forgetGoneIgnored()`), and transitions cleanly back to `kBridgeWaiting`.
+- **USB-only isolation & `/var/local/data/CarPlay/usb` contract (upstream `docs/USB.md`, `v0.13.0-rc.5`):**
+  - When USB mode is configured via `/var/local/data/CarPlay/usb` (`contract::kUsb`), Bluetooth (ALPS SPP / RFCOMM) and Wi-Fi (`wland` / `hostapd`) are **never** touched — including on head units with unknown BT library builds such as the 2017 F20 (`15024/480/36` ALPS layout, where USB mode still works while wireless is skipped as wireless-only).
+  - Empty `/var/local/data/CarPlay/usb` accepts any external non-hub, removable USB port; a non-empty file pins one sysfs port name (e.g., `3-1`, validated strictly via `isValidUsbPortName()`); invalid file contents must block USB startup cleanly rather than guessing a port.
+  - Phone USB reset (`USBDEVFS_RESET`) is reserved strictly for re-trying/clearing the phone's own residual accessory state without touching BMW drivers (upstream caps retries at 3 per physical plug).
 - **Explicit override:** Setting `detach_usbfs_driver = true` is reserved exclusively for deployments where the user intentionally stops or overrides native `MediaPlayer`/`CARPLAY`.
 
 ---

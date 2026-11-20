@@ -2274,6 +2274,85 @@ bool testLifetimeEdges() {
     return true;
 }
 
+bool checkSessionQos(bool wifi_qos, int expected_tos) {
+    Rig rig(wifi_qos ? "qos_wifi" : "qos_usb");
+    CHECK_TRUE(rig.ok);
+
+    RecordingSink sink;
+    plat::MediaEngineConfig me_cfg;
+    me_cfg.wifi_video_qos = wifi_qos;
+    plat::MediaEngine media_engine(rig.reactor, sink, me_cfg);
+
+    plat::SessionServerConfig srv_cfg = quietServerConfig();
+    srv_cfg.wifi_video_qos = wifi_qos;
+    plat::SessionServer server(
+        rig.reactor, info::bmwEntryNav2_800x480(false), rig.identity, rig.store,
+        rig.rng, rig.listener, media_engine, NULL, srv_cfg);
+    CHECK_TRUE(server.start(plat::Address::ipv4Loopback(0)));
+    const plat::Address addr = plat::Address::ipv4Loopback(server.controlPort());
+
+    NetPhoneClient phone(rig.reactor, "qos-ltsk", "6D6D6D6D-0000-4000-8000-000000000006", "qos-eph");
+    CHECK_TRUE(pairAndVerify(phone, addr, "qos-srp"));
+
+    int tos = -1;
+    CHECK_TRUE(plat::getSocketTrafficClass(server.controlSocketHandle(), tos));
+    CHECK_TRUE(tos == expected_tos);
+
+    plat::UdpSocket phone_timing_udp;
+    CHECK_TRUE(phone_timing_udp.open(plat::Address::ipv4Loopback(0)));
+    bplist::Value setup_req = bplist::Value::makeDict();
+    setup_req.set("timingPort", bplist::Value::makeInt(phone_timing_udp.port()));
+    setup_req.set("name", bplist::Value::makeString("QoS iPhone"));
+    setup_req.set("model", bplist::Value::makeString("iPhone16,2"));
+    int status = 0;
+    bplist::Value setup_resp;
+    CHECK_TRUE(phone.callPlist("SETUP", "rtsp://127.0.0.1/session", setup_req, status, setup_resp));
+    CHECK_TRUE(status == 200);
+    const int64_t srv_event_port = intAt(setup_resp, "eventPort");
+    CHECK_TRUE(phone.connectEvent(plat::Address::ipv4Loopback(static_cast<uint16_t>(srv_event_port))));
+
+    tos = -1;
+    CHECK_TRUE(plat::getSocketTrafficClass(server.eventSocketHandle(), tos));
+    CHECK_TRUE(tos == expected_tos);
+
+    bplist::Value streams_arr = bplist::Value::makeArray();
+    bplist::Value s_screen = bplist::Value::makeDict();
+    s_screen.set("type", bplist::Value::makeInt(110));
+    s_screen.set("streamConnectionID", bplist::Value::makeInt(5001));
+    streams_arr.asArray().push_back(s_screen);
+    streams_arr.asArray().push_back(audioEntry(100, "speechrecognition", 0x10, 5002));
+    bplist::Value streams_req = bplist::Value::makeDict();
+    streams_req.set("streams", streams_arr);
+    bplist::Value streams_resp;
+    CHECK_TRUE(phone.callPlist("SETUP", "rtsp://127.0.0.1/streams", streams_req, status, streams_resp));
+    CHECK_TRUE(status == 200);
+    const bplist::Value* resp_arr = streams_resp.find("streams");
+    CHECK_TRUE(resp_arr != NULL && resp_arr->isArray() && resp_arr->asArray().size() == 2U);
+    const int64_t screen_port = intAt(resp_arr->asArray()[0], "dataPort");
+
+    plat::TcpConnection screen_conn;
+    CHECK_TRUE(screen_conn.connect(plat::Address::ipv4Loopback(static_cast<uint16_t>(screen_port))));
+    CHECK_TRUE(waitUntilConnected(rig.reactor, screen_conn));
+    for (int i = 0; i < 4; ++i) {
+        rig.reactor.runOnce(5);
+    }
+
+    tos = -1;
+    CHECK_TRUE(plat::getSocketTrafficClass(media_engine.firstScreenSocketHandle(), tos));
+    CHECK_TRUE(tos == expected_tos);
+    tos = -1;
+    CHECK_TRUE(plat::getSocketTrafficClass(media_engine.firstAudioDataSocketHandle(), tos));
+    CHECK_TRUE(tos == expected_tos);
+
+    server.stop();
+    return true;
+}
+
+bool testWifiVideoQosSocketOption() {
+    // Wired USB path leaves traffic class at 0; wireless CarPlay path marks sockets 0x80.
+    return checkSessionQos(false, 0) && checkSessionQos(true, plat::kWifiVideoTos);
+}
+
 void runTest(const char* name, bool (*fn)()) {
     if (fn()) {
         printf("  [PASS] %s\n", name);
@@ -2296,6 +2375,7 @@ int main() {
     runTest("iapTunnelReconnectAndErrors", &testIapTunnelReconnectAndErrors);
     runTest("microphoneStartAndFeedbackWireForm", &testMicrophoneStartAndFeedbackWireForm);
     runTest("lifetimeEdges", &testLifetimeEdges);
+    runTest("wifiVideoQosSocketOption", &testWifiVideoQosSocketOption);
 
     printf("test_network_session: %d/%d passed\n", g_passed, g_passed + g_failed);
     return g_failed == 0 ? 0 : 1;

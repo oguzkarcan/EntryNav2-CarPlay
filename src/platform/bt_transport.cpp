@@ -1,3 +1,6 @@
+// ALPS/UUID/SPP compatibility probe derived from EntryNav2-Android-Auto 0.13.0-rc.6
+// tools/aa_supervisor.cpp, PolyForm Noncommercial License 1.0.0.
+
 #include "carplay/platform/bt_transport.hpp"
 
 #include <limits.h>
@@ -5,6 +8,7 @@
 #include <stdlib.h>
 
 #include <fstream>
+#include <sstream>
 
 #ifndef _WIN32
 #include <dirent.h>
@@ -254,6 +258,108 @@ std::string formatBtTransportCapability(const BtTransportCapability& cap) {
 
 void logBtTransportCapability(const BtTransportCapability& cap) {
     CARPLAY_LOG_INFO("bt", "transport capability: %s", formatBtTransportCapability(cap).c_str());
+}
+
+const char* compatStatusLevelName(CompatStatusLevel level) {
+    switch (level) {
+        case kCompatPass: return "pass";
+        case kCompatWarn: return "warn";
+        case kCompatInfo: return "info";
+        case kCompatFail: return "fail";
+        default: return "unknown";
+    }
+}
+
+AlpsCompatReport probeAlpsSppCompat(const BtTransportCapability& cap,
+                                    SppMemoryBackend* mem_backend,
+                                    bool usb_mode,
+                                    const CarPlaySlotPolicy& policy) {
+    AlpsCompatReport rep;
+    rep.usb_mode = usb_mode;
+    const CompatStatusLevel bt_fail_level = usb_mode ? kCompatInfo : kCompatFail;
+
+    bool snapshot_ok = false;
+    bool slot_usable = false;
+    if (!cap.alps_library_present) {
+        const std::string why =
+            cap.alps_detail.empty() ? std::string("libevo_btappl.so absent") : cap.alps_detail;
+        rep.alps = CompatCheckResult("alps", bt_fail_level, why + " (wireless only)");
+    } else {
+        SppSnapshotReader reader(mem_backend);
+        if (!reader.open()) {
+            const std::string why =
+                reader.error().empty() ? std::string("ALPS snapshot open failed") : reader.error();
+            rep.alps = CompatCheckResult("alps", bt_fail_level, why + " (wireless only)");
+        } else {
+            snapshot_ok = true;
+            const CarPlaySlotSelection sel = selectCarPlaySppSlot(reader, policy);
+            slot_usable = sel.isUsable();
+            std::ostringstream oss;
+            oss << "pid=" << reader.pid() << " slot=" << static_cast<unsigned>(sel.slot)
+                << " (" << carPlaySlotDecisionName(sel.decision) << ")";
+            if (!sel.reason.empty()) {
+                oss << ": " << sel.reason;
+            }
+            if (slot_usable) {
+                SppSlotSnapshot slot0;
+                CompatStatusLevel lvl = kCompatPass;
+                if (reader.read(kAlpsBmwAppsSlot, slot0, true) && !slot0.isIdle()) {
+                    oss << "; slot0_apps=" << (slot0.connected ? "connected" : "busy");
+                    if (sel.decision == kSlotBorrow5) {
+                        lvl = kCompatWarn;
+                    }
+                }
+                rep.alps = CompatCheckResult("alps", lvl, oss.str());
+            } else {
+                rep.alps = CompatCheckResult("alps", bt_fail_level, oss.str() + " (wireless only)");
+            }
+        }
+    }
+
+    if (!isSupportedSppBaseline(policy.target_uuid_pair)) {
+        rep.uuid = CompatCheckResult(
+            "uuid",
+            bt_fail_level,
+            "target UUID payload is not a verified iAP2/generic baseline (wireless only)");
+    } else if (!snapshot_ok) {
+        rep.uuid = CompatCheckResult(
+            "uuid",
+            kCompatInfo,
+            "skipped (ALPS snapshot unavailable; target iAP2 UUID valid, wireless only)");
+    } else if (slot_usable) {
+        rep.uuid = CompatCheckResult(
+            "uuid", kCompatPass, "iAP2/CarPlay SPP UUID baseline and slot policy compatible");
+    } else {
+        rep.uuid = CompatCheckResult(
+            "uuid", bt_fail_level, "no usable SPP slot for target iAP2 UUID (wireless only)");
+    }
+
+    if (cap.alps_dbus_ready) {
+        rep.spp = CompatCheckResult(
+            "spp", kCompatPass, "org.alps.evolution D-Bus + libdbus-1 ready");
+    } else {
+        const std::string why =
+            cap.alps_detail.empty() ? std::string("ALPS D-Bus unavailable") : cap.alps_detail;
+        rep.spp = CompatCheckResult("spp", bt_fail_level, why + " (wireless only)");
+    }
+
+    rep.wireless_ready = (rep.alps.level == kCompatPass || rep.alps.level == kCompatWarn) &&
+                         (rep.uuid.level == kCompatPass || rep.uuid.level == kCompatWarn) &&
+                         (rep.spp.level == kCompatPass || rep.spp.level == kCompatWarn);
+    return rep;
+}
+
+std::string formatAlpsCompatReport(const AlpsCompatReport& report) {
+    std::ostringstream oss;
+    oss << "wireless_ready=" << (report.wireless_ready ? "yes" : "no")
+        << " usb_mode=" << (report.usb_mode ? "yes" : "no")
+        << " [" << report.alps.name << ":" << compatStatusLevelName(report.alps.level)
+        << " " << report.alps.detail << "]"
+        << " [" << report.uuid.name << ":" << compatStatusLevelName(report.uuid.level)
+        << " " << report.uuid.detail << "]"
+        << " [" << report.spp.name << ":" << compatStatusLevelName(report.spp.level)
+        << " " << report.spp.detail << "]";
+    return oss.str();
 }
 
 std::unique_ptr<BtTransport> createBtTransport(Reactor& reactor,

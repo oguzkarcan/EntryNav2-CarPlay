@@ -438,4 +438,40 @@ TEST_CASE(tcpSendOnClosedConnection) {
     CHECK(!c.shutdownWrite());
 }
 
+TEST_CASE(wifiVideoTosOption) {
+    int tos = -1;
+    CHECK(!setWifiVideoTos(kInvalidSocket));
+    CHECK(!getSocketTrafficClass(kInvalidSocket, tos));
+
+    // IPv4 UDP socket starts with default 0, then switches to kWifiVideoTos (0x80 / WMM AC_VI).
+    UdpSocket udp4;
+    REQUIRE(udp4.open(Address::ipv4Loopback(0)));
+    CHECK(getSocketTrafficClass(udp4.handle(), tos));
+    CHECK_EQ(0, tos);
+    CHECK(udp4.setWifiVideoTos());
+    CHECK(getSocketTrafficClass(udp4.handle(), tos));
+    CHECK_EQ(kWifiVideoTos, tos);
+
+    // IPv4 TCP connection socket sets IP_TOS = 0x80.
+    TcpListener l;
+    REQUIRE(l.listen(Address::ipv4Loopback(0)));
+    TcpConnection c;
+    REQUIRE(c.connect(Address::ipv4Loopback(l.port())));
+    CHECK(waitFor(c.handle(), kPollOut));
+    CHECK_EQ(kIoOk, c.finishConnect());
+    CHECK(c.setWifiVideoTos());
+    CHECK(getSocketTrafficClass(c.handle(), tos));
+    CHECK_EQ(kWifiVideoTos, tos);
+
+    // IPv6 UDP socket sets IPV6_TCLASS = 0x80 when IPv6 loopback is available.
+    UdpSocket udp6;
+    if (udp6.open(Address::ipv6Loopback(0))) {
+        CHECK(getSocketTrafficClass(udp6.handle(), tos));
+        CHECK_EQ(0, tos);
+        CHECK(udp6.setWifiVideoTos());
+        CHECK(getSocketTrafficClass(udp6.handle(), tos));
+        CHECK_EQ(kWifiVideoTos, tos);
+    }
+}
+
 int main() { return test_support::runAll("test_platform_net"); }
