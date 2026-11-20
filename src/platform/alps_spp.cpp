@@ -22,6 +22,7 @@
 
 #include "carplay/platform/log.hpp"
 #include "carplay/platform/thread.hpp"
+#include "carplay/platform/wifi_link.hpp"
 
 namespace carplay {
 namespace platform {
@@ -1856,6 +1857,14 @@ bool AlpsSppManager::sendData(const uint8_t* data, size_t len) {
         return false;
     }
     return link_->sendData(data, len);
+}
+
+bool AlpsSppManager::readBmwAppsSlot(AppsSlot& out) {
+    if (!started_ || !reader_.isOpen()) {
+        out = AppsSlot();
+        return false;
+    }
+    return ::carplay::platform::readBmwAppsSlot(reader_, out);
 }
 
 void AlpsSppManager::handleLinkConnected(const BtAddr& peer) {

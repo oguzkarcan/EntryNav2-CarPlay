@@ -29,6 +29,8 @@
 namespace carplay {
 namespace platform {
 
+struct AppsSlot;
+
 enum BtBackendKind {
     kBtBackendNone = 0,
     kBtBackendAlpsSpp = 1,
@@ -61,6 +63,9 @@ public:
     virtual bool isStarted() const = 0;
     virtual bool isConnected() const = 0;
     virtual const BtAddr& peerAddress() const = 0;
+
+    /// Read-only probe of ALPS BMW Apps slot 0 (`kAlpsBmwAppsSlot`) for WL18xx coex logging.
+    virtual bool readBmwAppsSlot(AppsSlot& /*out*/) { return false; }
 };
 
 /// Adapts a `BtTransport` instance to `carplay::iap2::ByteSink` for `iap2::Link`.
@@ -100,6 +105,7 @@ public:
     virtual bool isStarted() const { return manager_.isStarted(); }
     virtual bool isConnected() const { return manager_.isConnected(); }
     virtual const BtAddr& peerAddress() const { return manager_.peerAddress(); }
+    virtual bool readBmwAppsSlot(AppsSlot& out);
 
     const AlpsSppManager& manager() const { return manager_; }
 

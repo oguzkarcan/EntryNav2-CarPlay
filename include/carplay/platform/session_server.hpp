@@ -138,6 +138,16 @@ public:
     const Address& controlPeerAddress() const { return control_conn_.peerAddress(); }
     void closeActiveSession();
 
+    /// Enables or disables Wi-Fi video QoS (IP_TOS / IPV6_TCLASS = 0x80) for subsequent
+    /// control/event TCP accepts and delegates the setting to the attached MediaEngine.
+    void setWifiVideoQos(bool enabled) {
+        server_cfg_.wifi_video_qos = enabled;
+        if (media_engine_ != NULL) {
+            media_engine_->setWifiVideoQos(enabled);
+        }
+    }
+    bool wifiVideoQos() const { return server_cfg_.wifi_video_qos; }
+
     // ---- session::TransportHost implementation ----
     virtual bool openTiming(int32_t peer_timing_port, int32_t& local_port_out);
     virtual bool openEvent(int32_t& local_port_out);

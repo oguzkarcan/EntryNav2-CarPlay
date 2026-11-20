@@ -15,6 +15,7 @@
 #endif
 
 #include "carplay/platform/log.hpp"
+#include "carplay/platform/wifi_link.hpp"
 
 namespace carplay {
 namespace platform {
@@ -140,6 +141,10 @@ void AlpsBtTransport::disconnect(const std::string& reason) {
 
 bool AlpsBtTransport::sendBytes(const uint8_t* data, size_t len) {
     return manager_.sendData(data, len);
+}
+
+bool AlpsBtTransport::readBmwAppsSlot(AppsSlot& out) {
+    return manager_.readBmwAppsSlot(out);
 }
 
 // ------------------------------------------------------------------------------------------------

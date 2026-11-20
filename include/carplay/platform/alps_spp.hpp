@@ -37,6 +37,8 @@
 namespace carplay {
 namespace platform {
 
+struct AppsSlot;
+
 // Verified ALPS D-Bus coordinates (EntryNav2-Android-Auto-0.12.0/platform/alps_spp.cpp).
 static const char kAlpsDbusService[] = "org.alps.evolution";
 static const char kAlpsDbusPath[] = "/org/alps/evolution/hli";
@@ -310,6 +312,9 @@ public:
     void disconnect(const std::string& reason = "local disconnect");
     bool sendData(const uint8_t* data, size_t len);
     void setListener(AlpsSppManagerListener* listener) { listener_ = listener; }
+
+    /// Read-only probe of ALPS BMW Apps slot 0 (`kAlpsBmwAppsSlot`) using the open snapshot reader.
+    bool readBmwAppsSlot(AppsSlot& out);
 
     bool isStarted() const { return started_; }
     bool isConnected() const { return connected_; }

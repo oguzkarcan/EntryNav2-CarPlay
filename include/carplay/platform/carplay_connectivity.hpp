@@ -41,6 +41,7 @@
 #include "carplay/platform/usb_carplay_bridge.hpp"
 #include "carplay/platform/usb_host.hpp"
 #include "carplay/platform/wifi_ap.hpp"
+#include "carplay/platform/wifi_link.hpp"
 
 namespace carplay {
 namespace platform {
@@ -131,6 +132,11 @@ public:
     void setListener(CarPlayConnectivityListener* listener) { listener_ = listener; }
     void setIap2AuthProvider(iap2::AuthProvider* auth);
     void setBtTransportForTest(BtTransport* transport);
+    void setBtCapabilityForTest(const BtTransportCapability& cap);
+    void clearBtCapabilityForTest();
+    void setSppMemoryBackendForTest(SppMemoryBackend* mem);
+    void setAlpsLinkForTest(AlpsSppLink* link);
+    void setRfcommSocketOpsForTest(BtSocketOps* ops);
     void setUsbHostForTest(UsbHostInterface* usb);
     void setTapPortForTest(TapPortInterface* tap);
 
@@ -138,6 +144,8 @@ public:
     const WifiAp& wifiAp() const { return wifi_ap_; }
     MdnsAdvertiser& mdnsAdvertiser() { return mdns_; }
     const MdnsAdvertiser& mdnsAdvertiser() const { return mdns_; }
+    WifiLinkLog& wifiLinkLog() { return wifi_link_log_; }
+    const WifiLinkLog& wifiLinkLog() const { return wifi_link_log_; }
 
     // ---- Lifecycle (Reactor thread) ----
     bool start(SessionServer& server,
@@ -160,6 +168,8 @@ public:
 
     BtBackendKind activeBtBackend() const;
     WifiApBackend activeWifiApBackend() const { return wifi_ap_.activeBackend(); }
+    bool hasAlpsCompatReport() const { return has_compat_report_; }
+    const AlpsCompatReport& lastAlpsCompatReport() const { return last_compat_report_; }
     bool hasActiveWifiCredentials() const { return wifi_creds_adapter_.hasCredentials(); }
     const WifiCredentials& activeWifiCredentials() const { return active_wifi_creds_; }
 
@@ -380,6 +390,7 @@ private:
                               bool is_failure,
                               bool schedule_restart);
     void startMdnsForWireless(const WifiCredentials& creds);
+    static bool appsProbeThunk(void* user, AppsSlot& out);
 
     Reactor& reactor_;
     pairing::RandomSource& rng_;
@@ -402,10 +413,19 @@ private:
     TickTimerHandler timer_handler_;
 
     BtTransport* bt_transport_override_;
+    BtTransportCapability bt_cap_override_;
+    bool has_bt_cap_override_;
+    SppMemoryBackend* spp_mem_override_;
+    AlpsSppLink* alps_link_override_;
+    BtSocketOps* rfcomm_socket_ops_override_;
     std::unique_ptr<BtTransport> owned_bt_transport_;
     BtTransport* bt_transport_;
     BtSessionAdapter bt_adapter_;
     iap2::Session* wireless_iap2_session_;
+    bool has_compat_report_;
+    AlpsCompatReport last_compat_report_;
+    bool alps_snapshot_safe_;
+    WifiLinkLog wifi_link_log_;
 
     WifiAp wifi_ap_;
     WifiApCredentialsAdapter wifi_creds_adapter_;
