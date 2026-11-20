@@ -81,6 +81,7 @@ void printUsage(const char* argv0) {
         "  --no-mfi-i2c           Disable I2C MFi coprocessor auth (default)\n"
         "  --compat               Run dry-run vehicle compatibility self-check and exit\n"
         "  --self-check           Alias for --compat\n"
+        "  --compat-mfi-read      With --compat and --mfi-i2c/mfi_i2c=, read CP reg 0x00 (risk: bus contention)\n"
         "  --service              Supervisor compatibility flag (default mode)\n"
         "  --version              Show version information and exit\n"
         "  --help                 Show this help message and exit\n",
@@ -92,6 +93,7 @@ void printUsage(const char* argv0) {
 
 struct CliOverrides {
     bool compat_mode;
+    bool compat_mfi_read;
     bool has_port;
     uint16_t port;
     bool has_data_dir;
@@ -123,6 +125,7 @@ struct CliOverrides {
 
     CliOverrides()
         : compat_mode(false),
+          compat_mfi_read(false),
           has_port(false),
           port(7000U),
           has_data_dir(false),
@@ -169,6 +172,8 @@ int main(int argc, char** argv) {
             return 0;
         } else if (strcmp(arg, "--compat") == 0 || strcmp(arg, "--self-check") == 0) {
             cli.compat_mode = true;
+        } else if (strcmp(arg, "--compat-mfi-read") == 0) {
+            cli.compat_mfi_read = true;
         } else if (strcmp(arg, "--service") == 0) {
             // Accepted for supervisor invocation (`carplayd --service`).
         } else if (strcmp(arg, "--port") == 0 && val != NULL) {
@@ -282,6 +287,11 @@ int main(int argc, char** argv) {
         if (cli.has_wired && cli.wired && (!cli.has_wireless || !cli.wireless)) {
             compat_cfg.usb_mode = true;
         }
+        if (cli.has_mfi_i2c) {
+            compat_cfg.has_mfi_i2c_override = true;
+            compat_cfg.mfi_i2c_config = cli.mfi_i2c_config;
+        }
+        compat_cfg.compat_mfi_read = cli.compat_mfi_read;
         const carplay::platform::CompatReport report =
             carplay::platform::runCompatChecks(compat_cfg);
         const std::string text = report.format();

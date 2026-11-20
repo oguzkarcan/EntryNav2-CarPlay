@@ -80,6 +80,11 @@ public:
     uint32_t ilm_w;
     uint32_t ilm_h;
     bool ilm_top_first;
+    bool mfi_accessible;
+    bool mfi_funcs_ok;
+    bool mfi_read_ok;
+    bool mfi_query_called;
+    bool mfi_read_requested;
     std::set<std::string> unwritable_dirs;
     std::set<std::string> existing_paths;
 
@@ -95,7 +100,12 @@ public:
           ilm_ok(true),
           ilm_w(800U),
           ilm_h(480U),
-          ilm_top_first(false) {
+          ilm_top_first(false),
+          mfi_accessible(true),
+          mfi_funcs_ok(true),
+          mfi_read_ok(true),
+          mfi_query_called(false),
+          mfi_read_requested(false) {
         bt_cap.alps_library_present = true;
         bt_cap.alps_dbus_ready = true;
         bt_cap.alps_service_owned = true;
@@ -223,6 +233,35 @@ public:
     virtual bool pathExists(const std::string& path) {
         return existing_paths.find(path) != existing_paths.end();
     }
+
+    virtual bool queryI2cMfi(const plat::MfiI2cConfig& mfi_cfg,
+                             bool probe_version_reg,
+                             std::string& detail_out,
+                             bool& accessible_out,
+                             bool& funcs_ok_out) {
+        mfi_query_called = true;
+        mfi_read_requested = probe_version_reg;
+        accessible_out = mfi_accessible;
+        funcs_ok_out = mfi_funcs_ok;
+        if (!mfi_accessible) {
+            detail_out = mfi_cfg.device_path + " missing";
+            return false;
+        }
+        if (!mfi_funcs_ok) {
+            detail_out = mfi_cfg.device_path + " I2C_FUNCS failed";
+            return false;
+        }
+        if (!probe_version_reg) {
+            detail_out = mfi_cfg.device_path + " accessible, I2C_FUNCS ok (bus read skipped)";
+            return true;
+        }
+        if (!mfi_read_ok) {
+            detail_out = mfi_cfg.device_path + " accessible, I2C_FUNCS ok, reg 0x00 NACK";
+            return false;
+        }
+        detail_out = mfi_cfg.device_path + " I2C_FUNCS ok, addr=0x10 dev_ver=0x05";
+        return true;
+    }
 };
 
 const plat::CompatLine* findLine(const plat::CompatReport& r, const std::string& check) {
@@ -270,6 +309,8 @@ TEST_CASE(compatAllPassWithFakeOps) {
     CHECK(formatted.find("@ok|alps|") != std::string::npos);
     CHECK(formatted.find("@ok|data_dir|") != std::string::npos);
     CHECK(formatted.find("@ok|state_dir|") != std::string::npos);
+    CHECK(formatted.find("@info|mfi|") != std::string::npos);
+    CHECK(!ops.mfi_query_called);
 }
 
 TEST_CASE(compatOptionalLibAndSymbolDoNotBlock) {
@@ -433,8 +474,103 @@ TEST_CASE(compatDaemonBinaryCliSmoke) {
     CHECK(rep.text.find("@ok|data_dir|") != std::string::npos);
     CHECK(rep.text.find("@ok|state_dir|") != std::string::npos);
     CHECK(rep.text.find("|libxsvideo|") != std::string::npos);
+    CHECK(rep.text.find("@info|mfi|") != std::string::npos);
+
+    // Passing --mfi-i2c /dev/null triggers @block|mfi| (not a character I2C device; no bus transaction)
+    args.push_back("--mfi-i2c");
+    args.push_back("/dev/null");
+    std::string out_mfi;
+    plat::CommandReport rep_mfi;
+    plat::runCommand(siblingDaemonPath(), args, out_mfi, 5000, &rep_mfi);
+    CHECK_EQ(0, rep_mfi.spawn_error);
+    CHECK(rep_mfi.text.find("@block|mfi|") != std::string::npos);
+
     removeTempDir(dir);
 #endif
+}
+
+TEST_CASE(compatMfiConfiguredAndOptInReadStates) {
+    const std::string dir = makeTempDir("compat_mfi");
+    const std::string conf_path = plat::joinPath(dir, "carplay.conf");
+    const std::string cfg_body = "wired=1\nmfi_i2c=/dev/i2c-0:0x10\n";
+    REQUIRE(plat::writeFileAtomic(
+        conf_path, reinterpret_cast<const uint8_t*>(cfg_body.data()), cfg_body.size()));
+
+    // 1. Configured via carplay.conf without compat_mfi_read -> @ok without bus read
+    {
+        FakeCompatSystemOps ops;
+        plat::CompatCheckConfig cfg;
+        cfg.data_dir = dir;
+        cfg.config_file = conf_path;
+        cfg.state_file = plat::joinPath(dir, "state");
+        const plat::CompatReport r = plat::runCompatChecks(cfg, &ops);
+        CHECK(!r.hasBlockingFailure());
+        CHECK(ops.mfi_query_called);
+        CHECK(!ops.mfi_read_requested);
+        const plat::CompatLine* mfi = findLine(r, "mfi");
+        REQUIRE(mfi != NULL);
+        CHECK_EQ(static_cast<int>(plat::kCompatLineOk), static_cast<int>(mfi->level));
+    }
+
+    // 2. Explicit CLI --no-mfi-i2c override suppresses carplay.conf mfi_i2c
+    {
+        FakeCompatSystemOps ops;
+        plat::CompatCheckConfig cfg;
+        cfg.data_dir = dir;
+        cfg.config_file = conf_path;
+        cfg.state_file = plat::joinPath(dir, "state");
+        cfg.has_mfi_i2c_override = true;
+        cfg.mfi_i2c_config.enabled = false;
+        const plat::CompatReport r = plat::runCompatChecks(cfg, &ops);
+        CHECK(!ops.mfi_query_called);
+        const plat::CompatLine* mfi = findLine(r, "mfi");
+        REQUIRE(mfi != NULL);
+        CHECK_EQ(static_cast<int>(plat::kCompatLineInfo), static_cast<int>(mfi->level));
+    }
+
+    // 3. Explicit --compat-mfi-read succeeds -> @ok; fails reg read -> @warn
+    {
+        FakeCompatSystemOps ops;
+        plat::CompatCheckConfig cfg;
+        cfg.data_dir = dir;
+        cfg.config_file = conf_path;
+        cfg.state_file = plat::joinPath(dir, "state");
+        cfg.compat_mfi_read = true;
+        const plat::CompatReport r_ok = plat::runCompatChecks(cfg, &ops);
+        CHECK(ops.mfi_read_requested);
+        CHECK(!r_ok.hasBlockingFailure());
+        CHECK_EQ(static_cast<int>(plat::kCompatLineOk),
+                 static_cast<int>(findLine(r_ok, "mfi")->level));
+
+        ops.mfi_read_ok = false;
+        const plat::CompatReport r_warn = plat::runCompatChecks(cfg, &ops);
+        CHECK(!r_warn.hasBlockingFailure());
+        CHECK_EQ(static_cast<int>(plat::kCompatLineWarn),
+                 static_cast<int>(findLine(r_warn, "mfi")->level));
+    }
+
+    // 4. Inaccessible device or failed I2C_FUNCS -> @block
+    {
+        FakeCompatSystemOps ops;
+        ops.mfi_accessible = false;
+        plat::CompatCheckConfig cfg;
+        cfg.data_dir = dir;
+        cfg.config_file = conf_path;
+        cfg.state_file = plat::joinPath(dir, "state");
+        const plat::CompatReport r_missing = plat::runCompatChecks(cfg, &ops);
+        CHECK(r_missing.hasBlockingFailure());
+        CHECK_EQ(static_cast<int>(plat::kCompatLineBlock),
+                 static_cast<int>(findLine(r_missing, "mfi")->level));
+
+        ops.mfi_accessible = true;
+        ops.mfi_funcs_ok = false;
+        const plat::CompatReport r_nofunc = plat::runCompatChecks(cfg, &ops);
+        CHECK(r_nofunc.hasBlockingFailure());
+        CHECK_EQ(static_cast<int>(plat::kCompatLineBlock),
+                 static_cast<int>(findLine(r_nofunc, "mfi")->level));
+    }
+
+    removeTempDir(dir);
 }
 
 }  // namespace

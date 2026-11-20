@@ -15,6 +15,7 @@
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 #endif
 
@@ -247,6 +248,17 @@ int readUsbFlagFile(const std::string& path, std::string& port_out) {
 }
 
 #ifndef _WIN32
+void sleepMsCompat(int64_t ms) {
+    if (ms <= 0) {
+        return;
+    }
+    struct timespec req;
+    req.tv_sec = static_cast<time_t>(ms / 1000LL);
+    req.tv_nsec = static_cast<long>((ms % 1000LL) * 1000000LL);
+    while (::nanosleep(&req, &req) < 0 && errno == EINTR) {
+    }
+}
+
 bool processNameRunning(const char* name) {
     DIR* proc = ::opendir("/proc");
     if (proc == NULL) {
@@ -692,6 +704,125 @@ bool PosixCompatSystemOps::pathExists(const std::string& path) {
     return carplay::platform::pathExists(path);
 }
 
+bool PosixCompatSystemOps::queryI2cMfi(const MfiI2cConfig& mfi_cfg,
+                                       bool probe_version_reg,
+                                       std::string& detail_out,
+                                       bool& accessible_out,
+                                       bool& funcs_ok_out) {
+    detail_out.clear();
+    accessible_out = false;
+    funcs_ok_out = false;
+#ifdef _WIN32
+    (void)mfi_cfg;
+    (void)probe_version_reg;
+    detail_out = "Linux i2c-dev unsupported on Windows";
+    return false;
+#else
+    if (mfi_cfg.device_path.empty()) {
+        detail_out = "empty I2C device path";
+        return false;
+    }
+    struct stat st;
+    if (::stat(mfi_cfg.device_path.c_str(), &st) != 0) {
+        detail_out = mfi_cfg.device_path + " missing (" + strerror(errno) + ")";
+        return false;
+    }
+    if (!S_ISCHR(st.st_mode)) {
+        detail_out = mfi_cfg.device_path + " is not a character device";
+        return false;
+    }
+
+    LinuxI2cBackend backend;
+    std::string open_err;
+    if (!backend.openDevice(mfi_cfg.device_path, &open_err)) {
+        if (open_err.find("ioctl(I2C_FUNCS)") != std::string::npos) {
+            accessible_out = true;
+            funcs_ok_out = false;
+        }
+        detail_out = open_err;
+        return false;
+    }
+
+    accessible_out = true;
+    funcs_ok_out = true;
+
+    if (!probe_version_reg) {
+        std::ostringstream oss;
+        oss << mfi_cfg.device_path << " accessible, I2C_FUNCS ok (I2C_RDWR="
+            << (backend.supportsI2cRdwr() ? "yes" : "no")
+            << "; bus read skipped, pass --compat-mfi-read to probe 0x00)";
+        detail_out = oss.str();
+        backend.closeDevice();
+        return true;
+    }
+
+    std::vector<uint8_t> addrs;
+    if (mfi_cfg.address7 != 0U) {
+        addrs.push_back(mfi_cfg.address7);
+    } else {
+        addrs.push_back(mfi_reg::kCandidateAddrPrimary);
+        addrs.push_back(mfi_reg::kCandidateAddrSecondary);
+    }
+
+    std::string last_fail;
+    for (size_t i = 0; i < addrs.size(); ++i) {
+        const uint8_t addr = addrs[i];
+        for (int attempt = 0; attempt < 2; ++attempt) {
+            const uint8_t reg = mfi_reg::kDeviceVersion;
+            int sys_err = 0;
+            const I2cStatus st_tx = backend.transfer(addr, &reg, 1U, NULL, 0U, &sys_err);
+            if (st_tx == kI2cNack && attempt == 0) {
+                sleepMsCompat(20);
+                continue;
+            }
+            if (st_tx != kI2cOk) {
+                char buf[64];
+                snprintf(buf, sizeof(buf), "0x%02x select failed (status=%d errno=%d)",
+                         static_cast<unsigned>(addr), static_cast<int>(st_tx), sys_err);
+                last_fail = buf;
+                break;
+            }
+            const int64_t gap_ms =
+                (mfi_cfg.select_to_read_gap_ms > 0) ? mfi_cfg.select_to_read_gap_ms : 5;
+            sleepMsCompat(gap_ms);
+            uint8_t dev_ver = 0U;
+            const I2cStatus st_rx = backend.transfer(addr, NULL, 0U, &dev_ver, 1U, &sys_err);
+            if (st_rx == kI2cNack && attempt == 0) {
+                sleepMsCompat(20);
+                continue;
+            }
+            if (st_rx != kI2cOk) {
+                char buf[64];
+                snprintf(buf, sizeof(buf), "0x%02x read failed (status=%d errno=%d)",
+                         static_cast<unsigned>(addr), static_cast<int>(st_rx), sys_err);
+                last_fail = buf;
+                break;
+            }
+            if (dev_ver == 0x00U || dev_ver == 0xffU) {
+                char buf[64];
+                snprintf(buf, sizeof(buf), "0x%02x invalid dev_ver=0x%02x",
+                         static_cast<unsigned>(addr), static_cast<unsigned>(dev_ver));
+                last_fail = buf;
+                break;
+            }
+            char okbuf[160];
+            snprintf(okbuf, sizeof(okbuf), "%s I2C_FUNCS ok, addr=0x%02x dev_ver=0x%02x",
+                     mfi_cfg.device_path.c_str(),
+                     static_cast<unsigned>(addr),
+                     static_cast<unsigned>(dev_ver));
+            detail_out = okbuf;
+            backend.closeDevice();
+            return true;
+        }
+    }
+
+    backend.closeDevice();
+    detail_out = mfi_cfg.device_path + " accessible, I2C_FUNCS ok, CP version read failed: " +
+                 (last_fail.empty() ? std::string("no response") : last_fail);
+    return false;
+#endif
+}
+
 // ------------------------------------------------------------------------------------------------
 // Main compatibility check orchestration
 // ------------------------------------------------------------------------------------------------
@@ -714,7 +845,11 @@ CompatReport runCompatChecks(const CompatCheckConfig& config, CompatSystemOps* o
                 << " (enabled=" << (file_cfg.enabled ? "1" : "0")
                 << " wireless=" << (file_cfg.wireless ? "1" : "0")
                 << " wired=" << (file_cfg.wired ? "1" : "0")
-                << " detach_usbfs=" << (file_cfg.detach_usbfs_driver ? "1" : "0") << ")";
+                << " detach_usbfs=" << (file_cfg.detach_usbfs_driver ? "1" : "0")
+                << " mfi_i2c="
+                << (file_cfg.mfi_i2c_config.enabled ? file_cfg.mfi_i2c_config.device_path
+                                                    : std::string("off"))
+                << ")";
             report.add(kCompatLineOk, "config", oss.str());
             if (!usb_mode && file_cfg.wired && !file_cfg.wireless) {
                 usb_mode = true;
@@ -932,6 +1067,30 @@ CompatReport runCompatChecks(const CompatCheckConfig& config, CompatSystemOps* o
             report.add(kCompatLineOk, "state_dir", state_detail);
         } else {
             report.add(kCompatLineBlock, "state_dir", state_detail);
+        }
+    }
+
+    // 10. MFi I2C coprocessor check (never performs bus transactions unless compat_mfi_read=true)
+    {
+        MfiI2cConfig mfi_cfg = config.mfi_i2c_config;
+        if (!config.has_mfi_i2c_override && file_cfg.loaded_from_file) {
+            mfi_cfg = file_cfg.mfi_i2c_config;
+        }
+        if (!mfi_cfg.enabled) {
+            report.add(kCompatLineInfo, "mfi",
+                       "disabled (default off; set mfi_i2c=... in carplay.conf or --mfi-i2c=DEV[:ADDR])");
+        } else {
+            std::string mfi_detail;
+            bool mfi_accessible = false;
+            bool mfi_funcs_ok = false;
+            if (ops.queryI2cMfi(mfi_cfg, config.compat_mfi_read,
+                                mfi_detail, mfi_accessible, mfi_funcs_ok)) {
+                report.add(kCompatLineOk, "mfi", mfi_detail);
+            } else if (mfi_accessible && mfi_funcs_ok) {
+                report.add(kCompatLineWarn, "mfi", mfi_detail);
+            } else {
+                report.add(kCompatLineBlock, "mfi", mfi_detail);
+            }
         }
     }
 

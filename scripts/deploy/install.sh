@@ -223,6 +223,8 @@ enabled=1
 wireless=$CFG_WIRELESS
 wired=$CFG_WIRED
 detach_usbfs_driver=0
+# MFi I2C coprocessor (default off; uncomment only after verifying /dev/i2c-0 ownership):
+# mfi_i2c=/dev/i2c-0:0x10
 crash_guard_max=3
 crash_guard_window_sec=120
 crash_guard_stable_sec=120

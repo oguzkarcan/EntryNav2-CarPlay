@@ -140,3 +140,18 @@ RUN_CARLIB_SMOKE=1 SYSROOT=~/entrynav2/sysroot sh scripts/ci/build_and_test.sh h
 ```
 
 Both scripts skip cleanly (exit `0`) when `SYSROOT`, Docker, or QEMU is unavailable.
+
+## 9. LibFuzzer + ASan/UBSan Parser Fuzzing
+
+[`scripts/ci/fuzz.sh`](../scripts/ci/fuzz.sh) builds and runs 13 `clang++` libFuzzer + AddressSanitizer + UndefinedBehaviorSanitizer harnesses under `tests/fuzz/` (`fuzz_iap2_link`, `fuzz_iap2_session`, `fuzz_cdc_ncm`, `fuzz_usb_descriptors`, `fuzz_rtsp_message`, `fuzz_bplist_codec`, `fuzz_tlv8_codec`, `fuzz_sdp_record`, `fuzz_dnssd_txt`, `fuzz_event_channel`, `fuzz_audio_rtp`, `fuzz_screen_stream`, `fuzz_pairing_srp`):
+
+```sh
+FUZZ_BUILD_ONLY=1 sh scripts/ci/fuzz.sh                               # compile all 13 harnesses
+FUZZ_SECONDS=20 sh scripts/ci/fuzz.sh                                 # build + 20s run per target
+FUZZ_TARGETS="fuzz_bplist_codec fuzz_iap2_link" FUZZ_SECONDS=60 sh scripts/ci/fuzz.sh
+```
+
+## 10. Car Visit Kit, Safe-Mode Deployment & MFi I2C Bench Testing
+
+- **First car visit & safe-mode deployment:** See [docs/CAR_VISIT.md](CAR_VISIT.md) for the read-only probe (`scripts/probe/car_visit.sh`), dry-run compatibility self-check (`carplayd --compat`), byte-for-byte reversible deployment (`scripts/deploy/install.sh` / `uninstall.sh`), and `carplay.conf` / kill-switch / crash-loop guard controls. Tested on host fake-root by `scripts/ci/check_probe_scripts.sh`.
+- **Hardware MFi I2C coprocessor & PC bench setup:** See [docs/MFI_AUTH.md](MFI_AUTH.md) for `/dev/i2c-N` CP 2.0C/3.0 configuration (`--mfi-i2c` / `mfi_i2c=`), AirPlay `/auth-setup` MFiSAP, BMW bus-sharing safety, and USB–I2C bench adapter testing.

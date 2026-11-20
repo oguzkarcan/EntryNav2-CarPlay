@@ -73,9 +73,11 @@ Linux `i2c-dev` allows multiple processes to `open("/dev/i2c-0")`. The kernel OM
 - If `i2cdetect` or another driver already bound the slave, `I2C_SLAVE` returns `EBUSY`.
 
 **Safe defaults in this repo:**
-- `--mfi-i2c` is **opt-in and OFF by default** (`CarPlayDaemon` uses `UnavailableAuthProvider` unless `--mfi-i2c` is explicitly configured).
+- `--mfi-i2c` (and `mfi_i2c=` in `/var/local/data/CarPlay/carplay.conf`) is **opt-in and OFF by default** (`CarPlayDaemon` uses `UnavailableAuthProvider` unless `--mfi-i2c` or `mfi_i2c=...` is explicitly configured; CLI `--mfi-i2c` / `--no-mfi-i2c` overrides `carplay.conf`).
+- `install.sh --mode safe` writes `# mfi_i2c=/dev/i2c-0:0x10` commented out in `carplay.conf`.
+- `carplayd --compat` emits `@info|mfi|...` when off, checks device access + `I2C_FUNCS` when configured, and **never** reads register `0x00` unless `--compat-mfi-read` is explicitly passed.
 - `LinuxI2cBackend` never uses `I2C_SLAVE_FORCE`.
-- In-car deployment must confirm via the read-only commands below whether BMW `CARPLAY` holds `/dev/i2c-0` open; if it actively accesses the chip concurrently, stop/disable the competing native CarPlay handler before enabling `--mfi-i2c`.
+- In-car deployment must confirm via the read-only commands below (automated in `scripts/probe/car_visit.sh`, which skips bus transactions unless `--mfi-read` is passed) whether BMW `CARPLAY` holds `/dev/i2c-0` open; if it actively accesses the chip concurrently, stop/disable the competing native CarPlay handler before enabling `--mfi-i2c`.
 
 ### Legal & Licensing Note
 

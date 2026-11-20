@@ -72,6 +72,7 @@ TEST_CASE(safeModeConfigMissingUsesDisabledDefaults) {
     CHECK(!dcfg.connectivity_config.enable_wireless);
     CHECK(!dcfg.connectivity_config.enable_wired);
     CHECK(!dcfg.connectivity_config.usb_host_config.detach_usbfs_driver);
+    CHECK(!dcfg.mfi_i2c_config.enabled);
     removeTempDir(dir);
 }
 
@@ -89,6 +90,7 @@ TEST_CASE(safeModeConfigValidAndInvalidParsing) {
         "width = 1280\n"
         "height = 480\n"
         "usb_port = 3-1\n"
+        "mfi_i2c = /dev/i2c-0:0x10\n"
         "crash_guard_max = 4\n"
         "crash_guard_window_sec = 90\n"
         "crash_guard_stable_sec = 60\n";
@@ -108,6 +110,9 @@ TEST_CASE(safeModeConfigValidAndInvalidParsing) {
     CHECK_EQ(1280U, cfg.width);
     CHECK_EQ(480U, cfg.height);
     CHECK_EQ(std::string("3-1"), cfg.usb_port);
+    CHECK(cfg.mfi_i2c_config.enabled);
+    CHECK_EQ(std::string("/dev/i2c-0"), cfg.mfi_i2c_config.device_path);
+    CHECK_EQ(0x10U, static_cast<unsigned>(cfg.mfi_i2c_config.address7));
     CHECK_EQ(4, cfg.crash_guard_max);
     CHECK_EQ(90, static_cast<int>(cfg.crash_guard_window_sec));
     CHECK_EQ(60, static_cast<int>(cfg.crash_guard_stable_sec));
@@ -118,11 +123,23 @@ TEST_CASE(safeModeConfigValidAndInvalidParsing) {
     CHECK(dcfg.enable_wired);
     CHECK_EQ(7001U, static_cast<unsigned>(dcfg.control_port));
     CHECK_EQ(std::string("3-1"), dcfg.connectivity_config.usb_host_config.usb_port_filter);
+    CHECK(dcfg.mfi_i2c_config.enabled);
+    CHECK_EQ(std::string("/dev/i2c-0"), dcfg.mfi_i2c_config.device_path);
+    CHECK_EQ(0x10U, static_cast<unsigned>(dcfg.mfi_i2c_config.address7));
+
+    // Empty mfi_i2c= explicitly leaves MFi disabled
+    const std::string empty_mfi = "mfi_i2c=\n";
+    REQUIRE(plat::writeFileAtomic(
+        path, reinterpret_cast<const uint8_t*>(empty_mfi.data()), empty_mfi.size()));
+    CHECK(plat::loadDaemonConfigFile(path, cfg, err));
+    CHECK(!cfg.mfi_i2c_config.enabled);
 
     const char* bad_cases[] = {
         "wireless=maybe\n",
         "port=99999\n",
         "usb_port=../evil\n",
+        "mfi_i2c=/dev/i2c-0:0x99\n",
+        "mfi_i2c=/dev/i2c-0:\n",
         "unknown_key=1\n",
         "no_equals_sign\n"
     };

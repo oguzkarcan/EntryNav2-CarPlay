@@ -198,6 +198,17 @@ bool loadDaemonConfigFile(const std::string& path,
                 return false;
             }
             out.usb_port = val;
+        } else if (key == "mfi_i2c") {
+            if (val.empty()) {
+                out.mfi_i2c_config = MfiI2cConfig();
+                out.mfi_i2c_config.enabled = false;
+            } else {
+                std::string mfi_err;
+                if (!parseMfiI2cSpec(val, out.mfi_i2c_config, &mfi_err)) {
+                    error_out = path + ": invalid mfi_i2c (" + mfi_err + ")";
+                    return false;
+                }
+            }
         } else if (key == "crash_guard_max") {
             if (!parseUintRange(val, 0UL, 20UL, u)) {
                 error_out = path + ": invalid crash_guard_max";
@@ -251,6 +262,7 @@ void applyDaemonFileConfig(const DaemonFileConfig& file_cfg, CarPlayDaemonConfig
     if (!file_cfg.usb_port.empty()) {
         daemon_cfg.connectivity_config.usb_host_config.usb_port_filter = file_cfg.usb_port;
     }
+    daemon_cfg.mfi_i2c_config = file_cfg.mfi_i2c_config;
 }
 
 bool checkKillSwitch(const std::vector<std::string>& paths, std::string& matched_path_out) {

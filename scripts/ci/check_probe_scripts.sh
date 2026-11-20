@@ -44,6 +44,7 @@ mkdir -p \
     "$FAKE_ROOT/dev/bus/usb/001" \
     "$FAKE_ROOT/dev/net" \
     "$FAKE_ROOT/proc/101/fd" \
+    "$FAKE_ROOT/proc/102/fd" \
     "$FAKE_ROOT/proc/sys/net/ipv6/conf/all" \
     "$FAKE_ROOT/proc/sys/net/ipv6/conf/default" \
     "$FAKE_ROOT/proc/sys/net/ipv6/conf/wlan0" \
@@ -79,6 +80,9 @@ printf 'BTMedia\n' > "$FAKE_ROOT/proc/101/comm"
 printf 'BTMedia\0--daemon\0' > "$FAKE_ROOT/proc/101/cmdline"
 printf 'Uid:\t0\t0\t0\t0\n' > "$FAKE_ROOT/proc/101/status"
 ln -s /dev/bus/usb/001/002 "$FAKE_ROOT/proc/101/fd/10"
+printf 'CARPLAY\n' > "$FAKE_ROOT/proc/102/comm"
+ln -s /dev/i2c-0 "$FAKE_ROOT/proc/102/fd/7"
+printf 'va_API_APPLE_AUTH_CHIP_ON_OFF=1\n' > "$FAKE_ROOT/tmp/hmi_coding_dump.txt"
 
 printf '05ac\n' > "$FAKE_ROOT/sys/bus/usb/devices/1-1/idVendor"
 printf '12a8\n' > "$FAKE_ROOT/sys/bus/usb/devices/1-1/idProduct"
@@ -116,6 +120,7 @@ printf 'interface=wlan0\nssid=BMW-CarPlay\nchannel=36\nwpa_passphrase=SUPERSECRE
 : > "$FAKE_ROOT/usr/local/lib/libdns_sd.so.0"
 : > "$FAKE_ROOT/usr/local/lib/libvmostclient.so.1"
 : > "$FAKE_ROOT/opt/hmi/lib/libAppFramework.A.so"
+: > "$FAKE_ROOT/opt/hmi/lib/libhmicoding.so"
 : > "$FAKE_ROOT/opt/app/usr/MediaPlayer/bin/CARPLAY"
 
 # ---- 2. Create stubbed commands in STUB_BIN ----
@@ -159,7 +164,18 @@ cat > "$STUB_BIN/fake-carplayd" <<'EOF'
 echo "@ok|libasound|libasound.so.2 (10/10 symbols)"
 echo "@ok|alps|pid=101 slot=5"
 echo "@ok|tap|/dev/net/tun openable"
+echo "@info|mfi|disabled (default off)"
 exit 0
+EOF
+cat > "$STUB_BIN/i2cget" <<EOF
+#!/bin/sh
+echo "CALLED \$*" >> "$TMP_BASE/i2cget_calls.log"
+echo "0x05"
+EOF
+cat > "$STUB_BIN/i2cset" <<EOF
+#!/bin/sh
+echo "CALLED \$*" >> "$TMP_BASE/i2cset_calls.log"
+exit 99
 EOF
 chmod +x "$STUB_BIN"/*
 
@@ -197,7 +213,15 @@ for f in MANIFEST.txt SUMMARY.txt bt_probe.txt usb_probe.txt wifi_wland.txt vmos
 done
 
 # Check key summary & redaction invariants
+if [ -e "$TMP_BASE/i2cget_calls.log" ] || [ -e "$TMP_BASE/i2cset_calls.log" ]; then
+    echo "FAIL: default car_visit.sh invoked i2cget or i2cset!" >&2
+    exit 1
+fi
 grep -q 'adv7182' "$VISIT_DIR/i2c_mfi.txt"
+grep -q 'pid=102 comm=CARPLAY' "$VISIT_DIR/i2c_mfi.txt"
+grep -q 'i2cget=' "$VISIT_DIR/i2c_mfi.txt"
+grep -q 'va_API_APPLE_AUTH_CHIP_ON_OFF=1' "$VISIT_DIR/i2c_mfi.txt"
+grep -q 'skipped (default read-only mode' "$VISIT_DIR/i2c_mfi.txt"
 grep -q '05ac' "$VISIT_DIR/usb_probe.txt"
 grep -q '15032' "$VISIT_DIR/bt_probe.txt"
 grep -q 'wpa_passphrase=<REDACTED>' "$VISIT_DIR/wifi_wland.txt"
@@ -208,8 +232,30 @@ fi
 grep -q '1.1 ALPS' "$VISIT_DIR/SUMMARY.txt"
 grep -q '4.4 HMI Plugin ABI' "$VISIT_DIR/SUMMARY.txt"
 grep -q '5.1 I2C buses' "$VISIT_DIR/SUMMARY.txt"
+grep -q '5.2 /dev/i2c-\* FD owners' "$VISIT_DIR/SUMMARY.txt"
+grep -q '5.3 i2c-tools & coding refs' "$VISIT_DIR/SUMMARY.txt"
+grep -q '5.4 Optional CP version' "$VISIT_DIR/SUMMARY.txt"
 grep -q '@ok|libasound|' "$VISIT_DIR/compat.txt"
-echo "[PASS] car_visit.sh fake-root probe, tarball, redaction, and VEHICLE_FACTS summary"
+
+# Explicit --mfi-read run invokes i2cget only when requested
+OUT_DIR_MFI="$TMP_BASE/visit_out_mfi"
+mkdir -p "$OUT_DIR_MFI"
+PATH="$STUB_BIN:$PATH" sh scripts/probe/car_visit.sh \
+    --probe-root "$FAKE_ROOT" \
+    --out-dir "$OUT_DIR_MFI" \
+    --daemon "$STUB_BIN/fake-carplayd" \
+    --mfi-read \
+    --no-tar \
+    --timeout 2 >/dev/null
+[ -s "$TMP_BASE/i2cget_calls.log" ]
+if [ -e "$TMP_BASE/i2cset_calls.log" ]; then
+    echo "FAIL: car_visit.sh --mfi-read invoked i2cset!" >&2
+    exit 1
+fi
+VISIT_MFI_DIR=$(find "$OUT_DIR_MFI" -mindepth 1 -maxdepth 1 -type d | head -n 1)
+grep -q 'bus=0 addr=0x10 reg=0x00: 0x05' "$VISIT_MFI_DIR/i2c_mfi.txt"
+
+echo "[PASS] car_visit.sh fake-root probe, tarball, redaction, MFi gating, and VEHICLE_FACTS summary"
 
 # ---- 4. Test install.sh + uninstall.sh (--dry-run, safe defaults, byte-for-byte restore) ----
 mkdir -p \
@@ -253,6 +299,7 @@ sh scripts/deploy/install.sh --root "$FAKE_ROOT" --stage "$STAGE_DIR" --with-sys
 grep -q '^wireless=0$' "$FAKE_ROOT/var/local/data/CarPlay/carplay.conf"
 grep -q '^wired=0$' "$FAKE_ROOT/var/local/data/CarPlay/carplay.conf"
 grep -q '^detach_usbfs_driver=0$' "$FAKE_ROOT/var/local/data/CarPlay/carplay.conf"
+grep -q '^# mfi_i2c=' "$FAKE_ROOT/var/local/data/CarPlay/carplay.conf"
 
 # 4c. Uninstall dry-run makes ZERO changes
 sh scripts/deploy/uninstall.sh --root "$FAKE_ROOT" --dry-run | grep -q '^\[dry-run\]'

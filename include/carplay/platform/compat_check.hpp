@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "carplay/platform/bt_transport.hpp"
+#include "carplay/platform/mfi_i2c.hpp"
 #include "carplay/platform/service_contract.hpp"
 
 namespace carplay {
@@ -73,6 +74,9 @@ const CompatLibGroupSpec* compatRuntimeLibGroups(size_t& count_out);
 struct CompatCheckConfig {
     bool usb_mode;
     bool check_ilm;
+    bool has_mfi_i2c_override;
+    MfiI2cConfig mfi_i2c_config;
+    bool compat_mfi_read;
     std::string data_dir;
     std::string state_file;
     std::string config_file;
@@ -86,6 +90,9 @@ struct CompatCheckConfig {
     CompatCheckConfig()
         : usb_mode(false),
           check_ilm(true),
+          has_mfi_i2c_override(false),
+          mfi_i2c_config(),
+          compat_mfi_read(false),
           data_dir(contract::kDataDir),
           state_file(contract::kStateFile),
           config_file(contract::kConfigFile),
@@ -141,6 +148,11 @@ public:
                                 std::string& detail_out) = 0;
     virtual bool checkWritableDir(const std::string& dir_path, std::string& detail_out) = 0;
     virtual bool pathExists(const std::string& path) = 0;
+    virtual bool queryI2cMfi(const MfiI2cConfig& mfi_cfg,
+                             bool probe_version_reg,
+                             std::string& detail_out,
+                             bool& accessible_out,
+                             bool& funcs_ok_out) = 0;
 };
 
 class PosixCompatSystemOps : public CompatSystemOps {
@@ -185,6 +197,11 @@ public:
                                 std::string& detail_out);
     virtual bool checkWritableDir(const std::string& dir_path, std::string& detail_out);
     virtual bool pathExists(const std::string& path);
+    virtual bool queryI2cMfi(const MfiI2cConfig& mfi_cfg,
+                             bool probe_version_reg,
+                             std::string& detail_out,
+                             bool& accessible_out,
+                             bool& funcs_ok_out);
 
 private:
     PosixCompatSystemOps(const PosixCompatSystemOps&) = delete;

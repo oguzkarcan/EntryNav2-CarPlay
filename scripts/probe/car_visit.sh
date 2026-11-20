@@ -24,6 +24,7 @@ OUT_DIR=${CARPLAY_VISIT_OUT:-}
 DAEMON_BIN=${CARPLAYD_BIN:-}
 CMD_TIMEOUT=${CARPLAY_VISIT_TIMEOUT:-5}
 MAKE_TAR=1
+MFI_READ=0
 
 usage() {
     cat <<'EOF'
@@ -32,6 +33,8 @@ Usage: car_visit.sh [options]
   --daemon PATH        Path to carplayd binary for --compat check
   --probe-root PATH    Fake root prefix for host CI testing (or PROBE_ROOT env)
   --timeout SEC        Per-command timeout in seconds (default: 5)
+  --mfi-read           OPT-IN: read CP version reg 0x00 at 0x10/0x11 via i2cget
+                       (RISK: may contend with BMW MediaPlayer/CARPLAY on /dev/i2c-0)
   --no-tar             Skip creating the .tar.gz / .tar archive
   -h, --help           Show help
 EOF
@@ -47,6 +50,8 @@ while [ "$#" -gt 0 ]; do
             R=$2; export PROBE_ROOT="$R"; shift 2 ;;
         --timeout)
             CMD_TIMEOUT=$2; shift 2 ;;
+        --mfi-read)
+            MFI_READ=1; shift ;;
         --no-tar)
             MAKE_TAR=0; shift ;;
         -h|--help)
@@ -379,6 +384,75 @@ I2C_FILE="$WORK_DIR/i2c_mfi.txt"
     if [ -r "$R/proc/modules" ]; then
         grep -iE 'i2c|mfi|iap|apple' "$R/proc/modules" 2>/dev/null || printf '(no matching i2c/mfi modules)\n'
     fi
+
+    section_hdr "Processes holding /dev/i2c-* open (/proc/*/fd)"
+    found_i2c_fd=0
+    for pdir in "$R"/proc/[0-9]*; do
+        [ -d "$pdir/fd" ] || continue
+        pid=${pdir##*/}
+        hits=$(ls -l "$pdir/fd" 2>/dev/null | grep -E 'i2c|iap|mfi' || true)
+        if [ -n "$hits" ]; then
+            found_i2c_fd=1
+            pcomm=""
+            [ -r "$pdir/comm" ] && pcomm=$(tr -d '\r\n' < "$pdir/comm" 2>/dev/null || true)
+            printf 'pid=%s comm=%s\n' "$pid" "${pcomm:-unknown}"
+            printf '%s\n' "$hits" | sed 's/^/  /'
+        fi
+    done
+    if [ "$found_i2c_fd" -eq 0 ]; then
+        printf '(no open /dev/i2c-*, /dev/iap*, or /dev/mfi* file descriptors found)\n'
+    fi
+
+    section_hdr "Apple / MediaPlayer / MFi processes"
+    (ps -ef 2>/dev/null || ps w 2>/dev/null || ps 2>/dev/null) | \
+        grep -iE 'carplay|mediaplayer|mfi|iap' | grep -v 'grep' || printf '(no matching carplay/mediaplayer/mfi/iap processes)\n'
+
+    section_hdr "i2c-tools availability"
+    for tool in i2cdetect i2cget i2cset i2ctransfer; do
+        if tpath=$(command -v "$tool" 2>/dev/null); then
+            printf '%s=%s\n' "$tool" "$tpath"
+        else
+            printf '%s=absent\n' "$tool"
+        fi
+    done
+
+    section_hdr "Coding / MFi diagnostic references (read-only)"
+    ls -la "$R/opt/hmi/lib/libhmicoding.so" "$R/usr/local/lib/libauxin-apple.so.0" \
+        "$R/opt/app/usr/MediaPlayer/bin/CARPLAY" 2>/dev/null || printf '(some Apple/coding binaries absent)\n'
+    if [ -d "$R/tmp" ]; then
+        found_coding_ref=0
+        for f in "$R"/tmp/* "$R"/tmp/*/*; do
+            [ -f "$f" ] || continue
+            case "$f" in
+                "$OUT_DIR"/*|"$WORK_DIR"/*|*/carplay-visit-*) continue ;;
+            esac
+            m=$(grep -niE 'va_API_APPLE_AUTH_CHIP_ON_OFF|va_ENT_IAP2_SUPPORT|va_CARPLAY_SWT|va_ENT_BTAS_IAP|mfi|iap2|carplay' "$f" 2>/dev/null | head -n 10 || true)
+            if [ -n "$m" ]; then
+                found_coding_ref=1
+                printf '[%s]\n%s\n' "${f#"$R"}" "$m"
+            fi
+        done
+        if [ "$found_coding_ref" -eq 0 ]; then
+            printf '(no coding/MFi matches in readable /tmp files)\n'
+        fi
+    fi
+
+    section_hdr "Optional MFi I2C CP version probe (--mfi-read)"
+    if [ "$MFI_READ" -eq 1 ]; then
+        if command -v i2cget >/dev/null 2>&1; then
+            for bus in 0 1; do
+                [ -e "$R/dev/i2c-$bus" ] || continue
+                for addr in 0x10 0x11; do
+                    printf 'bus=%s addr=%s reg=0x00: ' "$bus" "$addr"
+                    run_to "$CMD_TIMEOUT" i2cget -y "$bus" "$addr" 0x00 b
+                done
+            done
+        else
+            printf 'i2cget: not installed (cannot read CP version register)\n'
+        fi
+    else
+        printf 'skipped (default read-only mode; pass --mfi-read only when MediaPlayer/CARPLAY is idle)\n'
+    fi
 } > "$I2C_FILE"
 
 # ---- 8. Daemon --compat self-check ----
@@ -448,7 +522,10 @@ SUMMARY_FILE="$WORK_DIR/SUMMARY.txt"
     printf '  4.3 vMOST controller (E5.01/E5.03)      -> %s\n' "$(find_match_line "$VMOST_MDNS_FILE" 'vmostctl|E5|libvmostclient')"
     printf '  4.4 HMI Plugin ABI (vtable 172 B)       -> %s\n' "$(find_match_line "$HMI_FILE" '_ZTVN3bmw9PluginAppE|libAppFramework')"
     printf '  4.5 Video/Audio HW (xsvideo/drm/alsa)   -> %s\n' "$(find_match_line "$HMI_FILE" 'carplay_alt|mic1|libxsvideo|cards')"
-    printf '  5.1 I2C buses & devices (MFi research)  -> %s\n\n' "$(find_match_line "$I2C_FILE" 'I2C |/dev/i2c')"
+    printf '  5.1 I2C buses & devices (VF §3 MFi)     -> %s\n' "$(find_match_line "$I2C_FILE" 'I2C |/dev/i2c')"
+    printf '  5.2 /dev/i2c-* FD owners (VF §3 MFi)    -> %s\n' "$(find_match_line "$I2C_FILE" 'pid=|CARPLAY|MediaPlayer|no open /dev/i2c')"
+    printf '  5.3 i2c-tools & coding refs (VF §3 MFi) -> %s\n' "$(find_match_line "$I2C_FILE" 'i2cget=|libhmicoding|va_API_APPLE')"
+    printf '  5.4 Optional CP version (--mfi-read)    -> %s\n\n' "$(find_match_line "$I2C_FILE" 'bus=.*addr=|skipped|i2cget: not installed')"
 
     printf '[Daemon --compat Summary]\n'
     cat "$COMPAT_FILE" 2>/dev/null || true
