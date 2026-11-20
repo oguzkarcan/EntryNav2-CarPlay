@@ -1764,7 +1764,11 @@ TEST_CASE(evoVideoReconfigureOver720pAndSpsPpsCache) {
     {
         LockGuard lock(g_xsv.mu);
         REQUIRE(g_xsv.submitted_frames.size() == 5U);
-        std::vector<uint8_t> expected_big(new_sps_pps, new_sps_pps + sizeof(new_sps_pps));
+        // Reserve first: GCC 15 reports a false -Warray-bounds on inserting into
+        // a vector sized exactly from a 16-byte array.
+        std::vector<uint8_t> expected_big;
+        expected_big.reserve(sizeof(new_sps_pps) + big_idr.size());
+        expected_big.insert(expected_big.end(), new_sps_pps, new_sps_pps + sizeof(new_sps_pps));
         expected_big.insert(expected_big.end(), big_idr.begin(), big_idr.end());
         CHECK_BYTES_EQ(expected_big, g_xsv.submitted_frames[4]);
     }
