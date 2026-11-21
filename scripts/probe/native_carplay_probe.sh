@@ -151,6 +151,23 @@ redact_line() {
     sed -e 's/\([Pp]assphrase\|[Pp]assword\|wpa_psk\|[Ss]ecret\|[Tt]oken\|[Aa]uth[Kk]ey\|[Ss]erial\|[Vv][Ii][Nn]\|[Uu][Dd][Ii][Dd]\|[Ii][Mm][Ee][Ii]\)[=:][^ ;,]*/\1=<REDACTED>/g'
 }
 
+is_target_proc() {
+    pid=$1
+    comm=$2
+    cmdline=$3
+    [ "$pid" = "$$" ] && return 1
+    case "$comm" in
+        sh|bash|ash|dash|busybox|su|sudo|ssh|sshd|timeout|grep|awk|sed)
+            return 1 ;;
+    esac
+    argv0=${cmdline%% *}
+    exe_base=${argv0##*/}
+    if printf '%s\n%s\n' "$comm" "$exe_base" | grep -qiE '^(carplay|ddpserver|mediaplayer|mediamanagement|vmostauxinusb|auxinucm)'; then
+        return 0
+    fi
+    return 1
+}
+
 dump_proc_target() {
     pdir=$1
     pid=${pdir##*/}
@@ -183,7 +200,7 @@ dump_proc_target() {
 
     printf '[maps]\n'
     if [ -r "$pdir/maps" ]; then
-        head -n 160 "$pdir/maps" 2>/dev/null || true
+        head -n 300 "$pdir/maps" 2>/dev/null || true
     else
         printf '(maps unreadable)\n'
     fi
@@ -238,14 +255,12 @@ sample_watch_tick() {
         [ "$found_apple" -eq 0 ] && printf 'USB: no 05ac device attached\n'
     fi
 
-    for pdir in "$R"/proc/[0-9]*; do
-        [ -d "$pdir" ] || continue
-        pid=${pdir##*/}
-        comm=""
-        cmdline=""
-        [ -r "$pdir/comm" ] && comm=$(read_attr "$pdir/comm")
-        [ -r "$pdir/cmdline" ] && cmdline=$(tr '\0' ' ' < "$pdir/cmdline" 2>/dev/null || true)
-        if printf '%s %s\n' "$comm" "$cmdline" | grep -qiE 'carplay|ddpserver|mediaplayer|mediamanagement|vmostauxinusb|auxinucm'; then
+    if [ -n "$WATCH_PIDS" ]; then
+        for pid in $WATCH_PIDS; do
+            pdir="$R/proc/$pid"
+            [ -d "$pdir" ] || continue
+            comm=""
+            [ -r "$pdir/comm" ] && comm=$(read_attr "$pdir/comm")
             hits=$(ls -l "$pdir/fd" 2>/dev/null | grep -E '/dev/bus/usb|hid|i2c|mdns|ffs|/tmp/Mediaplayer' || true)
             if [ -n "$hits" ]; then
                 printf 'FD pid=%s comm=%s:\n' "$pid" "${comm:-unknown}"
@@ -253,15 +268,19 @@ sample_watch_tick() {
             else
                 printf 'FD pid=%s comm=%s: (no usb/hid/i2c/mdns/ffs fds)\n' "$pid" "${comm:-unknown}"
             fi
-        fi
-    done
+        done
+    else
+        printf 'FD: (no cached CARPLAY/DDPServer/MediaPlayer target PIDs)\n'
+    fi
 
-    for f in "$R"/tmp/Mediaplayer/*DDPS* "$R"/tmp/Mediaplayer/*CARPLAY*; do
+    for f in "$R"/tmp/Mediaplayer/*DDPS* "$R"/tmp/Mediaplayer/*CARPLAY* "$R"/tmp/Mediaplayer/*USBC*; do
         [ -f "$f" ] || continue
         ls -l "$f" 2>/dev/null || true
         tail -n 5 "$f" 2>/dev/null | redact_line | sed 's/^/  /' || true
     done
 }
+
+WATCH_PIDS=""
 
 {
     printf 'EntryNav2-CarPlay Native CarPlay / DDPServer Probe (%s)\n' "$TS"
@@ -271,12 +290,14 @@ sample_watch_tick() {
     found_target=0
     for pdir in "$R"/proc/[0-9]*; do
         [ -d "$pdir" ] || continue
+        pid=${pdir##*/}
         comm=""
         cmdline=""
         [ -r "$pdir/comm" ] && comm=$(read_attr "$pdir/comm")
         [ -r "$pdir/cmdline" ] && cmdline=$(tr '\0' ' ' < "$pdir/cmdline" 2>/dev/null || true)
-        if printf '%s %s\n' "$comm" "$cmdline" | grep -qiE 'carplay|ddpserver|mediaplayer|mediamanagement|vmostauxinusb|auxinucm'; then
+        if is_target_proc "$pid" "$comm" "$cmdline"; then
             found_target=1
+            WATCH_PIDS="$WATCH_PIDS $pid"
             dump_proc_target "$pdir"
         fi
     done

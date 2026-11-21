@@ -25,6 +25,7 @@ mkdir -p "$STUB_BIN" "$OUT_DIR"
 # ---- 1. Build realistic HU_ENTRYNAV2 fake root ----
 mkdir -p \
     "$FAKE_ROOT/etc/dbus-1/system.d" \
+    "$FAKE_ROOT/etc/wayland" \
     "$FAKE_ROOT/etc/layermanager" \
     "$FAKE_ROOT/etc/systemd/system" \
     "$FAKE_ROOT/lib/modules/3.12.25-FR21.0/kernel/drivers/net/usb" \
@@ -49,6 +50,8 @@ mkdir -p \
     "$FAKE_ROOT/proc/101/net" \
     "$FAKE_ROOT/proc/102/net" \
     "$FAKE_ROOT/proc/103/net" \
+    "$FAKE_ROOT/proc/104/fd" \
+    "$FAKE_ROOT/proc/104/net" \
     "$FAKE_ROOT/tmp/Mediaplayer" \
     "$FAKE_ROOT/var/local/data/MediaPlayer" \
     "$FAKE_ROOT/proc/sys/net/ipv6/conf/all" \
@@ -64,6 +67,7 @@ mkdir -p \
     "$FAKE_ROOT/sys/class/udc/48890000.usb"
 
 printf '202402191339\n' > "$FAKE_ROOT/etc/version"
+printf 'genivi-flip-renderorder = 1\n' > "$FAKE_ROOT/etc/wayland/compositor.conf"
 printf 'genivi-flip-renderorder=1\n' > "$FAKE_ROOT/etc/layermanager/compositor.conf"
 printf 'pcm.carplay_alt { type dshare }\npcm.mic1 { type dsnoop }\n' > "$FAKE_ROOT/etc/asound.conf"
 printf '0 - dra7-entryevo\n' > "$FAKE_ROOT/proc/asound/cards"
@@ -102,6 +106,10 @@ printf 'Num RefCount Protocol Flags Type St Inode Path\n00000000: 00000002 00000
 ln -s /dev/i2c-0 "$FAKE_ROOT/proc/103/fd/40"
 printf '[Unit]\nDescription=CARPLAY\n[Service]\nUser=carplay\nExecStart=/usr/local/bin/CARPLAY\n' > "$FAKE_ROOT/etc/systemd/system/CARPLAY.service"
 printf '393.76 DDPS NmeIAP2Link OnNowPlayingUpdate\n' > "$FAKE_ROOT/tmp/Mediaplayer/103_DDPS_1.txt"
+printf '400.10 USBC USB connected iPod\n' > "$FAKE_ROOT/tmp/Mediaplayer/104_USBC_1.txt"
+printf 'sh\n' > "$FAKE_ROOT/proc/104/comm"
+printf 'sh\0-c\0sh /tmp/car_visit.sh --native --watch 20\0' > "$FAKE_ROOT/proc/104/cmdline"
+printf 'Name:\tsh\nUid:\t0\t0\t0\t0\n' > "$FAKE_ROOT/proc/104/status"
 printf 'va_API_APPLE_AUTH_CHIP_ON_OFF=1\n' > "$FAKE_ROOT/tmp/hmi_coding_dump.txt"
 
 printf '05ac\n' > "$FAKE_ROOT/sys/bus/usb/devices/1-1/idVendor"
@@ -305,8 +313,14 @@ tar -xf "$NAT_TAR" -C "$UNPACK_NAT"
 NAT_VISIT_DIR=$(find "$UNPACK_NAT" -mindepth 1 -maxdepth 1 -type d | head -n 1)
 [ -f "$NAT_VISIT_DIR/native_carplay.txt" ]
 grep -q 'N.1 CARPLAY/DDPServer/MediaPlayer procs' "$NAT_VISIT_DIR/SUMMARY.txt"
+! grep -E 'N\.2 .*:7:cmdline:' "$NAT_VISIT_DIR/SUMMARY.txt"
+grep -qE 'N\.2 .*genivi-flip-renderorder|/etc/wayland/compositor\.conf' "$NAT_VISIT_DIR/SUMMARY.txt"
 grep -q 'comm=CARPLAY' "$NAT_VISIT_DIR/native_carplay.txt"
 grep -q 'comm=DDPServer' "$NAT_VISIT_DIR/native_carplay.txt"
+if grep -q 'comm=sh' "$NAT_VISIT_DIR/native_carplay.txt" || grep -q 'comm=sh ' "$NAT_VISIT_DIR/usb_probe.txt"; then
+    echo "FAIL: wrapper sh process falsely matched as CARPLAY/MediaPlayer target!" >&2
+    exit 1
+fi
 grep -q 'CARPLAY_SECRET_TOKEN=<REDACTED>' "$NAT_VISIT_DIR/native_carplay.txt"
 grep -q 'API_KEY=<REDACTED>' "$NAT_VISIT_DIR/native_carplay.txt"
 if grep -qE 'TOPSECRETVALUE999|DO_NOT_LEAK' "$NAT_VISIT_DIR/native_carplay.txt"; then
@@ -315,6 +329,7 @@ if grep -qE 'TOPSECRETVALUE999|DO_NOT_LEAK' "$NAT_VISIT_DIR/native_carplay.txt";
 fi
 grep -q 'WATCH SAMPLE 1/1' "$NATIVE_STAND_DIR/native_carplay.txt"
 grep -q '05ac' "$NATIVE_STAND_DIR/native_carplay.txt"
+grep -q '104_USBC_1.txt' "$NATIVE_STAND_DIR/native_carplay.txt"
 
 echo "[PASS] car_visit.sh + native_carplay_probe.sh (--native, --watch, redaction, read-only)"
 

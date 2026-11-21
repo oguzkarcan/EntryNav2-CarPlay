@@ -22,15 +22,17 @@ public:
     EvoIlm();
     EvoIlm(const std::string& ctl_path, const std::string& compositor_conf_path);
 
-    /// Reads `genivi-flip-renderorder` from the Wayland compositor configuration.
-    /// When `top_first == true`, the first entry in a render-order list is on top.
-    /// Fails closed (returns false) if the file cannot be read or the key is invalid/duplicated.
+    /// Reads `genivi-flip-renderorder` from the Wayland compositor configuration (probing
+    /// `/etc/layermanager/compositor.conf` if the default `/etc/wayland/compositor.conf` cannot
+    /// be opened). When no configuration file can be opened, falls back to the verified EntryNav2
+    /// value (`top_first = true`, `genivi-flip-renderorder = 1`). Still fails closed if a
+    /// readable configuration file has an invalid/duplicated key or cannot be read to EOF.
     bool renderOrderTopFirst(bool& top_first);
 
     /// Attaches `surface_id` to `layer_id` hidden, with source and destination regions (0,0,w,h).
     /// Existing surfaces keep their relative order; `surface_id` is placed on top according to
-    /// `renderOrderTopFirst()`. Refuses before issuing any `set` command if direction or current
-    /// layer render order cannot be established.
+    /// `renderOrderTopFirst()`. Refuses before issuing any `set` command if a readable compositor
+    /// configuration is invalid or the current layer render order cannot be established.
     bool attachSurface(uint32_t surface_id, uint32_t layer_id, uint32_t w, uint32_t h);
 
     /// Attaches an overlay `surface_id` above all surfaces on `layer_id` with source (0,0,w,h)

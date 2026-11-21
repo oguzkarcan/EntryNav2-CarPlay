@@ -916,6 +916,37 @@ TEST_CASE(evoIlmCliExecutionAndValidation) {
     CHECK(!ilm_flip.attachSurface(0x7ec00001U, 0x80000000U, 800U, 480U));
     unsetenv("CARPLAY_TEST_NO_EFFECT");
 
+    // Absent compositor config falls back safely to EntryNav2 verified top_first = true.
+    {
+        const std::string missing_conf = "/tmp/carplay-nonexistent-compositor-" +
+                                         std::string(log_path.substr(log_path.size() - 6U));
+        unlink(missing_conf.c_str());
+        EvoIlm ilm_missing(g_self_exe, missing_conf);
+        bool top_first = false;
+        CHECK(ilm_missing.renderOrderTopFirst(top_first));
+        CHECK(top_first);
+        setenv("CARPLAY_TEST_ORDER", "0(0x0), ", 1);
+        resetLogAndOrder(log_path.c_str());
+        CHECK(ilm_missing.attachSurface(0x7ec00001U, 0x80000000U, 800U, 480U));
+        log_text = readFileText(log_path.c_str());
+        CHECK(log_text.find("set layer 0x80000000 render order 0x7ec00001,0x0") != std::string::npos);
+    }
+
+    // Corrupt/invalid readable compositor config still fails closed.
+    {
+        const std::string conf_bad = makeTempFile("carplay-conf-bad");
+        REQUIRE(!conf_bad.empty());
+        writeFileText(conf_bad.c_str(), "genivi-flip-renderorder = 2\n");
+        EvoIlm ilm_bad(g_self_exe, conf_bad);
+        bool top_first = true;
+        CHECK(!ilm_bad.renderOrderTopFirst(top_first));
+        setenv("CARPLAY_TEST_ORDER", "0(0x0), ", 1);
+        resetLogAndOrder(log_path.c_str());
+        CHECK(!ilm_bad.attachSurface(0x7ec00001U, 0x80000000U, 800U, 480U));
+        CHECK(readFileText(log_path.c_str()).find("set ") == std::string::npos);
+        unlink(conf_bad.c_str());
+    }
+
     unsetenv("CARPLAY_TEST_LM_LOG");
     unsetenv("CARPLAY_TEST_ORDER");
     unlink((log_path + ".order").c_str());

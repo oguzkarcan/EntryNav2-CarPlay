@@ -199,15 +199,22 @@ mp_found=0
 for pdir in "$R"/proc/[0-9]*; do
     [ -d "$pdir" ] || continue
     pid=${pdir##*/}
+    [ "$pid" = "$$" ] && continue
     comm=""
     cmdline=""
     if [ -r "$pdir/comm" ]; then
         comm=$(read_attr "$pdir/comm")
     fi
+    case "$comm" in
+        sh|bash|ash|dash|busybox|su|sudo|ssh|sshd|timeout|grep|awk|sed)
+            continue ;;
+    esac
     if [ -r "$pdir/cmdline" ]; then
         cmdline=$(tr '\0' ' ' < "$pdir/cmdline" 2>/dev/null || true)
     fi
-    if printf '%s %s\n' "$comm" "$cmdline" | grep -qiE 'mediaplayer|carplay|auxin|apple|ipod|usbmux|ddpserver'; then
+    argv0=${cmdline%% *}
+    exe_base=${argv0##*/}
+    if printf '%s\n%s\n' "$comm" "$exe_base" | grep -qiE '^(mediaplayer|mediamanagement|carplay|carlife|vmostauxin|auxin|apple|ipod|usbmux|ddpserver)'; then
         mp_found=1
         echo "pid=$pid comm=${comm:-unknown} cmdline=$cmdline"
     fi

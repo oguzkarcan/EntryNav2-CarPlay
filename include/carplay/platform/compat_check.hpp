@@ -100,7 +100,7 @@ struct CompatCheckConfig {
           usbfs_dir("/dev/bus/usb"),
           hmi_lib_dir("/opt/hmi/lib"),
           ilm_ctl_path("LayerManagerControl"),
-          compositor_conf_path("/etc/layermanager/compositor.conf") {
+          compositor_conf_path("/etc/wayland/compositor.conf") {
         extra_lib_dirs.push_back("/usr/local/lib");
         extra_lib_dirs.push_back("/opt/hmi/lib");
     }

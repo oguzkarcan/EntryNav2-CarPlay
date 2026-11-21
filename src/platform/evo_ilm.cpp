@@ -104,7 +104,26 @@ bool EvoIlm::parseRenderOrderFlip(const std::string& conf, bool& top_first) {
 }
 
 bool EvoIlm::renderOrderTopFirst(bool& top_first) {
-    std::ifstream file(compositor_conf_.c_str(), std::ios::in | std::ios::binary);
+    std::string active_conf = compositor_conf_;
+    std::ifstream file(active_conf.c_str(), std::ios::in | std::ios::binary);
+    if (!file.is_open() && active_conf == "/etc/wayland/compositor.conf") {
+        const char* fallback_conf = "/etc/layermanager/compositor.conf";
+        std::ifstream alt(fallback_conf, std::ios::in | std::ios::binary);
+        if (alt.is_open()) {
+            active_conf = fallback_conf;
+            file.open(active_conf.c_str(), std::ios::in | std::ios::binary);
+        }
+    }
+    if (!file.is_open()) {
+        // Verified EntryNav2 compositor (/etc/wayland/compositor.conf, 2026-11-21 visit 2) uses
+        // genivi-flip-renderorder = 1 (top-first); do not fail closed when absent.
+        CARPLAY_LOG_WARN("ilm",
+                         "compositor configuration absent/unreadable (%s); using verified "
+                         "EntryNav2 fallback top_first=1",
+                         compositor_conf_.c_str());
+        top_first = true;
+        return true;
+    }
     std::string text;
     char buf[4096];
     while (file && text.size() <= 65536U) {
@@ -112,12 +131,12 @@ bool EvoIlm::renderOrderTopFirst(bool& top_first) {
         text.append(buf, static_cast<size_t>(file.gcount()));
     }
     if (!file.eof() || text.size() > 65536U) {
-        CARPLAY_LOG_ERROR("ilm", "compositor configuration unreadable (%s)", compositor_conf_.c_str());
+        CARPLAY_LOG_ERROR("ilm", "compositor configuration unreadable (%s)", active_conf.c_str());
         return false;
     }
     if (!parseRenderOrderFlip(text, top_first)) {
         CARPLAY_LOG_ERROR("ilm", "genivi-flip-renderorder invalid or duplicated in %s",
-                          compositor_conf_.c_str());
+                          active_conf.c_str());
         return false;
     }
     return true;

@@ -568,8 +568,8 @@ SUMMARY_FILE="$WORK_DIR/SUMMARY.txt"
 
     if [ "$NATIVE_PROBE" -eq 1 ]; then
         printf '[Native CarPlay / DDPServer (--native)]\n'
-        printf '  N.1 CARPLAY/DDPServer/MediaPlayer procs -> %s\n' "$(find_match_line "$NATIVE_FILE" 'PID .*comm=(CARPLAY|DDPServer|Media)')"
-        printf '  N.2 compositor/xml/config matches       -> %s\n' "$(find_match_line "$NATIVE_FILE" 'compositor\.conf|weston\.ini|caff|cafe|carplay')"
+        printf '  N.1 CARPLAY/DDPServer/MediaPlayer procs -> %s\n' "$(find_match_line "$NATIVE_FILE" '^--- PID [0-9]+ \(comm=(CARPLAY|DDPServer|Media)')"
+        printf '  N.2 compositor/xml/config matches       -> %s\n' "$(find_match_line "$NATIVE_FILE" '/etc/(wayland|layermanager)/compositor\.conf|genivi-flip-renderorder|CinemoCarPlay|supported_services')"
         printf '  N.3 D-Bus ListNames & policies          -> %s\n' "$(find_match_line "$NATIVE_FILE" 'org\.|dbus-send: not installed')"
         printf '  N.4 Journal/dmesg/DDPS logs             -> %s\n' "$(find_match_line "$NATIVE_FILE" 'journalctl|NmeIAP2|DDPS|i2c')"
         printf '  N.5 Live --watch samples                -> %s\n\n' "$(find_match_line "$NATIVE_FILE" 'WATCH SAMPLE|Live Plug/Unplug')"

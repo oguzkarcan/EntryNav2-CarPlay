@@ -276,6 +276,7 @@ const plat::CompatLine* findLine(const plat::CompatReport& r, const std::string&
 TEST_CASE(compatAllPassWithFakeOps) {
     FakeCompatSystemOps ops;
     plat::CompatCheckConfig cfg;
+    CHECK_EQ(std::string("/etc/wayland/compositor.conf"), cfg.compositor_conf_path);
     cfg.data_dir = "/tmp/nonexistent_carplay_data_compat_test";
     cfg.state_file = "/tmp/entry-carplayd-state";
     cfg.config_file = "/tmp/nonexistent_carplay_conf_compat_test";
