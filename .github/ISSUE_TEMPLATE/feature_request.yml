@@ -1,0 +1,20 @@
+name: Feature request
+description: Propose a new capability or improvement
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please review [PROGRESS.md](https://github.com/oguzkarcan/EntryNav2-CarPlay/blob/main/PROGRESS.md) and existing issues before opening a new request.
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Requested feature or improvement
+      description: Describe the use case in the vehicle, current behavior, and desired behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: details
+    attributes:
+      label: Implementation notes or references
+      description: Optional. Relevant head-unit interfaces, iAP2/AirPlay details, or constraints.

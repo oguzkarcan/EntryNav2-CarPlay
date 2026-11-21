@@ -1,0 +1,78 @@
+name: Bug report
+description: Report a problem on a head unit or during testing
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please follow the log collection instructions in [README.md](https://github.com/oguzkarcan/EntryNav2-CarPlay#collecting-logs-for-a-bug-report) before submitting.
+        Never post personal or vehicle-identifying information (VIN, Bluetooth/Wi-Fi MACs, phone name, serial numbers, UDID/IMEI, accessory identity UUID, or non-`169.254.x.x` IP addresses).
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      description: Release tag (e.g. `v0.1.0-alpha.1`) or full/short git commit SHA you built from.
+      placeholder: v0.1.0-alpha.1
+    validations:
+      required: true
+  - type: input
+    id: head_unit
+    attributes:
+      label: Head unit model and `/etc/version`
+      description: Vehicle model/year, head unit variant, and the contents of `/etc/version` on the head unit.
+      placeholder: 2017 BMW F20 HU_ENTRYNAV2, 202402191339
+    validations:
+      required: true
+  - type: input
+    id: iphone
+    attributes:
+      label: iPhone model and iOS version
+      description: Leave blank if the issue happens without a phone connected.
+      placeholder: iPhone 15, iOS 18.1
+  - type: dropdown
+    id: connection
+    attributes:
+      label: Connection type
+      options:
+        - Wired USB
+        - Wireless
+        - Safe-mode / --compat check only
+        - Not connected yet
+    validations:
+      required: true
+  - type: textarea
+    id: carplay_conf
+    attributes:
+      label: "`/var/local/data/CarPlay/carplay.conf` values"
+      description: Paste the active keys from `carplay.conf` (e.g. `wireless`, `wired`, `mfi_i2c`, `ddp_handoff`, `ddp_restore`, `detach_usbfs_driver`).
+      render: ini
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Numbered steps starting from head-unit boot or plugin launch.
+    validations:
+      required: true
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Expected vs. actual behavior
+      description: What you expected to happen and what actually happened on iDrive and the iPhone.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs (`app.log`, `entry-carplay-service.log`, `--compat`, `car_visit.sh`)
+      description: |
+        See [README.md#collecting-logs-for-a-bug-report](https://github.com/oguzkarcan/EntryNav2-CarPlay#collecting-logs-for-a-bug-report) for exact SSH/SCP commands.
+        Attach or paste `/var/local/data/CarPlay/app.log`, `/tmp/entry-carplay-service.log`, `carplayd --compat` output, and (if relevant) `journalctl`/`dmesg` tail or your redacted `carplay-visit-*.tar.gz` archive.
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy check
+      options:
+        - label: I have redacted any VIN, Bluetooth/Wi-Fi MAC addresses, phone name, serial numbers, UDID/IMEI, accessory identity UUID, and IP addresses other than `169.254.x.x` from all pasted text and attached files.
+          required: true

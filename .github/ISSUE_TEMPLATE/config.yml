@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Discussions / Questions
+    url: https://github.com/oguzkarcan/EntryNav2-CarPlay/discussions
+    about: Ask installation, usage, or development questions.
+  - name: Documentation (README)
+    url: https://github.com/oguzkarcan/EntryNav2-CarPlay#readme
+    about: Read installation, configuration, and log-collection instructions first.
+  - name: Security Advisory
+    url: https://github.com/oguzkarcan/EntryNav2-CarPlay/security/advisories/new
+    about: Report security vulnerabilities privately instead of opening a public issue.
