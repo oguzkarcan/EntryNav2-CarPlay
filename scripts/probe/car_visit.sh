@@ -25,6 +25,8 @@ DAEMON_BIN=${CARPLAYD_BIN:-}
 CMD_TIMEOUT=${CARPLAY_VISIT_TIMEOUT:-5}
 MAKE_TAR=1
 MFI_READ=0
+NATIVE_PROBE=0
+WATCH_SECS=0
 
 usage() {
     cat <<'EOF'
@@ -35,6 +37,8 @@ Usage: car_visit.sh [options]
   --timeout SEC        Per-command timeout in seconds (default: 5)
   --mfi-read           OPT-IN: read CP version reg 0x00 at 0x10/0x11 via i2cget
                        (RISK: may contend with BMW MediaPlayer/CARPLAY on /dev/i2c-0)
+  --native             Run Visit 2 native CARPLAY/DDPServer/MediaPlayer probe (native_carplay_probe.sh)
+  --watch SECS         Implies --native; sample USB/proc FDs every 2s for SECS seconds (max 120s)
   --no-tar             Skip creating the .tar.gz / .tar archive
   -h, --help           Show help
 EOF
@@ -52,6 +56,10 @@ while [ "$#" -gt 0 ]; do
             CMD_TIMEOUT=$2; shift 2 ;;
         --mfi-read)
             MFI_READ=1; shift ;;
+        --native)
+            NATIVE_PROBE=1; shift ;;
+        --watch)
+            WATCH_SECS=$2; NATIVE_PROBE=1; shift 2 ;;
         --no-tar)
             MAKE_TAR=0; shift ;;
         -h|--help)
@@ -63,6 +71,13 @@ while [ "$#" -gt 0 ]; do
     esac
 done
 
+case "$WATCH_SECS" in
+    ''|*[!0-9]*) WATCH_SECS=0 ;;
+esac
+if [ "$WATCH_SECS" -gt 120 ]; then
+    WATCH_SECS=120
+fi
+
 TS=$(date '+%Y%m%d-%H%M%S' 2>/dev/null || echo 'unknown-time')
 if [ -z "$OUT_DIR" ]; then
     OUT_DIR="/tmp/carplay-visit-$TS"
@@ -72,13 +87,12 @@ mkdir -p "$OUT_DIR"
 WORK_DIR="$OUT_DIR/carplay-visit-$TS"
 mkdir -p "$WORK_DIR"
 
-# Detect timeout syntax once (GNU coreutils: `timeout 5 cmd`, BusyBox: `timeout -t 5 cmd`)
+# Detect GNU coreutils timeout only. BusyBox `timeout -t` leaves lingering
+# reparented timer processes in `ps` and is avoided in favor of the POSIX watchdog.
 TIMEOUT_STYLE="none"
 if command -v timeout >/dev/null 2>&1; then
     if timeout 1 true >/dev/null 2>&1; then
         TIMEOUT_STYLE="gnu"
-    elif timeout -t 1 true >/dev/null 2>&1; then
-        TIMEOUT_STYLE="busybox"
     fi
 fi
 
@@ -88,8 +102,6 @@ run_to() {
     case "$TIMEOUT_STYLE" in
         gnu)
             timeout "$secs" "$@" 2>&1 || printf '[rc=%s]\n' "$?" ;;
-        busybox)
-            timeout -t "$secs" "$@" 2>&1 || printf '[rc=%s]\n' "$?" ;;
         *)
             "$@" 2>&1 &
             cmd_pid=$!
@@ -135,7 +147,7 @@ find_match_line() {
 # ---- 1. Bluetooth probe ----
 BT_FILE="$WORK_DIR/bt_probe.txt"
 if [ -r "$SCRIPT_DIR/bt_probe.sh" ]; then
-    PROBE_ROOT="$R" run_to "$((CMD_TIMEOUT * 4))" sh "$SCRIPT_DIR/bt_probe.sh" > "$BT_FILE"
+    PROBE_ROOT="$R" run_to "$((CMD_TIMEOUT * 6))" sh "$SCRIPT_DIR/bt_probe.sh" > "$BT_FILE"
 else
     printf 'bt_probe.sh not found at %s\n' "$SCRIPT_DIR/bt_probe.sh" > "$BT_FILE"
 fi
@@ -143,7 +155,7 @@ fi
 # ---- 2. USB probe ----
 USB_FILE="$WORK_DIR/usb_probe.txt"
 if [ -r "$SCRIPT_DIR/usb_probe.sh" ]; then
-    PROBE_ROOT="$R" run_to "$((CMD_TIMEOUT * 4))" sh "$SCRIPT_DIR/usb_probe.sh" > "$USB_FILE"
+    PROBE_ROOT="$R" run_to "$((CMD_TIMEOUT * 6))" sh "$SCRIPT_DIR/usb_probe.sh" > "$USB_FILE"
 else
     printf 'usb_probe.sh not found at %s\n' "$SCRIPT_DIR/usb_probe.sh" > "$USB_FILE"
 fi
@@ -213,11 +225,15 @@ VMOST_MDNS_FILE="$WORK_DIR/vmost_mdns.txt"
     ls -la "$R/var/run/vmost_sockstream" "$R/tmp/vmost_sockstream" "$R"/var/run/vmostd* \
         "$R"/usr/local/lib/libvmostclient.so* "$R/usr/local/bin/vmostctl" 2>/dev/null || printf '(some vMOST paths absent)\n'
     if command -v vmostctl >/dev/null 2>&1; then
-        run_to "$CMD_TIMEOUT" vmostctl --list-fblock
-        run_to "$CMD_TIMEOUT" vmostctl --apps
+        LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-/usr/local/lib:/opt/hmi/lib:/usr/lib:/lib}" \
+            run_to "$CMD_TIMEOUT" vmostctl --list-fblock
+        LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-/usr/local/lib:/opt/hmi/lib:/usr/lib:/lib}" \
+            run_to "$CMD_TIMEOUT" vmostctl --apps
     elif [ -x "$R/usr/local/bin/vmostctl" ]; then
-        run_to "$CMD_TIMEOUT" "$R/usr/local/bin/vmostctl" --list-fblock
-        run_to "$CMD_TIMEOUT" "$R/usr/local/bin/vmostctl" --apps
+        LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-/usr/local/lib:/opt/hmi/lib:/usr/lib:/lib}" \
+            run_to "$CMD_TIMEOUT" "$R/usr/local/bin/vmostctl" --list-fblock
+        LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-/usr/local/lib:/opt/hmi/lib:/usr/lib:/lib}" \
+            run_to "$CMD_TIMEOUT" "$R/usr/local/bin/vmostctl" --apps
     else
         printf 'vmostctl: not installed\n'
     fi
@@ -249,10 +265,14 @@ HMI_FILE="$WORK_DIR/hmi_display_audio.txt"
 {
     section_hdr "LayerManager / Wayland Display"
     ls -la "$R/run/system/0/wayland-0" "$R/etc/layermanager/compositor.conf" \
+        "$R/etc/wayland/compositor.conf" "$R/etc/xdg/weston/weston.ini" \
         "$R/dev/dri/card0" "$R/dev/cmem" "$R/dev/rpmsg-dce" 2>/dev/null || true
-    if [ -r "$R/etc/layermanager/compositor.conf" ]; then
-        grep -i 'genivi-flip-renderorder' "$R/etc/layermanager/compositor.conf" 2>/dev/null || true
-    fi
+    for cpath in "$R/etc/layermanager/compositor.conf" "$R/etc/wayland/compositor.conf"; do
+        if [ -r "$cpath" ]; then
+            printf '[%s]\n' "${cpath#"$R"}"
+            grep -i 'genivi-flip-renderorder' "$cpath" 2>/dev/null || true
+        fi
+    done
     if command -v LayerManagerControl >/dev/null 2>&1; then
         XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/system/0}" run_to "$CMD_TIMEOUT" LayerManagerControl get screens
         XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/system/0}" run_to "$CMD_TIMEOUT" LayerManagerControl get screen 0
@@ -488,6 +508,25 @@ fi
 } > "$COMPAT_FILE"
 rm -rf "$OUT_DIR/.compat_probe_tmp" "$OUT_DIR/.compat_probe_state" 2>/dev/null || true
 
+# ---- 8b. Optional Visit 2 native CARPLAY / DDPServer probe (--native) ----
+NATIVE_FILE="$WORK_DIR/native_carplay.txt"
+if [ "$NATIVE_PROBE" -eq 1 ]; then
+    if [ -r "$SCRIPT_DIR/native_carplay_probe.sh" ]; then
+        native_to=$((CMD_TIMEOUT * 6 + WATCH_SECS))
+        if [ "$WATCH_SECS" -gt 0 ]; then
+            PROBE_ROOT="$R" run_to "$native_to" sh "$SCRIPT_DIR/native_carplay_probe.sh" \
+                --probe-root "$R" --out-dir "$WORK_DIR" --out-file "$NATIVE_FILE" \
+                --timeout "$CMD_TIMEOUT" --watch "$WATCH_SECS" >/dev/null
+        else
+            PROBE_ROOT="$R" run_to "$native_to" sh "$SCRIPT_DIR/native_carplay_probe.sh" \
+                --probe-root "$R" --out-dir "$WORK_DIR" --out-file "$NATIVE_FILE" \
+                --timeout "$CMD_TIMEOUT" >/dev/null
+        fi
+    else
+        printf 'native_carplay_probe.sh not found at %s\n' "$SCRIPT_DIR/native_carplay_probe.sh" > "$NATIVE_FILE"
+    fi
+fi
+
 # ---- 9. Human-readable SUMMARY.txt mapped to docs/VEHICLE_FACTS.md ----
 SUMMARY_FILE="$WORK_DIR/SUMMARY.txt"
 {
@@ -526,6 +565,15 @@ SUMMARY_FILE="$WORK_DIR/SUMMARY.txt"
     printf '  5.2 /dev/i2c-* FD owners (VF §3 MFi)    -> %s\n' "$(find_match_line "$I2C_FILE" 'pid=|CARPLAY|MediaPlayer|no open /dev/i2c')"
     printf '  5.3 i2c-tools & coding refs (VF §3 MFi) -> %s\n' "$(find_match_line "$I2C_FILE" 'i2cget=|libhmicoding|va_API_APPLE')"
     printf '  5.4 Optional CP version (--mfi-read)    -> %s\n\n' "$(find_match_line "$I2C_FILE" 'bus=.*addr=|skipped|i2cget: not installed')"
+
+    if [ "$NATIVE_PROBE" -eq 1 ]; then
+        printf '[Native CarPlay / DDPServer (--native)]\n'
+        printf '  N.1 CARPLAY/DDPServer/MediaPlayer procs -> %s\n' "$(find_match_line "$NATIVE_FILE" 'PID .*comm=(CARPLAY|DDPServer|Media)')"
+        printf '  N.2 compositor/xml/config matches       -> %s\n' "$(find_match_line "$NATIVE_FILE" 'compositor\.conf|weston\.ini|caff|cafe|carplay')"
+        printf '  N.3 D-Bus ListNames & policies          -> %s\n' "$(find_match_line "$NATIVE_FILE" 'org\.|dbus-send: not installed')"
+        printf '  N.4 Journal/dmesg/DDPS logs             -> %s\n' "$(find_match_line "$NATIVE_FILE" 'journalctl|NmeIAP2|DDPS|i2c')"
+        printf '  N.5 Live --watch samples                -> %s\n\n' "$(find_match_line "$NATIVE_FILE" 'WATCH SAMPLE|Live Plug/Unplug')"
+    fi
 
     printf '[Daemon --compat Summary]\n'
     cat "$COMPAT_FILE" 2>/dev/null || true

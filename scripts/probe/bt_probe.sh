@@ -91,7 +91,8 @@ done
 section "Libraries matching *blue*, *bt*, *alps*, or libdbus in /lib /usr/lib /usr/local/lib /opt"
 for dir in "$R/lib" "$R/usr/lib" "$R/usr/local/lib" "$R/opt"; do
     if [ -d "$dir" ]; then
-        find "$dir" \( -name '*blue*' -o -name '*bt*' -o -name '*alps*' -o -name 'libdbus-1*' \) 2>/dev/null | sort || true
+        find "$dir" -path "$R/opt/hmi/data" -prune -o \
+            \( -name '*blue*' -o -name '*bt*' -o -name '*alps*' -o -name 'libdbus-1*' \) -print 2>/dev/null | sort || true
     fi
 done
 
@@ -112,7 +113,7 @@ if [ -r "$R/opt/app/usr/BTMedia/evolution/stack/lib/libevo_btappl.so" ]; then
     fi
 fi
 if [ -r "$R/opt/app/usr/BTMedia/evolution/stack/etc/evo_config.xml" ]; then
-    grep -iE 'spp|uuid|6203|instance|carplay' "$R/opt/app/usr/BTMedia/evolution/stack/etc/evo_config.xml" 2>/dev/null | head -n 40 || true
+    grep -iE 'caff|cafe|supported_services|carplay|iap|6203' "$R/opt/app/usr/BTMedia/evolution/stack/etc/evo_config.xml" 2>/dev/null | head -n 60 || true
 fi
 for map in "$R"/proc/[0-9]*/maps; do
     [ -r "$map" ] || continue

@@ -146,6 +146,37 @@ Test bittikten sonra flash belleği yormamak için logları kapatabilirsiniz:
 4. MFi gözlemleri: `/dev/i2c-0` izinleri, `/proc/*/fd` çıktısında `CARPLAY`/`MediaPlayer` sahipliği, ve güvenliyse `--compat-mfi-read` / `--mfi-read` ile görülen adres (`0x10`/`0x11`) ve sürüm baytı.
 5. Her adımda iDrive ekranı ve iPhone ekranında görülen davranış özeti (hangi USB portu kullanıldı, BMW `CARPLAY` süreci USB'yi tuttu mu, ses/görüntü/dokunmatik/ZBE3 tepkisi).
 
+### 11. Ziyaret 2 — Yerel `CARPLAY` / `DDPServer` ve Tak/Çıkar Taraması (`--native` & `--watch`)
+Ziyaret 1 (2026-11-21) sonucunda yerel `/usr/local/bin/CARPLAY` sürecinin çalıştığı, `DDPServer` sürecinin `/dev/i2c-0` (`fd 40`) ve `NmeIAP2Link` tuttuğu, `compositor.conf` dosyasının `/etc/layermanager/` altında okunamadığı ve `usb_probe.sh` `/proc/*/fd` taramasının zaman aşımına uğradığı görüldü. Ziyaret 2'de tüm betikleri `/tmp/` altına kopyalayıp **salt-okunur** `--native` + `--watch` modunu çalıştırın:
+
+1. Betikleri kopyalayın (`native_carplay_probe.sh` dahil):
+   ```sh
+   scp build/arm-entrynav2/carplayd scripts/probe/*.sh root@169.254.1.0:/tmp/
+   ssh root@169.254.1.0
+   chmod +x /tmp/carplayd /tmp/*.sh
+   ```
+2. Önce tam Ziyaret 2 paketini alın (`--native`, iPhone bağlı değilken veya takılıyken; kurulum yapmaz):
+   ```sh
+   sh /tmp/car_visit.sh --daemon /tmp/carplayd --native --out-dir /tmp/visit2_out
+   cat /tmp/visit2_out/carplay-visit-*/SUMMARY.txt
+   ```
+3. Ardından canlı **USB tak/çıkar gözlemi** için `native_carplay_probe.sh --watch 20` çalıştırın:
+   - Komutu iPhone **çıkarılmış** durumdayken başlatın.
+   - Ekranda `Plug/unplug iPhone now...` uyarısını görünce ~4. saniyede iPhone'u takın, 6–8 saniye bekleyin, sonra çıkarın (her 2 saniyede bir `/proc/<pid>/fd`, USB konfigürasyonu ve `DDPServer` günlüğü örneklenir):
+   ```sh
+   sh /tmp/native_carplay_probe.sh --out-dir /tmp/visit2_watch --watch 20
+   ```
+4. İsteğe bağlı: `DDPServer` boşta iken (iPhone USB takılı değilken) MFi çip adresini doğrulamak için:
+   ```sh
+   LD_LIBRARY_PATH=/usr/local/lib:/opt/hmi/lib:/usr/lib:/lib \
+   /tmp/carplayd --compat --mfi-i2c=/dev/i2c-0 --compat-mfi-read
+   ```
+5. Toplanan arşivleri çekin:
+   ```sh
+   scp root@169.254.1.0:/tmp/visit2_out/carplay-visit-*.tar.gz .
+   scp root@169.254.1.0:/tmp/visit2_watch/native_carplay.txt .
+   ```
+
 ---
 
 ## Part II — English Guide (Step-by-Step Checklist)
@@ -263,3 +294,34 @@ Proceed only if `--compat` passed `alps`/`uuid`/`spp`/`libdns_sd`/`ap`/`mdnsd`:
 3. `/var/local/data/CarPlay/app.log` and `/tmp/entry-carplay-service.log`.
 4. MFi I2C findings: `/dev/i2c-0` permissions, `/proc/*/fd` owner (`CARPLAY`/`MediaPlayer`), and if `--compat-mfi-read` / `--mfi-read` was safely run, the detected address (`0x10`/`0x11`) and `dev_ver`.
 5. Notes on which USB port was used and observed behavior at Steps 3, 4, 5, and 6.
+
+### 10. Visit 2 — Native `CARPLAY` / `DDPServer` & Plug/Unplug Watch (`--native` & `--watch`)
+Visit 1 (`2026-11-21`) confirmed native `/usr/local/bin/CARPLAY` is running idle, `DDPServer` holds `/dev/i2c-0` (`fd 40`) and runs `NmeIAP2Link`, `/etc/layermanager/compositor.conf` is unreadable, `vmostctl` needs `LD_LIBRARY_PATH=/usr/local/lib:...`, and `usb_probe.sh`'s old `/proc/*/fd` scan timed out (`[rc=143]`). Visit 2 scripts fix those bottlenecks and add read-only native inspection (`native_carplay_probe.sh`, see [docs/COEXISTENCE.md](COEXISTENCE.md)):
+
+1. Copy all updated probe scripts (including `native_carplay_probe.sh`) to `/tmp/`:
+   ```sh
+   scp build/arm-entrynav2/carplayd scripts/probe/*.sh root@169.254.1.0:/tmp/
+   ssh root@169.254.1.0
+   chmod +x /tmp/carplayd /tmp/*.sh
+   ```
+2. Run the full read-only Visit 2 capture (`--native` adds `native_carplay.txt` to the archive and `SUMMARY.txt`):
+   ```sh
+   sh /tmp/car_visit.sh --daemon /tmp/carplayd --native --out-dir /tmp/visit2_out
+   cat /tmp/visit2_out/carplay-visit-*/SUMMARY.txt
+   ```
+3. Run the 20-second live plug/unplug watch (`--watch 20`, samples every 2s):
+   - Start with the iPhone **unplugged**.
+   - Once `native_carplay_probe.sh: WATCH MODE ... -- plug/unplug iPhone now` appears, plug the iPhone into the console USB port at ~4s, leave it connected for 6–8s, then unplug it before the 20s window ends:
+   ```sh
+   sh /tmp/native_carplay_probe.sh --out-dir /tmp/visit2_watch --watch 20
+   ```
+4. Optional (ONLY with the iPhone **unplugged**, when `DDPServer` is idle): check whether `/dev/i2c-0` answers on `0x10` or `0x11`:
+   ```sh
+   LD_LIBRARY_PATH=/usr/local/lib:/opt/hmi/lib:/usr/lib:/lib \
+   /tmp/carplayd --compat --mfi-i2c=/dev/i2c-0 --compat-mfi-read
+   ```
+5. Pull Visit 2 artifacts back to your laptop:
+   ```sh
+   scp root@169.254.1.0:/tmp/visit2_out/carplay-visit-*.tar.gz .
+   scp root@169.254.1.0:/tmp/visit2_watch/native_carplay.txt .
+   ```

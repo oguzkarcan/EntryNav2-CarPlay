@@ -154,37 +154,33 @@ fi
 
 section "Process Owning /dev/bus/usb/* (read-only proc scan)"
 usb_fd_found=0
-for fdpath in "$R"/proc/[0-9]*/fd/*; do
-    [ -e "$fdpath" ] || [ -L "$fdpath" ] || continue
-    line=$(ls -l "$fdpath" 2>/dev/null || true)
-    case "$line" in
-        */dev/bus/usb/*)
-            usb_fd_found=1
-            rest=${fdpath#"$R/proc/"}
-            pid=${rest%%/*}
-            comm=""
-            cmdline=""
-            uid=""
-            exe=""
-            if [ -r "$R/proc/$pid/comm" ]; then
-                comm=$(read_attr "$R/proc/$pid/comm")
-            fi
-            if [ -r "$R/proc/$pid/cmdline" ]; then
-                cmdline=$(tr '\0' ' ' < "$R/proc/$pid/cmdline" 2>/dev/null || true)
-            fi
-            if [ -r "$R/proc/$pid/status" ]; then
-                uid=$(grep '^Uid:' "$R/proc/$pid/status" 2>/dev/null | head -n 1 || true)
-            fi
-            if [ -L "$R/proc/$pid/exe" ]; then
-                exe=$(ls -ld "$R/proc/$pid/exe" 2>/dev/null || true)
-            fi
-            echo "$line"
-            echo "  pid=$pid comm=${comm:-unknown} $uid cmdline=$cmdline"
-            if [ -n "$exe" ]; then
-                echo "  $exe"
-            fi
-            ;;
-    esac
+for pdir in "$R"/proc/[0-9]*; do
+    [ -d "$pdir/fd" ] || continue
+    hits=$(ls -l "$pdir/fd" 2>/dev/null | grep '/dev/bus/usb/' || true)
+    [ -n "$hits" ] || continue
+    usb_fd_found=1
+    pid=${pdir##*/}
+    comm=""
+    cmdline=""
+    uid=""
+    exe=""
+    if [ -r "$pdir/comm" ]; then
+        comm=$(read_attr "$pdir/comm")
+    fi
+    if [ -r "$pdir/cmdline" ]; then
+        cmdline=$(tr '\0' ' ' < "$pdir/cmdline" 2>/dev/null || true)
+    fi
+    if [ -r "$pdir/status" ]; then
+        uid=$(grep '^Uid:' "$pdir/status" 2>/dev/null | head -n 1 || true)
+    fi
+    if [ -L "$pdir/exe" ]; then
+        exe=$(ls -ld "$pdir/exe" 2>/dev/null || true)
+    fi
+    echo "$hits"
+    echo "  pid=$pid comm=${comm:-unknown} $uid cmdline=$cmdline"
+    if [ -n "$exe" ]; then
+        echo "  $exe"
+    fi
 done
 if [ "$usb_fd_found" -eq 0 ]; then
     echo "no readable /proc/*/fd/* symlinks pointing to /dev/bus/usb/*"
@@ -211,7 +207,7 @@ for pdir in "$R"/proc/[0-9]*; do
     if [ -r "$pdir/cmdline" ]; then
         cmdline=$(tr '\0' ' ' < "$pdir/cmdline" 2>/dev/null || true)
     fi
-    if printf '%s %s\n' "$comm" "$cmdline" | grep -qiE 'mediaplayer|carplay|auxin|apple|ipod|usbmux'; then
+    if printf '%s %s\n' "$comm" "$cmdline" | grep -qiE 'mediaplayer|carplay|auxin|apple|ipod|usbmux|ddpserver'; then
         mp_found=1
         echo "pid=$pid comm=${comm:-unknown} cmdline=$cmdline"
     fi
@@ -222,22 +218,18 @@ fi
 
 section "Process Owning /dev/ffs-carlife (read-only proc scan)"
 ls -la "$R/dev/ffs-carlife" 2>/dev/null || echo "/dev/ffs-carlife: not present"
-for fdpath in "$R"/proc/[0-9]*/fd/*; do
-    [ -e "$fdpath" ] || [ -L "$fdpath" ] || continue
-    line=$(ls -l "$fdpath" 2>/dev/null || true)
-    case "$line" in
-        *ffs-carlife*|*carlife*)
-            echo "$line"
-            rest=${fdpath#"$R/proc/"}
-            pid=${rest%%/*}
-            if [ -r "$R/proc/$pid/comm" ]; then
-                echo "  pid=$pid comm=$(read_attr "$R/proc/$pid/comm")"
-            fi
-            if [ -r "$R/proc/$pid/cmdline" ]; then
-                echo "  pid=$pid cmdline=$(tr '\0' ' ' < "$R/proc/$pid/cmdline" 2>/dev/null || true)"
-            fi
-            ;;
-    esac
+for pdir in "$R"/proc/[0-9]*; do
+    [ -d "$pdir/fd" ] || continue
+    hits=$(ls -l "$pdir/fd" 2>/dev/null | grep -E 'ffs-carlife|carlife' || true)
+    [ -n "$hits" ] || continue
+    echo "$hits"
+    pid=${pdir##*/}
+    if [ -r "$pdir/comm" ]; then
+        echo "  pid=$pid comm=$(read_attr "$pdir/comm")"
+    fi
+    if [ -r "$pdir/cmdline" ]; then
+        echo "  pid=$pid cmdline=$(tr '\0' ' ' < "$pdir/cmdline" 2>/dev/null || true)"
+    fi
 done
 
 section "Dual-Role / Host vs Peripheral Hints"

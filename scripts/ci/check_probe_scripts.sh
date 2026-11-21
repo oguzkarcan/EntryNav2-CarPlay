@@ -45,6 +45,12 @@ mkdir -p \
     "$FAKE_ROOT/dev/net" \
     "$FAKE_ROOT/proc/101/fd" \
     "$FAKE_ROOT/proc/102/fd" \
+    "$FAKE_ROOT/proc/103/fd" \
+    "$FAKE_ROOT/proc/101/net" \
+    "$FAKE_ROOT/proc/102/net" \
+    "$FAKE_ROOT/proc/103/net" \
+    "$FAKE_ROOT/tmp/Mediaplayer" \
+    "$FAKE_ROOT/var/local/data/MediaPlayer" \
     "$FAKE_ROOT/proc/sys/net/ipv6/conf/all" \
     "$FAKE_ROOT/proc/sys/net/ipv6/conf/default" \
     "$FAKE_ROOT/proc/sys/net/ipv6/conf/wlan0" \
@@ -81,7 +87,21 @@ printf 'BTMedia\0--daemon\0' > "$FAKE_ROOT/proc/101/cmdline"
 printf 'Uid:\t0\t0\t0\t0\n' > "$FAKE_ROOT/proc/101/status"
 ln -s /dev/bus/usb/001/002 "$FAKE_ROOT/proc/101/fd/10"
 printf 'CARPLAY\n' > "$FAKE_ROOT/proc/102/comm"
+printf '/usr/local/bin/CARPLAY\0' > "$FAKE_ROOT/proc/102/cmdline"
+printf 'Name:\tCARPLAY\nUid:\t1000\t1000\t1000\t1000\n' > "$FAKE_ROOT/proc/102/status"
+printf 'PATH=/usr/bin\0CARPLAY_SECRET_TOKEN=TOPSECRETVALUE999\0' > "$FAKE_ROOT/proc/102/environ"
+printf '00010000-00020000 r-xp 00000000 00:00 0 /opt/app/usr/MediaPlayer/bin/CARPLAY\n' > "$FAKE_ROOT/proc/102/maps"
+printf 'Num RefCount Protocol Flags Type St Inode Path\n00000000: 00000002 00000000 00010000 0001 01 12345 /run/vmost_sockstream\n' > "$FAKE_ROOT/proc/102/net/unix"
 ln -s /dev/i2c-0 "$FAKE_ROOT/proc/102/fd/7"
+printf 'DDPServer\n' > "$FAKE_ROOT/proc/103/comm"
+printf '/usr/local/bin/DDPServer\0' > "$FAKE_ROOT/proc/103/cmdline"
+printf 'Name:\tDDPServer\nUid:\t1001\t1001\t1001\t1001\n' > "$FAKE_ROOT/proc/103/status"
+printf 'API_KEY=DO_NOT_LEAK\0LANG=C\0' > "$FAKE_ROOT/proc/103/environ"
+printf '00030000-00040000 r-xp 00000000 00:00 0 /usr/local/bin/DDPServer\n' > "$FAKE_ROOT/proc/103/maps"
+printf 'Num RefCount Protocol Flags Type St Inode Path\n00000000: 00000002 00000000 00010000 0001 01 22222 /run/ddp_sock\n' > "$FAKE_ROOT/proc/103/net/unix"
+ln -s /dev/i2c-0 "$FAKE_ROOT/proc/103/fd/40"
+printf '[Unit]\nDescription=CARPLAY\n[Service]\nUser=carplay\nExecStart=/usr/local/bin/CARPLAY\n' > "$FAKE_ROOT/etc/systemd/system/CARPLAY.service"
+printf '393.76 DDPS NmeIAP2Link OnNowPlayingUpdate\n' > "$FAKE_ROOT/tmp/Mediaplayer/103_DDPS_1.txt"
 printf 'va_API_APPLE_AUTH_CHIP_ON_OFF=1\n' > "$FAKE_ROOT/tmp/hmi_coding_dump.txt"
 
 printf '05ac\n' > "$FAKE_ROOT/sys/bus/usb/devices/1-1/idVendor"
@@ -255,7 +275,48 @@ fi
 VISIT_MFI_DIR=$(find "$OUT_DIR_MFI" -mindepth 1 -maxdepth 1 -type d | head -n 1)
 grep -q 'bus=0 addr=0x10 reg=0x00: 0x05' "$VISIT_MFI_DIR/i2c_mfi.txt"
 
-echo "[PASS] car_visit.sh fake-root probe, tarball, redaction, MFi gating, and VEHICLE_FACTS summary"
+# Visit 2: car_visit.sh --native + standalone native_carplay_probe.sh --watch 2
+OUT_DIR_NATIVE="$TMP_BASE/visit_out_native"
+NATIVE_STAND_DIR="$TMP_BASE/native_stand"
+mkdir -p "$OUT_DIR_NATIVE" "$NATIVE_STAND_DIR"
+BEFORE_NATIVE_HASH=$(find "$FAKE_ROOT" -type f -exec sha256sum {} + | sort | sha256sum)
+PATH="$STUB_BIN:$PATH" sh scripts/probe/car_visit.sh \
+    --probe-root "$FAKE_ROOT" \
+    --out-dir "$OUT_DIR_NATIVE" \
+    --daemon "$STUB_BIN/fake-carplayd" \
+    --native \
+    --timeout 2 >/dev/null
+PATH="$STUB_BIN:$PATH" sh scripts/probe/native_carplay_probe.sh \
+    --probe-root "$FAKE_ROOT" \
+    --out-dir "$NATIVE_STAND_DIR" \
+    --timeout 2 \
+    --watch 2 >/dev/null 2>&1
+AFTER_NATIVE_HASH=$(find "$FAKE_ROOT" -type f -exec sha256sum {} + | sort | sha256sum)
+if [ "$BEFORE_NATIVE_HASH" != "$AFTER_NATIVE_HASH" ]; then
+    echo "FAIL: native_carplay_probe.sh or car_visit.sh --native modified files inside PROBE_ROOT!" >&2
+    exit 1
+fi
+
+NAT_TAR=$(find "$OUT_DIR_NATIVE" -maxdepth 1 -name 'carplay-visit-*.tar*' | head -n 1)
+[ -n "$NAT_TAR" ] && [ -s "$NAT_TAR" ]
+UNPACK_NAT="$TMP_BASE/unpack_nat"
+mkdir -p "$UNPACK_NAT"
+tar -xf "$NAT_TAR" -C "$UNPACK_NAT"
+NAT_VISIT_DIR=$(find "$UNPACK_NAT" -mindepth 1 -maxdepth 1 -type d | head -n 1)
+[ -f "$NAT_VISIT_DIR/native_carplay.txt" ]
+grep -q 'N.1 CARPLAY/DDPServer/MediaPlayer procs' "$NAT_VISIT_DIR/SUMMARY.txt"
+grep -q 'comm=CARPLAY' "$NAT_VISIT_DIR/native_carplay.txt"
+grep -q 'comm=DDPServer' "$NAT_VISIT_DIR/native_carplay.txt"
+grep -q 'CARPLAY_SECRET_TOKEN=<REDACTED>' "$NAT_VISIT_DIR/native_carplay.txt"
+grep -q 'API_KEY=<REDACTED>' "$NAT_VISIT_DIR/native_carplay.txt"
+if grep -qE 'TOPSECRETVALUE999|DO_NOT_LEAK' "$NAT_VISIT_DIR/native_carplay.txt"; then
+    echo "FAIL: secret leaked into native_carplay.txt!" >&2
+    exit 1
+fi
+grep -q 'WATCH SAMPLE 1/1' "$NATIVE_STAND_DIR/native_carplay.txt"
+grep -q '05ac' "$NATIVE_STAND_DIR/native_carplay.txt"
+
+echo "[PASS] car_visit.sh + native_carplay_probe.sh (--native, --watch, redaction, read-only)"
 
 # ---- 4. Test install.sh + uninstall.sh (--dry-run, safe defaults, byte-for-byte restore) ----
 mkdir -p \
