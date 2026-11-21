@@ -1171,6 +1171,52 @@ TEST_CASE(daemonMfiWiringTests) {
 #endif
 }
 
+TEST_CASE(mfiCp30DevVer05At0x10Visit3HardwareSpec) {
+    resetFakeClock();
+    plat::Reactor reactor(&fakeClockNs);
+    REQUIRE(reactor.init());
+
+    FakeMfiChipBackend chip;
+    chip.chip_addr = 0x10U;
+    chip.dev_ver = 0x05U;  // verified on car visit 3: @ok|mfi|/dev/i2c-0 I2C_FUNCS ok, addr=0x10 dev_ver=0x05
+    chip.fw_ver = 0x01U;
+    chip.proto_major = 3U;
+    chip.proto_minor = 0U;
+    chip.setDerCertificate(900U);
+
+    plat::MfiI2cConfig cfg;
+    REQUIRE(plat::parseMfiI2cSpec("/dev/i2c-0:0x10", cfg));
+    cfg.select_to_read_gap_ms = 5;
+    cfg.validate_der_certificate = true;
+
+    plat::I2cMfiAuthProvider auth(reactor, cfg, &chip);
+    RecordingProbeCallback probe_cb;
+    REQUIRE(auth.start(&probe_cb));
+    driveReactor(reactor, 60, 20);
+    REQUIRE(probe_cb.calls == 1);
+    CHECK(probe_cb.ok);
+    CHECK_EQ(0x10U, probe_cb.info.address7);
+    CHECK_EQ(0x05U, probe_cb.info.device_version);
+    CHECK_EQ(3U, probe_cb.info.protocol_major);
+    CHECK_EQ(3, auth.protocolMajor());
+    CHECK(!auth.isBusy());
+
+    RecordingAuthCallback auth_cb;
+    uint8_t challenge[32];
+    for (size_t i = 0U; i < sizeof(challenge); ++i) {
+        challenge[i] = static_cast<uint8_t>(i + 0x10U);
+    }
+    const uint64_t sign_op = auth.beginSignChallenge(challenge, sizeof(challenge), auth_cb);
+    CHECK(sign_op != 0ULL);
+    driveReactor(reactor, 60, 20);
+    REQUIRE(auth_cb.sign_calls == 1);
+    CHECK(auth_cb.sign_ok);
+    CHECK_EQ(32U, chip.written_challenge.size());
+    CHECK_EQ(static_cast<size_t>(64U), auth_cb.sign_data.size());
+
+    auth.stop();
+}
+
 }  // namespace
 
 int main() {

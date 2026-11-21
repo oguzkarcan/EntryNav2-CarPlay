@@ -61,6 +61,8 @@ CarPlayDaemon::CarPlayDaemon(const CarPlayDaemonConfig& config)
       media_sink_(audio_sink_, mic_, this),
       media_engine_(NULL),
       mfi_backend_override_(NULL),
+      ddp_ops_override_(NULL),
+      ddp_handoff_(NULL),
       mfi_auth_(NULL),
       server_(NULL),
       connectivity_(reactor_, rng_),
@@ -76,6 +78,9 @@ CarPlayDaemon::CarPlayDaemon(const CarPlayDaemonConfig& config)
       tick_timer_(Reactor::kNoTimer),
       started_(false),
       stopping_(false),
+      startup_failure_(false),
+      ddp_was_stopped_(false),
+      ddp_needs_reboot_(false),
       video_running_(false),
       session_focus_initialized_(false),
       focus_(true),
@@ -96,6 +101,9 @@ bool CarPlayDaemon::start() {
         return true;
     }
     stopping_ = false;
+    startup_failure_ = false;
+    ddp_was_stopped_ = false;
+    ddp_needs_reboot_ = false;
     session_focus_initialized_ = false;
     if (!reactor_.init()) {
         CARPLAY_LOG_ERROR("daemon", "CarPlayDaemon: Reactor::init() failed");
@@ -160,18 +168,6 @@ bool CarPlayDaemon::start() {
 
     media_engine_ = new MediaEngine(reactor_, media_sink_, config_.media_config);
 
-    if (config_.mfi_i2c_config.enabled) {
-        mfi_auth_ = new I2cMfiAuthProvider(reactor_, config_.mfi_i2c_config, mfi_backend_override_);
-        std::string mfi_err;
-        if (!mfi_auth_->start(NULL, &mfi_err)) {
-            CARPLAY_LOG_ERROR("daemon", "CarPlayDaemon: MFi I2C provider failed to start: %s",
-                              mfi_err.c_str());
-            stop();
-            return false;
-        }
-        connectivity_.setIap2AuthProvider(mfi_auth_);
-    }
-
     config_.server_config.control_port = config_.control_port;
     server_ = new SessionServer(reactor_,
                                 airplay_config_,
@@ -180,7 +176,7 @@ bool CarPlayDaemon::start() {
                                 rng_,
                                 *this,
                                 *media_engine_,
-                                static_cast<session::AuthProvider*>(mfi_auth_),
+                                NULL,
                                 config_.server_config);
 
     const bool server_ok = config_.bind_loopback_only
@@ -245,6 +241,51 @@ bool CarPlayDaemon::start() {
         tick_timer_ = reactor_.startTimer(config_.tick_interval_ms, config_.tick_interval_ms, this);
     }
 
+    started_ = true;
+
+    if (config_.mfi_i2c_config.enabled && config_.ddp_handoff_config.enabled) {
+        DdpHandoffConfig ddp_cfg = config_.ddp_handoff_config;
+        if (ddp_cfg.i2c_device_path == "/dev/i2c-0" && !config_.mfi_i2c_config.device_path.empty()) {
+            ddp_cfg.i2c_device_path = config_.mfi_i2c_config.device_path;
+        }
+        ddp_handoff_ = new DdpHandoff(reactor_, ddp_cfg, ddp_ops_override_);
+        if (!ddp_handoff_->begin(this) || startup_failure_) {
+            stop();
+            return false;
+        }
+    } else {
+        if (config_.ddp_handoff_config.enabled && !config_.mfi_i2c_config.enabled) {
+            CARPLAY_LOG_INFO("daemon",
+                             "CarPlayDaemon: ddp_handoff enabled but mfi_i2c is off; skipping DDPServer stop");
+        }
+        if (!startMfiAndConnectivity()) {
+            stop();
+            return false;
+        }
+    }
+
+    stepVisibility();
+    return true;
+}
+
+bool CarPlayDaemon::startMfiAndConnectivity() {
+    if (config_.mfi_i2c_config.enabled) {
+        mfi_auth_ = new I2cMfiAuthProvider(reactor_, config_.mfi_i2c_config, mfi_backend_override_);
+        std::string mfi_err;
+        if (!mfi_auth_->start(this, &mfi_err)) {
+            CARPLAY_LOG_ERROR("daemon", "CarPlayDaemon: MFi I2C provider failed to start: %s",
+                              mfi_err.c_str());
+            delete mfi_auth_;
+            mfi_auth_ = NULL;
+            startup_failure_ = true;
+            return false;
+        }
+        connectivity_.setIap2AuthProvider(mfi_auth_);
+        if (server_ != NULL) {
+            server_->setAuthProvider(static_cast<session::AuthProvider*>(mfi_auth_));
+        }
+    }
+
     CarPlayConnectivityConfig conn_cfg = config_.connectivity_config;
     if (config_.enable_wireless) {
         conn_cfg.enable_wireless = true;
@@ -254,13 +295,84 @@ bool CarPlayDaemon::start() {
     }
     if (!connectivity_.start(*server_, airplay_config_, identity_, conn_cfg)) {
         CARPLAY_LOG_ERROR("daemon", "CarPlayDaemon: CarPlayConnectivity failed to start");
-        stop();
+        startup_failure_ = true;
         return false;
     }
+    return !startup_failure_;
+}
 
-    started_ = true;
+void CarPlayDaemon::recordDdpNeedsReboot(const char* reason) {
+    if (!ddp_was_stopped_) {
+        return;
+    }
+    ddp_needs_reboot_ = true;
+    if (config_.ddp_handoff_config.restore_mode != kDdpRestoreRebootPrompt) {
+        return;
+    }
+    CARPLAY_LOG_WARN("daemon",
+                     "DDPServer remains stopped (%s); headunit requires `systemctl reboot` to restore BT audio",
+                     (reason != NULL) ? reason : "session_end");
+    if (!config_.ddp_needs_reboot_file.empty()) {
+        writeDdpNeedsRebootFile(config_.ddp_needs_reboot_file,
+                                (reason != NULL) ? std::string(reason) : std::string("session_end"));
+    }
+}
+
+void CarPlayDaemon::onDdpHandoffFinished(bool ok,
+                                         bool did_stop_ddp,
+                                         const std::string& detail) {
+    if (did_stop_ddp) {
+        ddp_was_stopped_ = true;
+        recordDdpNeedsReboot("ddp_stopped");
+    }
+    if (stopping_) {
+        return;
+    }
+    if (!ok) {
+        CARPLAY_LOG_ERROR("daemon",
+                          "CarPlayDaemon: DDPServer handoff failed (%s); aborting session without opening %s",
+                          detail.c_str(),
+                          config_.mfi_i2c_config.device_path.c_str());
+        startup_failure_ = true;
+        requestStop();
+        return;
+    }
+    if (!startMfiAndConnectivity()) {
+        startup_failure_ = true;
+        requestStop();
+        return;
+    }
     stepVisibility();
-    return true;
+}
+
+void CarPlayDaemon::onProbeComplete(bool ok, const MfiChipInfo& info) {
+    if (ok) {
+        CARPLAY_LOG_INFO("daemon",
+                         "CarPlayDaemon: MFi coprocessor ready (addr=0x%02x dev_ver=0x%02x fw=0x%02x proto=%u.%u id=0x%08x)",
+                         static_cast<unsigned>(info.address7),
+                         static_cast<unsigned>(info.device_version),
+                         static_cast<unsigned>(info.firmware_version),
+                         static_cast<unsigned>(info.protocol_major),
+                         static_cast<unsigned>(info.protocol_minor),
+                         static_cast<unsigned>(info.device_id));
+        return;
+    }
+
+    const std::string err = (mfi_auth_ != NULL) ? mfi_auth_->stats().last_error : std::string();
+    CARPLAY_LOG_ERROR("daemon",
+                      "CarPlayDaemon: MFi coprocessor probe failed (%s); closing I2C bus cleanly and aborting",
+                      err.empty() ? "unknown error" : err.c_str());
+    connectivity_.stop();
+    connectivity_.setIap2AuthProvider(NULL);
+    if (server_ != NULL) {
+        server_->setAuthProvider(NULL);
+    }
+    if (mfi_auth_ != NULL) {
+        mfi_auth_->stop();
+    }
+    recordDdpNeedsReboot("mfi_probe_failed");
+    startup_failure_ = true;
+    requestStop();
 }
 
 void CarPlayDaemon::stop() {
@@ -273,6 +385,11 @@ void CarPlayDaemon::stop() {
     if (tick_timer_ != Reactor::kNoTimer) {
         reactor_.cancelTimer(tick_timer_);
         tick_timer_ = Reactor::kNoTimer;
+    }
+    if (ddp_handoff_ != NULL) {
+        ddp_handoff_->cancel();
+        delete ddp_handoff_;
+        ddp_handoff_ = NULL;
     }
     // Join the control thread first: it posts onPostedCommands(this), and
     // Reactor::cancelPosted requires posting threads to have stopped.
@@ -309,6 +426,9 @@ void CarPlayDaemon::stop() {
         mfi_auth_->stop();
         delete mfi_auth_;
         mfi_auth_ = NULL;
+    }
+    if (ddp_was_stopped_) {
+        recordDdpNeedsReboot("daemon_stop");
     }
 
     // Join the capture thread before the engine goes away: the worker calls
@@ -570,6 +690,9 @@ void CarPlayDaemon::onSessionEnded(session::Session& /*session*/) {
     media_press_.cancel();
     if (!config_.media_recall_file.empty()) {
         removeFile(config_.media_recall_file);
+    }
+    if (ddp_was_stopped_) {
+        recordDdpNeedsReboot("session_ended");
     }
     stepVisibility();
 }

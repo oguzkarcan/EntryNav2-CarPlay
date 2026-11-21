@@ -41,6 +41,7 @@ LANGS = (
 TEXTS = {
     1: "Apple CarPlay",
     2: "Apple CarPlay: Connecting...",
+    3: "Apple CarPlay (Reboot for BT audio)",
     10: "Start Apple CarPlay",
     11: "Stop Apple CarPlay",
     13: "Connecting to iPhone...",
@@ -48,6 +49,7 @@ TEXTS = {
     15: "Start automatically",
     16: "Help",
     17: "USB cable instead of wireless",
+    18: "Start CarPlay (Reboot for BT audio)",
     20: "NAV: CarPlay navigation",
     21: "MEDIA: CarPlay media",
     22: "COM / steering wheel phone button: CarPlay phone",

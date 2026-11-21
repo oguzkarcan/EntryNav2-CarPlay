@@ -126,7 +126,8 @@ Inspection of the head unit sysroot (`$SYSROOT`) shows:
 
 ### Safe Coexistence Policy in `UsbHost` & `UsbCarPlayBridge`
 
-- **Never hijack `"usbfs"` by default:** `UsbHostConfig::detach_usbfs_driver` and `UsbCarPlayBridgeConfig::detach_usbfs_driver` both default to `false` (confirmed in-car policy in `EntryNav2-Android-Auto` `docs/USB.md`: never detach a BMW driver/process).
+- **Never hijack `"usbfs"` or detach kernel drivers by default:** `UsbHostConfig::detach_usbfs_driver`, `UsbCarPlayBridgeConfig::detach_usbfs_driver`, `UsbHostConfig::detach_kernel_driver`, and `UsbCarPlayBridgeConfig::detach_kernel_driver` all default to `false` (Visit 2 confirmed `vmostAuxInUSB` opens `/tmp/Mediaplayer/*_USBC_*.txt` on plug without persistent `usbfs` claim when FSC is inactive, and `cfg=2/4` attaches `01/01/00`, `01/02/00`, `03/00/00` safely).
+- **Clean `0xc0/0x52` switch in `UsbCarPlayBridge`:** `CarPlayConnectivityConfig` enables `auto_request_carplay_switch=true`. When the iPhone first attaches in `cfg=2/4` (Audio+HID iAP, no CDC-NCM or iAP2 bulk interface yet), sending `0xc0/0x52` cleanly tears down the transient probe handle (`awaiting_reenum_from_switch_=true`) without emitting a spurious error while waiting for USB re-enumeration into CarPlay (`Apple Ethernet 0xff/0xfd/0x01` + `CDC-NCM`).
 - **Pre-claim check (`USBDEVFS_GETDRIVER`):** Before claiming any iAP2 or CDC-NCM interface, `UsbHost::claimInterfaceWithStatus()` queries `USBDEVFS_GETDRIVER`.
   - If the bound driver is `"usbfs"` and `detach_usbfs_driver == false`, `claimInterfaceWithStatus()` refuses immediately with `kUsbClaimBusyUserspace` (`USBDEVFS_DISCONNECT` is **not** issued).
   - If `USBDEVFS_CLAIMINTERFACE` fails with `EBUSY` (race condition or residual binding), it re-queries `USBDEVFS_GETDRIVER` and classifies `kUsbClaimBusyUserspace` vs `kUsbClaimBusyKernel`.

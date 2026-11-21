@@ -2,7 +2,7 @@
 
 **Target Hardware:** BMW `HU_ENTRYNAV2` (EntryEVO / ARMv7 `-std=gnu++0x`)  
 **Transports Targeted:** Wired USB (`iAP2` over USB + `NCM` IPv6) **and** Wireless (`Bluetooth RFCOMM` + `Wi-Fi` AP/STA + Bonjour)  
-**Active Milestone:** **Phase 4 Wave D Completed + Phase 5 MFi I2C Started (No-Car Preparation Wave)** — host `g++`/`clang++` (40/40 binaries, 454 tests), QEMU car-library smoke (9/9 + 8-test ARM subset), sysroot symbol check, and 13-target libFuzzer sanity run verified; live car/hardware verification pending.
+**Active Milestone:** **Visit 3 On-Car Safe-Mode & MFi Verified -> `ddp_handoff` + Visit 4 Wired/MFi Prep** — Visit 3 (`2026-11-21`) confirmed MFi CP at `/dev/i2c-0` `addr=0x10 dev_ver=0x05`, safe-mode `install.sh`, `HmiMain3D` `EntryCarPlay` (`32753`) alongside `EntryAad` (`32752`), `800x480` LayerManager/omapdrm surface, `older CCS (E5.01, C10/C20)`, and `STOP` relaunch. Implemented opt-in Reactor `DdpHandoff`, `ddp_needs_reboot` HMI notice, persistent `.install-backup/uninstall.sh`, and `detach_kernel_driver=false` + `0xc0/0x52` wired coexistence hardening ahead of Visit 4.
 
 ---
 
@@ -185,4 +185,7 @@ Remaining for Phase 4 (requires live car):
 ### Phase 5 — Authentication Bridge & Live Vehicle Bring-Up
 - [ ] **Hardware I2C MFi `AuthProvider` + AirPlay `/auth-setup` MFiSAP (`D3` — implemented, needs car/hardware verification):** Implemented `I2cMfiAuthProvider` (`mfi_i2c.*`, non-blocking Reactor-timer state machine over `/dev/i2c-N`, STOP-terminated register select + 5 ms gap + read, NACK/EBUSY retries, async `iap2::AuthProvider` hooks) and MFiSAP `POST /auth-setup` (`mfi_sap.*`, `airplay_crypto` SHA-1/SHA-256/AES-128-CTR) wired into `CarPlayDaemon` (`--mfi-i2c` / `mfi_i2c=`, default **OFF**). **Unverified in car:** `/dev/i2c-0` (`root:mplayer` `0660`) is the likely bus, while 7-bit addresses `0x10`/`0x11`, CP 2.0C/3.0 presence on coded units (`va_API_APPLE_AUTH_CHIP_ON_OFF`), and `/dev/i2c-0` concurrency with BMW `CARPLAY`/`MediaPlayer` remain unverified until probed on the vehicle (or on a PC USB–I2C breakout).
 - [ ] Cross-compilation with BMW `arm-linux-gnueabihf` GCC 4.7 toolchain (`make arm-core` -> full `entrynav2_carplay` daemon binary).
-- [ ] Live `HU_ENTRYNAV2` vehicle deployment & end-to-end validation (USB plug-in, Wireless BT -> Wi-Fi auto-connect, steering wheel / ZBE3 buttons, Siri mic, audio routing).
+- [x] **Visit 3 Verification & `ddp_handoff` Pre-Visit-4 Hardening (2026-11-21):**
+  - Live HU Visit 3 (`verified 2026-11-21 visit 3`) confirmed MFi CP at `/dev/i2c-0` (`addr=0x10`, `dev_ver=0x05`), `DistributedDeviceProtocol.service` `KillMode=none` / no recovery on `systemctl start` until explicit `systemctl reboot`, `EntryCarPlay` (`32753`) `HmiMain3D` stability, `omapdrm` dma-buf + `800x480` surface `0x7ec00001` (`genivi-flip-renderorder=1`), `older CCS`, and `STOP` handling.
+  - Added non-blocking Reactor `DdpHandoff` (`ddp_handoff=0|1`, `ddp_restore=reboot_prompt|none` in `carplay.conf` & CLI), `/tmp/entry-carplayd-ddp-needs-reboot` + RHMI text `3`/`18`, persistent `.install-backup/uninstall.sh` in `install.sh`, `detach_kernel_driver=false` default + clean `0xc0/0x52` switch in `UsbCarPlayBridge`, and full unit tests (`test_ddp_handoff`, `test_mfi_i2c` `dev_ver=0x05`, `test_safe_mode`, `test_usb_bridge`, `test_carplay_daemon`).
+- [ ] Live `HU_ENTRYNAV2` Visit 4 (`wired=1` + `mfi_i2c=/dev/i2c-0:0x10` + `ddp_handoff=1`) and Wireless validation.

@@ -372,17 +372,20 @@ sh scripts/deploy/install.sh --root "$FAKE_ROOT" --stage "$STAGE_DIR" --with-sys
 [ -f "$FAKE_ROOT/opt/carplay/.installed-by-entrycarplay" ]
 [ -f "$FAKE_ROOT/opt/hmi/data/ro/Plugins/EntryCarPlay/EntryCarPlay.manifest" ]
 [ -f "$FAKE_ROOT/etc/systemd/system/entry-carplay.service" ]
+[ -f "$FAKE_ROOT/var/local/data/CarPlay/.install-backup/manifest.txt" ]
+[ -f "$FAKE_ROOT/var/local/data/CarPlay/.install-backup/uninstall.sh" ]
 grep -q '^wireless=0$' "$FAKE_ROOT/var/local/data/CarPlay/carplay.conf"
 grep -q '^wired=0$' "$FAKE_ROOT/var/local/data/CarPlay/carplay.conf"
 grep -q '^detach_usbfs_driver=0$' "$FAKE_ROOT/var/local/data/CarPlay/carplay.conf"
+grep -q '^ddp_handoff=0$' "$FAKE_ROOT/var/local/data/CarPlay/carplay.conf"
 grep -q '^# mfi_i2c=' "$FAKE_ROOT/var/local/data/CarPlay/carplay.conf"
 
 # 4c. Uninstall dry-run makes ZERO changes
-sh scripts/deploy/uninstall.sh --root "$FAKE_ROOT" --dry-run | grep -q '^\[dry-run\]'
+sh "$FAKE_ROOT/var/local/data/CarPlay/.install-backup/uninstall.sh" --root "$FAKE_ROOT" --dry-run | grep -q '^\[dry-run\]'
 [ -x "$FAKE_ROOT/opt/carplay/carplayd" ]
 
-# 4d. Uninstall restores every modified file byte-for-byte & removes newly added files/dirs
-sh scripts/deploy/uninstall.sh --root "$FAKE_ROOT" >/dev/null
+# 4d. Uninstall directly from .install-backup restores every file byte-for-byte & removes itself
+sh "$FAKE_ROOT/var/local/data/CarPlay/.install-backup/uninstall.sh" --root "$FAKE_ROOT" >/dev/null
 [ ! -e "$FAKE_ROOT/opt/carplay" ]
 [ ! -e "$FAKE_ROOT/opt/hmi/data/ro/Plugins/EntryCarPlay" ]
 [ ! -e "$FAKE_ROOT/var/local/data/CarPlay/.install-backup" ]

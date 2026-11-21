@@ -52,6 +52,7 @@ static const char* const kAppKeyFile = "/tmp/entry-carplayd-appkey";
 static const char* const kDayNightFile = "/tmp/entry-carplayd-daynight";
 static const char* const kWirelessLock = "/tmp/entry-carplayd-wireless.lock";
 static const char* const kMediaRecallFile = "/tmp/entry-carplayd-media-recall";
+static const char* const kDdpNeedsRebootFile = "/tmp/entry-carplayd-ddp-needs-reboot";
 
 // ---- Abstract Unix domain datagram socket name (\0entry-carplayd-control) ----
 static const char* const kControlName = "entry-carplayd-control";

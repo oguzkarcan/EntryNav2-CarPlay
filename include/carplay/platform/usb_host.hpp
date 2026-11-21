@@ -328,7 +328,7 @@ struct UsbHostConfig {
           dev_usb_root("/dev/bus/usb"),
           target_vendor_id(usb::kAppleVendorId),
           hotplug_poll_ms(500),
-          detach_kernel_driver(true),
+          detach_kernel_driver(false),
           detach_usbfs_driver(false),
           ignore_fixed_devices(true) {}
 };

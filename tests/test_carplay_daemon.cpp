@@ -2344,6 +2344,82 @@ TEST_CASE(testCarPlayDaemonCliBinary) {
 #endif
 }
 
+TEST_CASE(pluginShowsDdpRebootPromptWhenMarkerPresent) {
+#if !defined(_WIN32) && defined(__linux__)
+    const std::string dir = makeTempDir("carplay-ddp-hmi");
+    const std::string state_file = dir + "/state";
+    const std::string stop_file = dir + "/STOP";
+    const std::string service_log = dir + "/service.log";
+    const std::string reboot_marker = dir + "/ddp-needs-reboot";
+
+    const size_t slash = g_argv0_exe.rfind('/');
+    const std::string bin_dir = (slash == std::string::npos) ? std::string(".") : g_argv0_exe.substr(0, slash);
+    const std::string so_path = bin_dir + "/libEntryCarPlay.so";
+    char ctrl_name[64];
+    snprintf(ctrl_name, sizeof(ctrl_name), "cp-test-ddp-%d", static_cast<int>(getpid()));
+
+    void* handle = dlopen(so_path.c_str(), RTLD_NOW | RTLD_LOCAL);
+    REQUIRE(handle != NULL);
+    const EntryPluginAppInfo* info =
+        reinterpret_cast<const EntryPluginAppInfo*>(dlsym(handle, "pluginAppInfo"));
+    REQUIRE(info != NULL);
+    SetApiFn set_api = NULL;
+    void* set_api_sym = dlsym(handle, "entryCarPlaySetFrameworkApiForTest");
+    REQUIRE(set_api_sym != NULL);
+    memcpy(&set_api, &set_api_sym, sizeof(set_api));
+
+    REQUIRE(plat::writeDdpNeedsRebootFile(reboot_marker, "test_handoff"));
+
+    MockBmwEnv mock_env;
+    g_mock_bmw = &mock_env;
+    plat::BmwFrameworkApi api;
+    initMockFrameworkApi(api, mock_env);
+
+    plat::EntryCarPlayTestOptions opts;
+    opts.stop_file = stop_file.c_str();
+    opts.service_bin = g_argv0_exe.c_str();
+    opts.service_log = service_log.c_str();
+    opts.ddp_needs_reboot_file = reboot_marker.c_str();
+    opts.launch_debounce_ms = 0L;
+
+    set_api(&api, dir.c_str(), ctrl_name, state_file.c_str(), &opts);
+    int dummy = 0;
+    void* app = info->create(&dummy, "EntryCarPlay", &dummy, &dummy);
+    REQUIRE(app != NULL);
+    void** vtbl = *reinterpret_cast<void***>(app);
+    bool (*on_init_hook)(void*) = NULL;
+    memcpy(&on_init_hook, &vtbl[22], sizeof(on_init_hook));
+    REQUIRE(on_init_hook(app));
+
+    // Invoke posted statusRun runnable (posted_runnables[1])
+    REQUIRE(mock_env.posted_runnables.size() == 2U);
+    invokeRunnableObj(mock_env.posted_runnables[1]);
+    bool saw_entry_reboot = false;
+    bool saw_row_reboot = false;
+    for (size_t i = 0U; i < mock_env.updated_text_models.size(); ++i) {
+        if (mock_env.updated_text_models[i] == plat::rhmi::kTextRebootForBt) {
+            saw_entry_reboot = true;
+        }
+        if (mock_env.updated_text_models[i] == plat::rhmi::kTextRowRebootForBt) {
+            saw_row_reboot = true;
+        }
+    }
+    CHECK(saw_entry_reboot);
+    CHECK(saw_row_reboot);
+
+    void (*on_fin_hook)(void*) = NULL;
+    memcpy(&on_fin_hook, &vtbl[23], sizeof(on_fin_hook));
+    if (on_fin_hook != NULL) {
+        on_fin_hook(app);
+    }
+    info->destroy(app);
+    set_api(NULL, NULL, NULL, NULL, NULL);
+    g_mock_bmw = NULL;
+    dlclose(handle);
+    removeTempDir(dir);
+#endif
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {

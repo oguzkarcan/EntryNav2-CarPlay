@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "carplay/platform/carplay_daemon.hpp"
+#include "carplay/platform/ddp_handoff.hpp"
 #include "carplay/platform/service_contract.hpp"
 
 namespace carplay {
@@ -43,6 +44,8 @@ struct DaemonFileConfig {
 
     std::string usb_port;
     MfiI2cConfig mfi_i2c_config;
+    bool ddp_handoff;
+    DdpRestoreMode ddp_restore;
     int crash_guard_max;
     int64_t crash_guard_window_sec;
     int64_t crash_guard_stable_sec;
@@ -66,6 +69,8 @@ struct DaemonFileConfig {
           touch_enabled(true),
           usb_port(),
           mfi_i2c_config(),
+          ddp_handoff(false),
+          ddp_restore(kDdpRestoreRebootPrompt),
           crash_guard_max(3),
           crash_guard_window_sec(120),
           crash_guard_stable_sec(120) {}

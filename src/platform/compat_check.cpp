@@ -846,6 +846,7 @@ CompatReport runCompatChecks(const CompatCheckConfig& config, CompatSystemOps* o
                 << " wireless=" << (file_cfg.wireless ? "1" : "0")
                 << " wired=" << (file_cfg.wired ? "1" : "0")
                 << " detach_usbfs=" << (file_cfg.detach_usbfs_driver ? "1" : "0")
+                << " ddp_handoff=" << (file_cfg.ddp_handoff ? "1" : "0")
                 << " mfi_i2c="
                 << (file_cfg.mfi_i2c_config.enabled ? file_cfg.mfi_i2c_config.device_path
                                                     : std::string("off"))

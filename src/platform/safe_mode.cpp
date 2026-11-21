@@ -209,6 +209,16 @@ bool loadDaemonConfigFile(const std::string& path,
                     return false;
                 }
             }
+        } else if (key == "ddp_handoff") {
+            if (!parseBoolValue(val, out.ddp_handoff)) {
+                error_out = path + ": invalid ddp_handoff value '" + val + "'";
+                return false;
+            }
+        } else if (key == "ddp_restore") {
+            if (!parseDdpRestoreMode(val, out.ddp_restore)) {
+                error_out = path + ": invalid ddp_restore '" + val + "' (expected reboot_prompt|none)";
+                return false;
+            }
         } else if (key == "crash_guard_max") {
             if (!parseUintRange(val, 0UL, 20UL, u)) {
                 error_out = path + ": invalid crash_guard_max";
@@ -263,6 +273,11 @@ void applyDaemonFileConfig(const DaemonFileConfig& file_cfg, CarPlayDaemonConfig
         daemon_cfg.connectivity_config.usb_host_config.usb_port_filter = file_cfg.usb_port;
     }
     daemon_cfg.mfi_i2c_config = file_cfg.mfi_i2c_config;
+    daemon_cfg.ddp_handoff_config.enabled = file_cfg.ddp_handoff;
+    daemon_cfg.ddp_handoff_config.restore_mode = file_cfg.ddp_restore;
+    if (file_cfg.mfi_i2c_config.enabled && !file_cfg.mfi_i2c_config.device_path.empty()) {
+        daemon_cfg.ddp_handoff_config.i2c_device_path = file_cfg.mfi_i2c_config.device_path;
+    }
 }
 
 bool checkKillSwitch(const std::vector<std::string>& paths, std::string& matched_path_out) {

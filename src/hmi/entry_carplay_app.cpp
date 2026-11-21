@@ -73,6 +73,7 @@ const char* g_state_file = contract::kStateFile;
 const char* g_app_key_file = contract::kAppKeyFile;
 const char* g_day_night_file = contract::kDayNightFile;
 const char* g_media_recall_file = contract::kMediaRecallFile;
+const char* g_ddp_needs_reboot_file = contract::kDdpNeedsRebootFile;
 const char* g_stop_file = contract::kServiceStop;
 const char* g_service_bin = contract::kService;
 const char* g_supervisor_bin = contract::kSupervisor;
@@ -84,6 +85,7 @@ char g_state_file_buf[576] = "";
 char g_app_key_file_buf[576] = "";
 char g_day_night_file_buf[576] = "";
 char g_media_recall_file_buf[576] = "";
+char g_ddp_needs_reboot_file_buf[576] = "";
 char g_stop_file_buf[576] = "";
 char g_service_bin_buf[576] = "";
 char g_supervisor_bin_buf[576] = "";
@@ -95,6 +97,7 @@ void* g_vtbl[36];
 long g_init_time = 0;
 bool g_stable_marked = false;
 bool g_autostart_done = false;
+bool g_ddp_reboot_logged = false;
 unsigned g_shown_text = rhmi::kTextDefault;
 unsigned g_shown_row = rhmi::kTextStart;
 int g_stop_shown = -1;
@@ -173,6 +176,7 @@ void resetPluginConfigToDefaults() {
     g_app_key_file = contract::kAppKeyFile;
     g_day_night_file = contract::kDayNightFile;
     g_media_recall_file = contract::kMediaRecallFile;
+    g_ddp_needs_reboot_file = contract::kDdpNeedsRebootFile;
     g_stop_file = contract::kServiceStop;
     g_service_bin = contract::kService;
     g_supervisor_bin = contract::kSupervisor;
@@ -200,6 +204,7 @@ void resetSessionRuntimeState() {
     g_init_time = 0;
     g_stable_marked = false;
     g_autostart_done = false;
+    g_ddp_reboot_logged = false;
     g_shown_text = rhmi::kTextDefault;
     g_shown_row = rhmi::kTextStart;
     g_stop_shown = -1;
@@ -1052,7 +1057,21 @@ void statusRun(void*) {
         const ServiceState d = readCurrentServiceState();
         const bool connecting = d.is("connecting");
         const bool connected = d.is("connected");
-        const unsigned want_text = connecting ? rhmi::kTextConnecting : rhmi::kTextDefault;
+        bool ddp_needs_reboot = false;
+#ifndef _WIN32
+        ddp_needs_reboot =
+            (g_ddp_needs_reboot_file != NULL && g_ddp_needs_reboot_file[0] != '\0' &&
+             access(g_ddp_needs_reboot_file, F_OK) == 0);
+#endif
+        if (ddp_needs_reboot && !g_ddp_reboot_logged) {
+            g_ddp_reboot_logged = true;
+            appLog("ddp_needs_reboot (%s): DDPServer stopped; reboot headunit to restore BT audio",
+                   g_ddp_needs_reboot_file);
+        }
+        const unsigned want_text =
+            connecting
+                ? rhmi::kTextConnecting
+                : ((!connected && ddp_needs_reboot) ? rhmi::kTextRebootForBt : rhmi::kTextDefault);
         if (want_text != g_shown_text) {
             updateTextModel(g_run_app, rhmi::kEntryTextModel, want_text);
             g_shown_text = want_text;
@@ -1074,8 +1093,11 @@ void statusRun(void*) {
             }
         }
 
-        const unsigned row = connected ? rhmi::kTextRowOpen
-                                       : (connecting ? rhmi::kTextRowConnecting : rhmi::kTextStart);
+        const unsigned row =
+            connected ? rhmi::kTextRowOpen
+                      : (connecting ? rhmi::kTextRowConnecting
+                                    : (ddp_needs_reboot ? rhmi::kTextRowRebootForBt
+                                                        : rhmi::kTextStart));
         if (row != g_shown_row) {
             updateTextModel(g_run_app, rhmi::kStartRowModel, row);
             g_shown_row = row;
@@ -1292,6 +1314,9 @@ __attribute__((visibility("default"))) void entryCarPlaySetFrameworkApiForTest(
             snprintf(g_media_recall_file_buf, sizeof(g_media_recall_file_buf),
                      "%s/media-recall", g_data_dir);
             g_media_recall_file = g_media_recall_file_buf;
+            snprintf(g_ddp_needs_reboot_file_buf, sizeof(g_ddp_needs_reboot_file_buf),
+                     "%s/ddp-needs-reboot", g_data_dir);
+            g_ddp_needs_reboot_file = g_ddp_needs_reboot_file_buf;
             g_supervisor_bin = "";
             g_service_bin = "";
         }
@@ -1318,6 +1343,8 @@ __attribute__((visibility("default"))) void entryCarPlaySetFrameworkApiForTest(
                              test_opts->day_night_file, g_day_night_file);
             copyPathOverride(g_media_recall_file_buf, sizeof(g_media_recall_file_buf),
                              test_opts->media_recall_file, g_media_recall_file);
+            copyPathOverride(g_ddp_needs_reboot_file_buf, sizeof(g_ddp_needs_reboot_file_buf),
+                             test_opts->ddp_needs_reboot_file, g_ddp_needs_reboot_file);
             if (test_opts->stop_term_ms > 0L) {
                 g_stop_term_ms = test_opts->stop_term_ms;
             }

@@ -79,6 +79,9 @@ void printUsage(const char* argv0) {
         "  --no-wired             Disable Wired USB CarPlay (default)\n"
         "  --mfi-i2c DEV[:ADDR]   Enable I2C MFi coprocessor auth (e.g. /dev/i2c-0:0x10; default off)\n"
         "  --no-mfi-i2c           Disable I2C MFi coprocessor auth (default)\n"
+        "  --ddp-handoff          Opt-in: stop DDPServer cleanly before opening /dev/i2c-0\n"
+        "  --no-ddp-handoff       Disable DDPServer handoff (default)\n"
+        "  --ddp-restore MODE     DDP behavior on end: reboot_prompt (default) or none\n"
         "  --compat               Run dry-run vehicle compatibility self-check and exit\n"
         "  --self-check           Alias for --compat\n"
         "  --compat-mfi-read      With --compat and --mfi-i2c/mfi_i2c=, read CP reg 0x00 (risk: bus contention)\n"
@@ -122,6 +125,10 @@ struct CliOverrides {
     bool wired;
     bool has_mfi_i2c;
     carplay::platform::MfiI2cConfig mfi_i2c_config;
+    bool has_ddp_handoff;
+    bool ddp_handoff;
+    bool has_ddp_restore;
+    carplay::platform::DdpRestoreMode ddp_restore;
 
     CliOverrides()
         : compat_mode(false),
@@ -153,7 +160,11 @@ struct CliOverrides {
           has_wired(false),
           wired(false),
           has_mfi_i2c(false),
-          mfi_i2c_config() {}
+          mfi_i2c_config(),
+          has_ddp_handoff(false),
+          ddp_handoff(false),
+          has_ddp_restore(false),
+          ddp_restore(carplay::platform::kDdpRestoreRebootPrompt) {}
 };
 
 }  // namespace
@@ -262,6 +273,24 @@ int main(int argc, char** argv) {
             cli.has_mfi_i2c = true;
             cli.mfi_i2c_config = carplay::platform::MfiI2cConfig();
             cli.mfi_i2c_config.enabled = false;
+        } else if (strcmp(arg, "--ddp-handoff") == 0) {
+            cli.has_ddp_handoff = true;
+            cli.ddp_handoff = true;
+        } else if (strcmp(arg, "--no-ddp-handoff") == 0) {
+            cli.has_ddp_handoff = true;
+            cli.ddp_handoff = false;
+        } else if (strncmp(arg, "--ddp-restore=", 14) == 0 ||
+                   (strcmp(arg, "--ddp-restore") == 0 && val != NULL)) {
+            const char* mode_str = (strncmp(arg, "--ddp-restore=", 14) == 0) ? (arg + 14) : val;
+            if (!carplay::platform::parseDdpRestoreMode(mode_str, cli.ddp_restore)) {
+                fprintf(stderr, "carplayd: invalid --ddp-restore '%s' (expected reboot_prompt|none)\n",
+                        mode_str);
+                return 2;
+            }
+            cli.has_ddp_restore = true;
+            if (strncmp(arg, "--ddp-restore=", 14) != 0) {
+                ++i;
+            }
         } else {
             fprintf(stderr, "carplayd: unknown option: %s\n", arg);
             printUsage(argv[0]);
@@ -407,6 +436,15 @@ int main(int argc, char** argv) {
     }
     if (cli.has_mfi_i2c) {
         cfg.mfi_i2c_config = cli.mfi_i2c_config;
+        if (cli.mfi_i2c_config.enabled && !cli.mfi_i2c_config.device_path.empty()) {
+            cfg.ddp_handoff_config.i2c_device_path = cli.mfi_i2c_config.device_path;
+        }
+    }
+    if (cli.has_ddp_handoff) {
+        cfg.ddp_handoff_config.enabled = cli.ddp_handoff;
+    }
+    if (cli.has_ddp_restore) {
+        cfg.ddp_handoff_config.restore_mode = cli.ddp_restore;
     }
 
     signal(SIGINT, &onSignal);
@@ -433,7 +471,11 @@ int main(int argc, char** argv) {
     if (stable_tid != carplay::platform::Reactor::kNoTimer) {
         daemon.reactor().cancelTimer(stable_tid);
     }
+    const bool startup_failed = daemon.hasStartupFailure();
     daemon.stop();
+    if (startup_failed) {
+        return 1;
+    }
     crash_guard.clearOnCleanExit();
     return 0;
 }

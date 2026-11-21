@@ -1833,4 +1833,72 @@ TEST_CASE(bridgeNcmStreamSplitAndPreReadyOutNak) {
     bridge.stop();
 }
 
+TEST_CASE(coexistenceSafeDefaultsAndSwitchWithoutSpuriousError) {
+    // Coexistence defaults: never detach kernel drivers or BMW CARPLAY usbfs drivers automatically.
+    UsbHostConfig host_cfg;
+    CHECK(!host_cfg.detach_kernel_driver);
+    CHECK(!host_cfg.detach_usbfs_driver);
+
+    UsbCarPlayBridgeConfig bridge_cfg;
+    CHECK(!bridge_cfg.detach_kernel_driver);
+    CHECK(!bridge_cfg.detach_usbfs_driver);
+
+    Reactor reactor;
+    REQUIRE(reactor.init());
+
+    // Attached USBMUX-only configuration (no iAP2 or NCM) with auto_request_carplay_switch=true:
+    // clean 0xc0/0x52 switch should wait for re-enumeration without emitting an error.
+    FakeUsbHost fake_usb;
+    FakeTapPort fake_tap;
+    std::vector<uint8_t> usbmux_only;
+    {
+        std::vector<uint8_t> iface;
+        iface.push_back(9U);
+        iface.push_back(4U);
+        iface.push_back(0U);
+        iface.push_back(0U);
+        iface.push_back(2U);
+        iface.push_back(0xffU);
+        iface.push_back(0xfeU);
+        iface.push_back(0x02U);
+        iface.push_back(0U);
+        // Bulk IN + Bulk OUT
+        iface.push_back(7U);
+        iface.push_back(5U);
+        iface.push_back(0x81U);
+        iface.push_back(2U);
+        pushU16Le(iface, 512U);
+        iface.push_back(0U);
+        iface.push_back(7U);
+        iface.push_back(5U);
+        iface.push_back(0x01U);
+        iface.push_back(2U);
+        pushU16Le(iface, 512U);
+        iface.push_back(0U);
+
+        std::vector<uint8_t> cfg;
+        cfg.push_back(9U);
+        cfg.push_back(2U);
+        pushU16Le(cfg, static_cast<uint16_t>(9U + iface.size()));
+        cfg.push_back(1U);
+        cfg.push_back(1U);
+        cfg.push_back(0U);
+        cfg.push_back(0x80U);
+        cfg.push_back(250U);
+        cfg.insert(cfg.end(), iface.begin(), iface.end());
+        usbmux_only = cfg;
+    }
+
+    bridge_cfg.auto_request_carplay_switch = true;
+    UsbCarPlayBridge bridge(fake_usb, fake_tap, bridge_cfg);
+    RecordingBridgeListener listener;
+    REQUIRE(bridge.start(reactor, &listener));
+
+    fake_usb.simulateArrival(usbmux_only, 1U);
+    CHECK_EQ(1, fake_usb.switch_calls_);
+    CHECK(listener.errors.empty());
+    CHECK_EQ(kBridgeWaiting, bridge.state());
+    bridge.stop();
+}
+
 int main() { return test_support::runAll("test_usb_bridge"); }

@@ -296,6 +296,44 @@ TEST_CASE(safeModeDaemonBinaryKillSwitchAndCrashGuard) {
 #endif
 }
 
+TEST_CASE(parsesDdpHandoffAndRestoreKeys) {
+    const std::string dir = makeTempDir("safe_mode_ddp");
+    const std::string conf = plat::joinPath(dir, "carplay.conf");
+
+    {
+        const std::string txt =
+            "enabled=1\n"
+            "mfi_i2c=/dev/i2c-0:0x10\n"
+            "ddp_handoff=1\n"
+            "ddp_restore=none\n";
+        REQUIRE(plat::writeFileAtomic(conf, reinterpret_cast<const uint8_t*>(txt.data()), txt.size()));
+
+        plat::DaemonFileConfig fcfg;
+        std::string err;
+        REQUIRE(plat::loadDaemonConfigFile(conf, fcfg, err));
+        CHECK(fcfg.ddp_handoff);
+        CHECK_EQ(static_cast<int>(plat::kDdpRestoreNone), static_cast<int>(fcfg.ddp_restore));
+
+        plat::CarPlayDaemonConfig dcfg;
+        plat::applyDaemonFileConfig(fcfg, dcfg);
+        CHECK(dcfg.ddp_handoff_config.enabled);
+        CHECK_EQ(static_cast<int>(plat::kDdpRestoreNone),
+                 static_cast<int>(dcfg.ddp_handoff_config.restore_mode));
+        CHECK_EQ(std::string("/dev/i2c-0"), dcfg.ddp_handoff_config.i2c_device_path);
+    }
+
+    {
+        const std::string bad_txt = "ddp_restore=restart\n";
+        REQUIRE(plat::writeFileAtomic(conf, reinterpret_cast<const uint8_t*>(bad_txt.data()), bad_txt.size()));
+        plat::DaemonFileConfig fcfg;
+        std::string err;
+        CHECK(!plat::loadDaemonConfigFile(conf, fcfg, err));
+        CHECK(err.find("ddp_restore") != std::string::npos);
+    }
+
+    removeTempDir(dir);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {

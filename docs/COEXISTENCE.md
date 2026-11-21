@@ -46,23 +46,33 @@ On the target BMW `HU_ENTRYNAV2` (`/etc/version` `202402191339`), activating nat
 
 - **Visit 2 Verdict:** Native `CARPLAY` stays idle (`00:00:00` CPU, empty `/var/local/data/CarPlay`, no AP, no mDNS fd) because FSC coding (`va_CARPLAY_SWT`) fails. `DDPServer` only runs iPod/Audio (`NmeIAPDBusEntryEvoAudio`), never CarPlay.
 
-### Option D — Explicit, Opt-In, Strictly Reversible Suspend of `DistributedDeviceProtocol.service` (**Recommended Path — verified 2026-11-21 visit 2**)
+### Option D — Opt-In Irreversible-Until-Reboot `DDPServer` Handoff (`ddp_handoff`, **Revised & Implemented After Visit 3**)
 
-- **Mechanism:** Keep all BMW units untouched by default (`mfi_i2c` off, `suspend_ddp=0`). When hardware MFi auth is explicitly enabled via opt-in config/CLI, cleanly `systemctl stop DistributedDeviceProtocol.service` (a standalone `438` B unit under `After=vmostAuxinDiag.service`, `User=auxmms`, `Group=mplayer` — keeping `CARPLAY.service` and `MediaManagementServer.service` running unless wired USB testing also proves `vmostAuxInUSB12.service` contends) **only while our active CarPlay auth/session runs**, and **unconditionally `systemctl start` it** on teardown, `SIGTERM`/`SIGINT`, or crash-guard trip.
-- **Pros:** Guarantees exclusive ownership of `/dev/i2c-0` with our already-tested `I2cMfiAuthProvider`; prevents `DDPServer` BT Slot-0 `NmeIAP2Link` handshakes from racing with `carplayd` on `/dev/i2c-0` OR fighting iOS with a second simultaneous iAP2 session; preserves `CARPLAY.service` (which is idle and keeps `wlan0` `iptables` CarPlay ports open); 100% reversible on exit or uninstall.
-- **Risks & Visit 3 Checks:**
-  1. Stopping `DistributedDeviceProtocol.service` temporarily disables native USB iPod / BT AVRCP (`NmeIAPDBusEntryEvoAudio`) while CarPlay is active (acceptable trade-off while CarPlay owns media/audio).
-  2. Verify on Visit 3 whether `systemctl stop DistributedDeviceProtocol.service` restarts automatically or cascades to `MediaManagementServer`, whether CP `0x10`/`0x11` responds cleanly to `--compat-mfi-read`, and whether `CARPLAY.service`'s `authenticated_uid=1081` blocks DRM rendering or whether `root` `carplayd` renders cleanly via `omapdrm`/`Wayland`.
+- **Why the original "stop + restart" assumption changed (verified 2026-11-21 visit 3):**
+  - `DistributedDeviceProtocol.service` has **`KillMode=none`**, **no `ExecStop`**, `Restart=no`, `WatchdogSec=75`, `User=auxmms`, `Group=mplayer`, `WantedBy=unfocussed.target`.
+  - Calling `systemctl stop DistributedDeviceProtocol.service` alone leaves `DDPServer` running and still holding `/dev/i2c-0`.
+  - Sending `SIGTERM` explicitly to the verified `DDPServer` PID (`/proc/<pid>/exe -> .../MediaPlayer/bin/DDPServer`) stops `DDPServer` within ~1 s and frees `/dev/i2c-0` (`0` holders). Never use `SIGKILL` (`-9`).
+  - Calling `systemctl start DistributedDeviceProtocol.service` afterward spawns a fresh `DDPServer` PID that **does not reopen `/dev/i2c-0` and does not restore Bluetooth music**; an ignition off/on cycle did **not** recover it either — **only an explicit `systemctl reboot` (~3 min shutdown+boot) restored `DDPServer` and BT music**.
+- **Implemented `ddp_handoff` design (`include/carplay/platform/ddp_handoff.hpp`, opt-in default OFF):**
+  - Config keys in `/var/local/data/CarPlay/carplay.conf`:
+    - `ddp_handoff=0|1` (default `0`; CLI `--ddp-handoff` / `--no-ddp-handoff`).
+    - `ddp_restore=reboot_prompt|none` (default `reboot_prompt`; CLI `--ddp-restore=reboot_prompt|none`; **never** auto-restarts `DDPServer`).
+  - When `ddp_handoff=1` and `mfi_i2c` is enabled, **before opening `/dev/i2c-0`**:
+    1. `DdpHandoff` forks/execs `/bin/systemctl stop DistributedDeviceProtocol.service` non-blockingly on the single-threaded `Reactor` (`fork`/`execv` + `O_CLOEXEC` pipe, zero `system()`/`popen()`).
+    2. Scans `/proc` and sends `SIGTERM` (`kill(pid, SIGTERM)`, never `-9`) **only** to live non-zombie PIDs whose resolved `/proc/<pid>/exe` ends in `/MediaPlayer/bin/DDPServer`.
+    3. Polls non-blockingly up to **`<= 5 s`** until all `DDPServer` PIDs have exited **and** no process holds an open fd on `/dev/i2c-0` (or the configured I2C device path).
+    4. If any process still holds `/dev/i2c-0` (or `systemctl`/`SIGTERM` fails or times out), **aborts the session cleanly without ever opening `/dev/i2c-0`**.
+    5. Once `I2cMfiAuthProvider` opens `/dev/i2c-0`, if the coprocessor probe fails, `CarPlayDaemon` immediately calls `mfi_auth_->stop()` (closing `/dev/i2c-0` so the bus is never left half-used) and aborts.
+  - **On session end / daemon exit:** `carplayd` does **not** run `systemctl start` on `DDPServer`. Instead, when `ddp_restore=reboot_prompt`, it atomically writes `/tmp/entry-carplayd-ddp-needs-reboot`, logs the reboot requirement, and `libEntryCarPlay.so` surfaces `"Apple CarPlay (Reboot for BT audio)"` / `"Start CarPlay (Reboot for BT audio)"` in the iDrive menu while idle (plus a one-time notice in `app.log`).
 
 ---
 
-## 4. Recommended Coexistence Strategy (Post-Visit 2 Decision)
+## 4. Visit 3 Results & Post-Visit-3 Strategy (`verified 2026-11-21 visit 3`)
 
-1. **Default Installation Remains Safe & Non-Invasive:** Ship safe defaults (`wireless=0`, `wired=0`, `detach_usbfs_driver=0`, `mfi_i2c` commented out, no service stopped by default). Keep **`CARPLAY.service` running** so its `wlan0` `iptables` allow-rules stay in place unless Visit 3 finds interference (`omapdrm` `authenticated_uid=1081`).
-2. **Primary Hardware-MFi & Session Path — Option D:** Adopt **Option D** (explicit, opt-in, strictly reversible suspend/restore of `DistributedDeviceProtocol.service` while `carplayd` runs MFi auth/sessions; adding `vmostAuxInUSB12.service` only if wired USB testing shows `vmostAuxInUSB` reclaims `05ac:12a8`). Never attempt undocumented `DDPServer` socket hijacking (Option A) or blind concurrent `/dev/i2c-0` writes (Option B).
-3. **Wireless-First Session Validation (Visit 3):**
-   - Run `carplayd --compat` to verify `@ok|ilm|800x480 top_first=1` (using `/etc/wayland/compositor.conf`).
-   - Run one-shot `--compat --mfi-i2c=/dev/i2c-0 --compat-mfi-read` (ideally with `DistributedDeviceProtocol.service` stopped under opt-in test) to confirm Apple CP address (`0x10` vs `0x11`), `dev_ver`, `proto_major`, and `cert_len`.
-   - Test wireless bring-up (`ALPS` Slot `5` + `vmostd`/`wland` + `mdnsd` + Option D MFi), verifying `iptables`, `wland` 2.4 vs 5 GHz channel, and DRM/Wayland frame output.
-4. **Wired USB Second:** Test `--wired` `0xC0/0x52` CarPlay switch and CDC-NCM/`TapIface` on port `3-1` with fast 2s `--watch` to confirm whether `vmostAuxInUSB12.service` also needs opt-in suspend during wired sessions.
-5. **HMI Plugin (`EntryCarPlay` vs `EntryAad`):** `hmiapp/EntryCarPlay.xml` now uses `entryButtonFocusID="32753"` (`0x7FF1`) instead of `32752` (`EntryAad`); verify side-by-side `HmiMain3D` menu rendering in Visit 3 before permanent plugin installation.
+1. **Confirmed on HU in Visit 3 (verified 2026-11-21 visit 3):**
+   - **MFi chip present:** `@ok|mfi|/dev/i2c-0 I2C_FUNCS ok, addr=0x10 dev_ver=0x05` (with `DDPServer` stopped).
+   - **`omapdrm` + LayerManager:** `CARPLAY.service` (`authenticated_uid=1081`) does **not** block `root` `carplayd` from allocating `omapdrm` dma-buf (`4x524288 B`) or rendering `800x480` on surface `0x7ec00001` / layer `0x80000000` (`genivi-flip-renderorder=1`).
+   - **vMOST & HMI Coexistence:** `EntryCarPlay` (`32753`) coexists stably in `HmiMain3D` alongside `EntryAad` (`32752`); `knob: controller protocol locked: older CCS (E5.01, C10/C20)`; `STOP` file exits cleanly (`0`) and the plugin debounces relaunch (`3 s`).
+   - **Reboot vs Ignition & Persistent Uninstall:** Normal ignition off/on does **not** reboot `HU_ENTRYNAV2`; `systemctl reboot` is required to reload HMI plugins and wipes `/tmp/carplay-stage`, so `install.sh` now stores `uninstall.sh` inside `/var/local/data/CarPlay/.install-backup/uninstall.sh`.
+2. **Default Installation Remains Non-Invasive:** `carplay.conf` still defaults to `wireless=0`, `wired=0`, `detach_usbfs_driver=0`, `ddp_handoff=0`, and `# mfi_i2c=/dev/i2c-0:0x10` commented out. `CARPLAY.service` stays running (zero runtime contention, provides `wlan0` firewall rules).
+3. **Visit 4 Order of Operations:** Test **wired USB + MFi** (`wired=1`, `mfi_i2c=/dev/i2c-0:0x10`, `ddp_handoff=1`, `detach_usbfs_driver=0`) first via `/var/local/data/CarPlay/carplay.conf`, observing `vmostAuxInUSB` coexistence during `0xC0/0x52` CarPlay switch, `0x30..0x3F` cert read, and live session video/audio/input; then test **wireless** (`wireless=1`) once wired is proven. See [docs/CAR_VISIT.md](CAR_VISIT.md).

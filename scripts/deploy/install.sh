@@ -223,6 +223,10 @@ enabled=1
 wireless=$CFG_WIRELESS
 wired=$CFG_WIRED
 detach_usbfs_driver=0
+# Opt-in DDPServer handoff for /dev/i2c-0 MFi auth (0=off, 1=stop DDPServer cleanly):
+ddp_handoff=0
+# DDPServer restore policy on session end when ddp_handoff=1 (reboot_prompt|none):
+# ddp_restore=reboot_prompt
 # MFi I2C coprocessor (default off; uncomment only after verifying /dev/i2c-0 ownership):
 # mfi_i2c=/dev/i2c-0:0x10
 crash_guard_max=3
@@ -299,6 +303,16 @@ fi
 
 # 5. Safe-mode config file
 install_generated_conf
+
+# 6. Persistent uninstall script inside backup dir (survives /tmp wipe on reboot)
+UNINSTALL_SRC="$SCRIPT_DIR/uninstall.sh"
+if [ -f "$UNINSTALL_SRC" ]; then
+    log_act "copy $UNINSTALL_SRC -> $BACKUP_DIR/uninstall.sh"
+    if [ "$DRY_RUN" -eq 0 ]; then
+        cp -p "$UNINSTALL_SRC" "$BACKUP_DIR/uninstall.sh"
+        chmod 0755 "$BACKUP_DIR/uninstall.sh"
+    fi
+fi
 
 if [ "$NO_REMOUNT" -eq 0 ] && [ "$IS_LIVE_ROOT" -eq 1 ]; then
     log_act "sync && mount -o remount,ro /"

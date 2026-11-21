@@ -153,7 +153,9 @@ CarPlayConnectivityConfig::CarPlayConnectivityConfig()
       handoff_timeout_ms(30000),
       wired_failure_retry_ms(2000),
       start_mdns_on_wireless(true),
-      sdp_socket_path("/var/run/sdp") {}
+      sdp_socket_path("/var/run/sdp") {
+    usb_bridge_config.auto_request_carplay_switch = true;
+}
 
 bool CarPlayConnectivity::UnavailableAuthProvider::getCertificate(
     std::vector<uint8_t>& certificate_out) {

@@ -24,6 +24,7 @@
 #include "carplay/airplay_session.hpp"
 #include "carplay/pairing.hpp"
 #include "carplay/platform/carplay_connectivity.hpp"
+#include "carplay/platform/ddp_handoff.hpp"
 #include "carplay/platform/evo_audio.hpp"
 #include "carplay/platform/evo_control.hpp"
 #include "carplay/platform/evo_ilm.hpp"
@@ -55,6 +56,7 @@ struct CarPlayDaemonConfig {
     std::string app_key_file;
     std::string day_night_file;
     std::string media_recall_file;
+    std::string ddp_needs_reboot_file;
     std::string stop_file;
     /// Optional flag set by a signal handler; polled on every tick (NULL = unused).
     const volatile sig_atomic_t* stop_flag;
@@ -93,6 +95,7 @@ struct CarPlayDaemonConfig {
     MediaEngineConfig media_config;
     CarPlayConnectivityConfig connectivity_config;
     MfiI2cConfig mfi_i2c_config;
+    DdpHandoffConfig ddp_handoff_config;
 
     CarPlayDaemonConfig()
         : control_port(7000U),
@@ -103,6 +106,7 @@ struct CarPlayDaemonConfig {
           app_key_file(contract::kAppKeyFile),
           day_night_file(contract::kDayNightFile),
           media_recall_file(contract::kMediaRecallFile),
+          ddp_needs_reboot_file(contract::kDdpNeedsRebootFile),
           stop_file(contract::kServiceStop),
           stop_flag(NULL),
           enable_video(true),
@@ -127,13 +131,16 @@ struct CarPlayDaemonConfig {
           server_config(),
           media_config(),
           connectivity_config(),
-          mfi_i2c_config() {}
+          mfi_i2c_config(),
+          ddp_handoff_config() {}
 };
 
 class CarPlayDaemon : public session::SessionListener,
                       public MediaSink,
                       public EvoInputListener,
-                      public TimerHandler {
+                      public TimerHandler,
+                      public DdpHandoff::Callback,
+                      public I2cMfiAuthProvider::ProbeCallback {
 public:
     explicit CarPlayDaemon(const CarPlayDaemonConfig& config = CarPlayDaemonConfig());
     virtual ~CarPlayDaemon();
@@ -194,9 +201,19 @@ public:
 
     /// Test hook: inject a non-owning fake I2cBackend before start() when mfi_i2c_config.enabled is true.
     void setMfiI2cBackendForTest(I2cBackend* backend) { mfi_backend_override_ = backend; }
+    /// Test hook: inject a non-owning fake DdpHandoffOps before start().
+    void setDdpHandoffOpsForTest(DdpHandoffOps* ops) { ddp_ops_override_ = ops; }
+    bool hasStartupFailure() const { return startup_failure_; }
+    bool ddpNeedsReboot() const { return ddp_needs_reboot_; }
 
     // ---- TimerHandler (Reactor thread) ----
     virtual void onTimer(uint32_t timer_id);
+
+    // ---- DdpHandoff::Callback (Reactor thread) ----
+    virtual void onDdpHandoffFinished(bool ok, bool did_stop_ddp, const std::string& detail);
+
+    // ---- I2cMfiAuthProvider::ProbeCallback (Reactor thread) ----
+    virtual void onProbeComplete(bool ok, const MfiChipInfo& info);
 
     // ---- session::SessionListener (Reactor thread) ----
     virtual void onSessionActive(session::Session& session);
@@ -239,6 +256,8 @@ private:
     void drainControlQueue();
     void applyDayNight(int val);
     void activateSessionFocus();
+    bool startMfiAndConnectivity();
+    void recordDdpNeedsReboot(const char* reason);
 
     CarPlayDaemonConfig config_;
     Reactor reactor_;
@@ -258,6 +277,8 @@ private:
 
     MediaEngine* media_engine_;
     I2cBackend* mfi_backend_override_;
+    DdpHandoffOps* ddp_ops_override_;
+    DdpHandoff* ddp_handoff_;
     I2cMfiAuthProvider* mfi_auth_;
     SessionServer* server_;
     CarPlayConnectivity connectivity_;
@@ -277,6 +298,9 @@ private:
     uint32_t tick_timer_;
     bool started_;
     bool stopping_;
+    bool startup_failure_;
+    bool ddp_was_stopped_;
+    bool ddp_needs_reboot_;
     bool video_running_;
     bool session_focus_initialized_;
     bool focus_;

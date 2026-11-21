@@ -102,7 +102,7 @@ struct UsbCarPlayBridgeConfig {
     size_t max_consecutive_urb_errors;
 
     UsbCarPlayBridgeConfig()
-        : detach_kernel_driver(true),
+        : detach_kernel_driver(false),
           detach_usbfs_driver(false),
           auto_request_carplay_switch(false),
           ncm_allow_control_fallback(true),

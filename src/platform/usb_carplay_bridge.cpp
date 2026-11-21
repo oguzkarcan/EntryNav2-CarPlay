@@ -216,7 +216,12 @@ void UsbCarPlayBridge::onUsbDeviceArrived(
             switch_sent_for_device_ = true;
             CARPLAY_LOG_INFO("usb-bridge",
                              "no iAP2/NCM interface in current descriptors; sending CarPlay mode switch");
-            if (!sendCarPlayModeSwitch()) {
+            if (sendCarPlayModeSwitch()) {
+                awaiting_reenum_from_switch_ = true;
+                teardownDevice(false, true);
+                return;
+            }
+            {
                 std::vector<uint8_t> mode;
                 if (usb_->queryAppleUsbMode(mode)) {
                     CARPLAY_LOG_INFO("usb-bridge", "Apple USB mode query after rejection: %s",

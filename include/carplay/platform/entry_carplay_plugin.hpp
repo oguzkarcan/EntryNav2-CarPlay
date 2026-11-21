@@ -106,6 +106,7 @@ struct EntryCarPlayTestOptions {
     const char* app_key_file;
     const char* day_night_file;
     const char* media_recall_file;
+    const char* ddp_needs_reboot_file;
     long stop_term_ms;
     long stop_kill_ms;
     long stop_giveup_ms;
@@ -119,6 +120,7 @@ struct EntryCarPlayTestOptions {
           app_key_file(NULL),
           day_night_file(NULL),
           media_recall_file(NULL),
+          ddp_needs_reboot_file(NULL),
           stop_term_ms(0L),
           stop_kill_ms(0L),
           stop_giveup_ms(0L),

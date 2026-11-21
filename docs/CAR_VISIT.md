@@ -68,12 +68,12 @@ Varsayılan kurulum **`wireless=0` ve `wired=0`** ile kurulur. iDrive menüsünd
    sh /tmp/carplay-stage/deploy/install.sh \
        --stage /tmp/carplay-stage/install-root --mode safe
    ```
-4. Günlük kaydını açıp üniteyi yeniden başlatın:
+4. Günlük kaydını açıp üniteyi **`systemctl reboot`** ile yeniden başlatın (*önemli: normal kontak kapat/aç üniteyi yeniden başlatmaz ve `HmiMain3D` yeni eklentiyi yalnızca tam `systemctl reboot` sonrası ~3 dakikada yükler*):
    ```sh
    touch /var/local/data/CarPlay/maintenance
-   reboot
+   systemctl reboot
    ```
-5. Açılış sonrası kontrol:
+5. Açılış sonrası kontrol (`systemctl reboot` `/tmp/carplay-stage`'i temizler; kalıcı kaldırma kopyası artık `/var/local/data/CarPlay/.install-backup/uninstall.sh` içindedir):
    - iDrive **Media → Apple CarPlay** satırının göründüğünü ve iDrive'ın çökmeden stabil çalıştığını doğrulayın.
    - Güvenlik testi: `touch /var/local/data/CarPlay/killswitch` oluşturup menüden başlatmayı deneyin; `carplayd` anında durup nedenini loglamalıdır. Sonra `rm -f /var/local/data/CarPlay/killswitch` ile kaldırın.
 
@@ -131,13 +131,13 @@ Test bittikten sonra flash belleği yormamak için logları kapatabilirsiniz:
   rm -f /tmp/entry-carplay-crash-guard /tmp/entry-carplay-disabled-until-reboot \
         /var/local/data/CarPlay/app-guard /var/local/data/CarPlay/bootguard
   ```
-- **Tam kaldırma (değiştirilen dosyaları bayt-bayt geri yükler):**
+- **Tam kaldırma (değiştirilen dosyaları bayt-bayt geri yükler; yeniden başlatma sonrası `/tmp/carplay-stage` silinse bile kalıcı yedek dizininden çalışır):**
   ```sh
-  sh /tmp/carplay-stage/deploy/uninstall.sh --dry-run
-  sh /tmp/carplay-stage/deploy/uninstall.sh
-  reboot
+  sh /var/local/data/CarPlay/.install-backup/uninstall.sh --dry-run
+  sh /var/local/data/CarPlay/.install-backup/uninstall.sh
+  systemctl reboot
   ```
-- **iDrive ekranı donarsa:** iDrive ses/güç düğmesini yaklaşık **30 saniye** basılı tutarak üniteyi yeniden başlatın. `/` `rw` kaldıysa `mount -o remount,ro /` veya `reboot` çalıştırın.
+- **iDrive ekranı donarsa:** iDrive ses/güç düğmesini yaklaşık **30 saniye** basılı tutarak üniteyi yeniden başlatın. `/` `rw` kaldıysa `mount -o remount,ro /` veya `systemctl reboot` çalıştırın.
 
 ### 10. Geliştiriciye Neler Gönderilmeli?
 1. `carplay-visit-*.tar.gz` arşivi (içindeki `SUMMARY.txt`, `i2c_mfi.txt` ve tüm `.txt` raporlarıyla).
@@ -176,6 +176,52 @@ Ziyaret 1 (2026-11-21) sonucunda yerel `/usr/local/bin/CARPLAY` sürecinin çal�
    scp root@169.254.1.0:/tmp/visit2_out/carplay-visit-*.tar.gz .
    scp root@169.254.1.0:/tmp/visit2_watch/native_carplay.txt .
    ```
+
+### 12. Ziyaret 3 Özeti ve Ziyaret 4 Kontrol Listesi — Kablolu USB + MFi (`ddp_handoff=1`)
+Ziyaret 3 (`2026-11-21 visit 3`) donanım üzerinde şunları doğruladı:
+- **MFi çipi mevcut:** `DDPServer` durdurulduğunda `/dev/i2c-0` üzerinde `@ok|mfi|/dev/i2c-0 I2C_FUNCS ok, addr=0x10 dev_ver=0x05`.
+- **`DDPServer` davranışı (`KillMode=none`):** `systemctl stop DistributedDeviceProtocol.service` tek başına `DDPServer` sürecini öldürmez. Doğrulanmış `.../MediaPlayer/bin/DDPServer` PID'sine `SIGTERM` göndermek `/dev/i2c-0`'ı boşaltır; ancak sonrasında `systemctl start` veya kontak kapat/aç **`DDPServer`'ı ve Bluetooth müziği geri getirmez** — yalnızca tam **`systemctl reboot`** (~3 dk) geri yükler.
+- **Güvenli mod kurulumu & `HmiMain3D`:** `EntryCarPlay` (`32753`) + `EntryAad` (`32752`) kararlı çalıştı, `800x480` yüzey `0x7ec00001` (`genivi-flip-renderorder=1`) ve `older CCS (E5.01, C10/C20)` kilitlendi, `STOP` dosyası temiz çıktı (`0`). Not: yeni eklenti kontakla değil **yalnızca `systemctl reboot`** ile yüklenir.
+
+**Ziyaret 4 Adımları (Yalnızca `/var/local` değişir — `/` yeniden bağlanmaz!):**
+1. Yeni derlenen kurulumu yükleyip yeniden başlatın (`install.sh` artık `uninstall.sh` kopyasını `/var/local/data/CarPlay/.install-backup/` içine yazar):
+   ```sh
+   scp -r build/arm-entrynav2/install-root scripts/deploy root@169.254.1.0:/tmp/carplay-stage
+   ssh root@169.254.1.0 'sh /tmp/carplay-stage/deploy/install.sh --stage /tmp/carplay-stage/install-root --mode safe && touch /var/local/data/CarPlay/maintenance && systemctl reboot'
+   ```
+2. Açılıştan sonra (`/var/local` kalıcı ve yazılabilirdir; `remount` gerekmez) `/var/local/data/CarPlay/carplay.conf` içinde yalnızca şu satırları ayarlayın (`wireless=0` ve `detach_usbfs_driver=0` kalsın):
+   ```ini
+   enabled=1
+   wireless=0
+   wired=1
+   detach_usbfs_driver=0
+   ddp_handoff=1
+   ddp_restore=reboot_prompt
+   mfi_i2c=/dev/i2c-0:0x10
+   ```
+   *(Önemli not: `ddp_handoff=1` ile oturum başladığında `DDPServer` durdurulur; CarPlay kapatılsa bile Bluetooth müzik bir sonraki `systemctl reboot`'a kadar geri gelmez ve iDrive menüsü boşta iken `"Apple CarPlay (Reboot for BT audio)"` gösterir.)*
+3. iPhone'u orta konsol USB portuna (`3-1`) veri kablosuyla bağlayın ve iDrive'da **Media → Start Apple CarPlay** seçin.
+4. SSH üzerinden canlı durumu ve günlükleri toplayın:
+   ```sh
+   cat /tmp/entry-carplayd-state /tmp/entry-carplayd-ddp-needs-reboot 2>/dev/null
+   ip -6 addr show dev carplay0 2>/dev/null
+   ls -l /proc/*/fd 2>/dev/null | grep -E 'i2c-0|bus/usb' || true
+   tail -n 120 /tmp/entry-carplay-service.log
+   scp root@169.254.1.0:/tmp/entry-carplay-service.log .
+   scp root@169.254.1.0:/var/local/data/CarPlay/app.log .
+   ```
+   *USB çakışması görülürse ek olarak:* `sh /tmp/native_carplay_probe.sh --out-dir /tmp/v4_usb --watch 10` ile `vmostAuxInUSB` davranışını kaydedin.
+5. **Acil durdurma (Kill switch) & güvenli geri dönüş (BT müziği geri getirme):**
+   ```sh
+   # Anında durdurma:
+   touch /var/local/data/CarPlay/killswitch
+   touch /tmp/entry-carplay-service/STOP
+   # Güvenli ayarlara geri dön ve BT müziği / DDPServer'ı geri yükle (remount gerekmez):
+   # /var/local/data/CarPlay/carplay.conf -> wired=0, ddp_handoff=0, # mfi_i2c=/dev/i2c-0:0x10
+   rm -f /var/local/data/CarPlay/killswitch
+   systemctl reboot
+   ```
+   Tam kaldırma için (reboot sonrasında bile): `sh /var/local/data/CarPlay/.install-backup/uninstall.sh --dry-run && sh /var/local/data/CarPlay/.install-backup/uninstall.sh && systemctl reboot`.
 
 ---
 
@@ -228,13 +274,14 @@ Safe mode installs `/var/local/data/CarPlay/carplay.conf` with **`wireless=0`**,
    sh /tmp/carplay-stage/deploy/install.sh \
        --stage /tmp/carplay-stage/install-root --mode safe --dry-run
    ```
-3. Run the install (backs up any existing files byte-for-byte into `/var/local/data/CarPlay/.install-backup/`):
+3. Run the install (backs up existing files into `/var/local/data/CarPlay/.install-backup/` and copies `uninstall.sh` + `manifest.txt` there so uninstall keeps working after reboot):
    ```sh
    sh /tmp/carplay-stage/deploy/install.sh \
        --stage /tmp/carplay-stage/install-root --mode safe
    touch /var/local/data/CarPlay/maintenance
-   reboot
+   systemctl reboot
    ```
+   *(Important: a normal ignition off/on cycle does **not** reboot `HU_ENTRYNAV2`; `HmiMain3D` only loads newly installed plugins after an explicit `systemctl reboot`, which takes ~3 minutes and wipes `/tmp/carplay-stage`.)*
 4. Verify after reboot:
    - **Media → Apple CarPlay** appears in iDrive and iDrive remains stable.
    - Verify kill switch: `touch /var/local/data/CarPlay/killswitch` -> starting CarPlay exits immediately (`78`) and logs why; then `rm -f /var/local/data/CarPlay/killswitch`.
@@ -280,13 +327,13 @@ Proceed only if `--compat` passed `alps`/`uuid`/`spp`/`libdns_sd`/`ap`/`mdnsd`:
   rm -f /tmp/entry-carplay-crash-guard /tmp/entry-carplay-disabled-until-reboot \
         /var/local/data/CarPlay/app-guard /var/local/data/CarPlay/bootguard
   ```
-- **Full byte-for-byte uninstall:**
+- **Full byte-for-byte uninstall (works even after `systemctl reboot` wipes `/tmp/carplay-stage`, using the persistent copy in `/var/local/data/CarPlay/.install-backup/`):**
   ```sh
-  sh /tmp/carplay-stage/deploy/uninstall.sh --dry-run
-  sh /tmp/carplay-stage/deploy/uninstall.sh
-  reboot
+  sh /var/local/data/CarPlay/.install-backup/uninstall.sh --dry-run
+  sh /var/local/data/CarPlay/.install-backup/uninstall.sh
+  systemctl reboot
   ```
-- **If iDrive freezes:** hold the iDrive volume/power knob for ~30 seconds to reboot.
+- **If iDrive freezes:** hold the iDrive volume/power knob for ~30 seconds to force a reboot.
 
 ### 9. What to Send Back to the Developer
 1. The `carplay-visit-*.tar.gz` archive (containing `SUMMARY.txt`, `i2c_mfi.txt`, and all probe reports).
@@ -325,3 +372,49 @@ Visit 1 (`2026-11-21`) confirmed native `/usr/local/bin/CARPLAY` is running idle
    scp root@169.254.1.0:/tmp/visit2_out/carplay-visit-*.tar.gz .
    scp root@169.254.1.0:/tmp/visit2_watch/native_carplay.txt .
    ```
+
+### 11. Visit 3 Findings & Visit 4 Checklist — Wired USB + MFi (`ddp_handoff=1`)
+Visit 3 (`verified 2026-11-21 visit 3`) confirmed on hardware:
+- **MFi CP verified:** `@ok|mfi|/dev/i2c-0 I2C_FUNCS ok, addr=0x10 dev_ver=0x05` (with `DDPServer` stopped).
+- **`DDPServer` (`DistributedDeviceProtocol.service`) behavior:** Unit uses `KillMode=none`, no `ExecStop`, `Restart=no`, `WatchdogSec=75`, `User=auxmms`, `Group=mplayer`, `WantedBy=unfocussed.target`. `systemctl stop` alone does **not** terminate `DDPServer`. Explicit `SIGTERM` to `.../MediaPlayer/bin/DDPServer` frees `/dev/i2c-0`, **but `systemctl start` and ignition off/on do not restore `/dev/i2c-0` or Bluetooth music** — only `systemctl reboot` (~3 min) restores them.
+- **Safe-mode deploy verified:** 10 `REMOVE` / 0 `RESTORE`, `HmiMain3D` loaded `EntryCarPlay` (`32753`) alongside `EntryAad` (`32752`) **after `systemctl reboot`** (not ignition), `800x480` video (`0x7ec00001` / `0x80000000`, `genivi-flip-renderorder=1`, `omapdrm` dma-buf OK), `older CCS (E5.01, C10/C20)`, and `STOP` clean exit (`0`) + 3 s relaunch.
+
+**Visit 4 Checklist (`/var/local` only — no root `/` remount required!):**
+1. Install updated binaries (`install.sh` persists `uninstall.sh` + `manifest.txt` into `/var/local/data/CarPlay/.install-backup/`) and reboot with `systemctl reboot`:
+   ```sh
+   scp -r build/arm-entrynav2/install-root scripts/deploy root@169.254.1.0:/tmp/carplay-stage
+   ssh root@169.254.1.0 'sh /tmp/carplay-stage/deploy/install.sh --stage /tmp/carplay-stage/install-root --mode safe && touch /var/local/data/CarPlay/maintenance && systemctl reboot'
+   ```
+2. After reboot, edit persistent `/var/local/data/CarPlay/carplay.conf` (no remount needed; leave `wireless=0` and `detach_usbfs_driver=0`):
+   ```ini
+   enabled=1
+   wireless=0
+   wired=1
+   detach_usbfs_driver=0
+   ddp_handoff=1
+   ddp_restore=reboot_prompt
+   mfi_i2c=/dev/i2c-0:0x10
+   ```
+   *(Expectation: starting CarPlay with `ddp_handoff=1` stops `DDPServer` for `/dev/i2c-0`; BT music remains off after session end until `systemctl reboot`, and the idle iDrive entry/row + `/tmp/entry-carplayd-ddp-needs-reboot` display `"Apple CarPlay (Reboot for BT audio)"`.)*
+3. Plug iPhone via USB data cable into center console port `3-1` and press **Media → Start Apple CarPlay**.
+4. Inspect live state & collect logs:
+   ```sh
+   cat /tmp/entry-carplayd-state /tmp/entry-carplayd-ddp-needs-reboot 2>/dev/null
+   ip -6 addr show dev carplay0 2>/dev/null
+   ls -l /proc/*/fd 2>/dev/null | grep -E 'i2c-0|bus/usb' || true
+   tail -n 120 /tmp/entry-carplay-service.log
+   scp root@169.254.1.0:/tmp/entry-carplay-service.log .
+   scp root@169.254.1.0:/var/local/data/CarPlay/app.log .
+   ```
+   *(If `usb-bridge` reports `usbfs` contention or `0xc0/0x52` stall, capture a 10s watch via `native_carplay_probe.sh --out-dir /tmp/v4_usb --watch 10`.)*
+5. **Kill switch & revert (`wired=0`, `ddp_handoff=0`) + BT music recovery:**
+   ```sh
+   # Immediate stop without flash remount:
+   touch /var/local/data/CarPlay/killswitch
+   touch /tmp/entry-carplay-service/STOP
+   # Revert /var/local/data/CarPlay/carplay.conf back to safe defaults:
+   #   wired=0, ddp_handoff=0, and comment # mfi_i2c=/dev/i2c-0:0x10
+   rm -f /var/local/data/CarPlay/killswitch
+   systemctl reboot
+   ```
+   Full byte-for-byte uninstall after any reboot: `sh /var/local/data/CarPlay/.install-backup/uninstall.sh --dry-run && sh /var/local/data/CarPlay/.install-backup/uninstall.sh && systemctl reboot`.

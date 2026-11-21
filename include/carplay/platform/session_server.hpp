@@ -136,6 +136,9 @@ public:
     session::Session* activeSession() { return session_; }
     const session::Session* activeSession() const { return session_; }
     const Address& controlPeerAddress() const { return control_conn_.peerAddress(); }
+    /// Replaces the AirPlay/MFi auth provider before connectivity/sessions begin.
+    void setAuthProvider(session::AuthProvider* auth) { auth_ = auth; }
+
     void closeActiveSession();
 
     /// Enables or disables Wi-Fi video QoS (IP_TOS / IPV6_TCLASS = 0x80) for subsequent
